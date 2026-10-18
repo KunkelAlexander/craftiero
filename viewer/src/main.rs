@@ -1,22 +1,25 @@
-// M1 tech demo: fly through a destructible SDF world. Terrain is raymarched on
-// the GPU, drawn with a toon ramp and ink outlines, and edited with the mouse.
+// The viewer. M1: a destructible SDF world, raymarched on the GPU, drawn with a
+// toon ramp and ink outlines. M2: a worm from the `sim` crate that you walk,
+// jump, dig and swing around it. (F switches to the M1 fly camera and brush.)
 //
 //   cargo run -p viewer --release                  the interactive viewer
 //   cargo run -p viewer --release -- --shot a.png  render one frame to a PNG
 //   cargo run -p viewer --release -- --bench       time the GPU per frame
 //
-// The sim/networking split from CLAUDE.md is not in play yet: this crate only
-// reads and edits an `sdf::Grid` and draws it.
+// The split from CLAUDE.md: the rules live in `sim`. This file turns keys into
+// `sim::Input`s, steps `sim::World` at a fixed 60 Hz and draws what it holds.
 
 mod camera;
 mod renderer;
 mod shaders;
 mod world;
+mod worms;
 
 use camera::Camera;
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use renderer::{FrameParams, Gpu, Offscreen, Renderer};
 use sdf::{Grid, Op, Shape};
+use sim::{dig_target, Input, World, DIG_RADIUS, DT, EYE_HEIGHT};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,12 +33,15 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 const HELP: &str = "\
 Controls
   click the window  capture the mouse        Esc  release it (again to quit)
-  W A S D           fly                      Space / Ctrl  up / down   Shift  fast
-  left mouse        carve (hold to dig)      right mouse   build with a smooth join
-  mouse wheel       brush size
+  W A S D           walk                     Space  jump        mouse  look and aim
+  left mouse        dig (hold)               right mouse  shoot the rope / let go
+  E / Q             reel the rope in (pulls you, so you can launch yourself) / out
+  Space on the rope let go with an upward kick; steer while swinging to pump it up
+  F                 fly camera with the M1 brush: W A S D Space Ctrl Shift fly,
+                    left mouse carve, right mouse build, mouse wheel brush size
   1 2 3             fixed render resolution 100% / 75% / 50%
   T                 automatic resolution (default): holds ~60 fps by scaling it
-  G shadows   H ambient occlusion   O ink outlines   V vsync   R reset the terrain";
+  G shadows   H ambient occlusion   O ink outlines   V vsync   R reset the world";
 
 struct Config {
     shot: Option<String>,
@@ -46,6 +52,10 @@ struct Config {
     auto_res: bool,
     cam: Option<[f32; 5]>,
     edits: bool,
+    /// `--worm x,z,yaw_deg`: a worm in the screenshot, standing there.
+    worm: Option<[f32; 3]>,
+    /// `--rope`: that worm has just shot its rope and swings from it.
+    rope: bool,
     brush: bool,
     shadows: bool,
     ao: bool,
@@ -61,6 +71,8 @@ fn parse_args() -> Config {
         auto_res: true,
         cam: None,
         edits: false,
+        worm: None,
+        rope: false,
         brush: true,
         shadows: true,
         ao: true,
@@ -87,6 +99,11 @@ fn parse_args() -> Config {
                 c.cam = Some(v.try_into().expect("--cam x,y,z,yaw_deg,pitch_deg"));
             }
             "--edits" => c.edits = true,
+            "--worm" => {
+                let v: Vec<f32> = value("--worm").split(',').map(|s| s.trim().parse().expect("number")).collect();
+                c.worm = Some(v.try_into().expect("--worm x,z,yaw_deg"));
+            }
+            "--rope" => c.rope = true,
             "--no-brush" => c.brush = false,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
@@ -179,19 +196,47 @@ fn headless_gpu() -> Gpu {
     Gpu::new(&instance, None)
 }
 
+/// The world for a screenshot: the map, plus one worm if `--worm` asked for it,
+/// settled on the ground (and swinging from its rope after `--rope`).
+fn shot_world(cfg: &Config) -> World {
+    let spawns: Vec<(f32, f32)> = cfg.worm.iter().map(|w| (w[0], w[1])).collect();
+    let mut world = World::new(world::build(), &spawns);
+    if let Some([_, _, yaw]) = cfg.worm {
+        let look = Input { yaw: yaw.to_radians(), ..Input::default() };
+        for _ in 0..60 {
+            world.step(&[look]);
+        }
+        if cfg.rope {
+            // Shoot the rope up and forward, then let it swing for a third of a second.
+            let shoot = Input { pitch: 0.7, rope: true, ..look };
+            world.step(&[shoot]);
+            for _ in 0..20 {
+                world.step(&[Input { rope: false, ..shoot }]);
+            }
+        }
+    }
+    for (i, w) in world.worms.iter().enumerate() {
+        println!("worm {i} stands at {:.1}, {:.1}, {:.1}{}", w.pos.x, w.pos.y, w.pos.z, if w.rope.is_some() { " on its rope" } else { "" });
+    }
+    world
+}
+
 fn run_shot(cfg: &Config, path: &str) {
     let gpu = headless_gpu();
-    let mut grid = world::build();
-    let mut renderer = Renderer::new(&gpu, Offscreen::FORMAT, cfg.size, cfg.scale, &mut grid);
+    let mut world = shot_world(cfg);
+    let mut renderer = Renderer::new(&gpu, Offscreen::FORMAT, cfg.size, cfg.scale, &mut world.grid);
     if cfg.edits {
-        demo_edits(&mut grid);
-        println!("synced {} chunks", renderer.sync(&mut grid));
+        demo_edits(&mut world.grid);
+        println!("synced {} chunks", renderer.sync(&mut world.grid));
     }
     let cam = camera_from(cfg);
     let target = Offscreen::new(&gpu.device, cfg.size);
+    let positions: Vec<Vec3> = world.worms.iter().map(|w| w.pos).collect();
+    let capsules = worms::capsules(&world.worms, &positions);
     let params = FrameParams {
         camera: &cam,
-        brush: if cfg.brush { aim_point(&grid, &cam).map(|p| (p, 3.0)) } else { None },
+        capsules: &capsules,
+        brush: if cfg.brush { aim_point(&world.grid, &cam).map(|p| (p, 3.0)) } else { None },
         time: 0.0,
         shadows: cfg.shadows,
         ao: cfg.ao,
@@ -297,15 +342,42 @@ fn run_bench(cfg: &Config) {
     println!("{:<14}{:<20}{:>9}{:>9}{:>9}{:>9}", "view", "variant", "total", "march", "post", "worst");
     for (name, cam) in &views {
         for (label, shadows, ao, outlines) in variants {
-            let params = FrameParams { camera: cam, brush: None, time: 0.0, shadows, ao, outlines };
+            let params = FrameParams { camera: cam, capsules: &[], brush: None, time: 0.0, shadows, ao, outlines };
             let t = time_frames(&gpu, &mut renderer, &target, &params, frames);
             println!("{name:<14}{label:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", t.total, t.march, t.post, t.worst);
         }
     }
 
+    // Worms on screen: four, each with a gun and eyes, one on a rope. Every
+    // pixel tests its ray against all of these capsules.
+    let mut worms: Vec<sim::Worm> = [(58.0, 40.0), (64.0, 44.0), (70.0, 40.0), (64.0, 52.0)]
+        .iter()
+        .map(|&(x, z)| {
+            let t = grid.raycast(Vec3::new(x, 62.0, z), -Vec3::Y, 80.0).expect("ground");
+            sim::Worm::new(Vec3::new(x, 62.0 - t, z))
+        })
+        .collect();
+    worms[1].rope = Some(sim::Rope { anchor: Vec3::new(64.0, 60.0, 44.0), length: 10.0 });
+    let positions: Vec<Vec3> = worms.iter().map(|w| w.pos).collect();
+    let capsules = worms::capsules(&worms, &positions);
+    let with = FrameParams { camera: &views[0].1, capsules: &capsules, brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
+    let without = FrameParams { capsules: &[], ..with };
+    // Alternate the two, best of five rounds each: a clock change on this GPU is
+    // slow and large, and measured one after the other it would land on one variant.
+    let (mut a, mut b) = (None::<Timing>, None::<Timing>);
+    for _ in 0..5 {
+        let x = time_frames(&gpu, &mut renderer, &target, &without, frames);
+        let y = time_frames(&gpu, &mut renderer, &target, &with, frames);
+        a = Some(match a { Some(p) if p.total <= x.total => p, _ => x });
+        b = Some(match b { Some(p) if p.total <= y.total => p, _ => y });
+    }
+    for (label, t) in [("same view, no worms", a.unwrap()), ("everything + worms", b.unwrap())] {
+        println!("{:<14}{:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", "open hills", label, t.total, t.march, t.post, t.worst);
+    }
+
     // Edit cost: the CPU edit, the texture upload, and the frame after it.
     let cam = &views[0].1;
-    let params = FrameParams { camera: cam, brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
+    let params = FrameParams { camera: cam, capsules: &[], brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
     let (mut edit, mut sync, mut chunks) = (0.0, 0.0, 0usize);
     let n = 100;
     for i in 0..n {
@@ -346,7 +418,15 @@ struct Viewer {
     surface_cfg: wgpu::SurfaceConfiguration,
     gpu: Gpu,
     renderer: Renderer,
-    grid: Grid,
+    /// The game state: terrain, worms. Worm 0 is the player.
+    world: World,
+    /// Fixed timestep: real time not yet turned into sim ticks.
+    acc: f32,
+    /// Where each worm was before the last tick, for drawing between ticks.
+    prev_pos: Vec<Vec3>,
+    seq: u32,
+    /// The M1 mode: a free camera and the brush instead of the worm.
+    fly: bool,
     camera: Camera,
     keys: HashSet<KeyCode>,
     lmb: bool,
@@ -369,6 +449,7 @@ struct Viewer {
     last_frame: Instant,
     stats_since: Instant,
     frames: u32,
+    sim_ms: f64,
     edit_ms: f64,
     sync_ms: f64,
     synced: usize,
@@ -380,7 +461,7 @@ impl Viewer {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("liero3d M1")
+                        .with_title("liero3d M2")
                         // Physical pixels, not logical: on a display scaled to 150%+ a
                         // logical 1280 x 720 window is 2-4x the pixels and the frame
                         // time would depend on the user's desktop scaling.
@@ -412,8 +493,9 @@ impl Viewer {
         surface.configure(&gpu.device, &surface_cfg);
 
         println!("window {}x{} px, display scale {:.2}", size.width, size.height, window.scale_factor());
-        let mut grid = world::build();
-        let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut grid);
+        let mut world = World::new(world::build(), &world::SPAWNS);
+        let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
+        let prev_pos = world.worms.iter().map(|w| w.pos).collect();
         let now = Instant::now();
         Viewer {
             window,
@@ -421,7 +503,12 @@ impl Viewer {
             surface_cfg,
             gpu,
             renderer,
-            grid,
+            world,
+            acc: 0.0,
+            prev_pos,
+            seq: 0,
+            // An explicit --cam means "look at this spot", which only the free camera can.
+            fly: cfg.cam.is_some(),
             camera: camera_from(cfg),
             keys: HashSet::new(),
             lmb: false,
@@ -445,6 +532,7 @@ impl Viewer {
             last_frame: now,
             stats_since: now,
             frames: 0,
+            sim_ms: 0.0,
             edit_ms: 0.0,
             sync_ms: 0.0,
             synced: 0,
@@ -546,21 +634,83 @@ impl Viewer {
                     if self.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
                 self.surface.configure(&self.gpu.device, &self.surface_cfg);
             }
+            KeyCode::KeyF => self.fly = !self.fly,
             KeyCode::KeyR => {
-                self.grid = world::build();
+                self.world = World::new(world::build(), &world::SPAWNS);
+                self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
                 self.renderer = Renderer::new(
                     &self.gpu,
                     self.surface_cfg.format,
                     (self.surface_cfg.width, self.surface_cfg.height),
                     self.renderer.scale(),
-                    &mut self.grid,
+                    &mut self.world.grid,
                 );
             }
             _ => {}
         }
     }
 
+    /// What the keyboard and mouse ask worm 0 to do this tick.
+    fn worm_input(&self) -> Input {
+        let worm = &self.world.worms[0];
+        if self.fly {
+            // The free camera has the keys: the worm just stands and looks as before.
+            return Input { yaw: worm.yaw, pitch: worm.pitch, ..Input::default() };
+        }
+        let held = |k| self.keys.contains(&k);
+        let axis = |plus, minus| (if held(plus) { 1.0 } else { 0.0 }) - (if held(minus) { 1.0 } else { 0.0 });
+        Input {
+            seq: 0, // set per tick in `update`
+            move_dir: Vec2::new(axis(KeyCode::KeyD, KeyCode::KeyA), axis(KeyCode::KeyW, KeyCode::KeyS)),
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            jump: held(KeyCode::Space),
+            dig: self.grabbed && self.lmb,
+            rope: self.grabbed && self.rmb,
+            reel: axis(KeyCode::KeyE, KeyCode::KeyQ),
+        }
+    }
+
     fn update(&mut self, dt: f32) {
+        // Pattern: Fixed Timestep. The sim always advances in exact 1/60 s ticks,
+        // however fast frames come: it adds the real time to an accumulator and
+        // runs as many ticks as fit. (The frame time is capped at 0.1 s so a
+        // long stall cannot trigger a burst of ticks.) What is left in `acc` is
+        // how far we are into the next tick; `frame` uses it to draw smoothly.
+        self.acc += dt;
+        let mut input = self.worm_input();
+        let t = Instant::now();
+        let mut ticks = 0;
+        while self.acc >= DT {
+            self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
+            input.seq = self.seq;
+            self.seq = self.seq.wrapping_add(1);
+            self.world.step(&[input]);
+            self.acc -= DT;
+            ticks += 1;
+        }
+        if ticks > 0 {
+            self.sim_ms = t.elapsed().as_secs_f64() * 1000.0;
+        }
+        // Nothing listens to the sim's events yet (sound and particles will, at
+        // M6); drain them so they do not pile up. The renderer needs no event
+        // for terrain edits: it asks the grid which chunks changed.
+        self.world.drain_events();
+
+        if self.fly {
+            self.fly_and_edit(dt);
+        }
+        let t = Instant::now();
+        let n = self.renderer.sync(&mut self.world.grid);
+        if n > 0 {
+            self.sync_ms = t.elapsed().as_secs_f64() * 1000.0;
+            self.synced = n;
+        }
+    }
+
+    /// The M1 mode: fly the camera and edit the terrain with the brush. The
+    /// brush edits the grid directly, bypassing the sim: a developer tool.
+    fn fly_and_edit(&mut self, dt: f32) {
         // Fly.
         let held = |k| self.keys.contains(&k);
         let (right, _) = self.camera.right_up();
@@ -592,24 +742,18 @@ impl Viewer {
         // Edit. A button held down repeats at 20 Hz, so digging is a motion and
         // not a series of clicks.
         self.edit_cooldown -= dt;
-        let aim = aim_point(&self.grid, &self.camera);
+        let aim = aim_point(&self.world.grid, &self.camera);
         if self.grabbed && (self.lmb || self.rmb) && self.edit_cooldown <= 0.0 {
             if let Some(p) = aim {
                 let t = Instant::now();
                 if self.lmb {
-                    carve(&mut self.grid, p, self.brush_radius);
+                    carve(&mut self.world.grid, p, self.brush_radius);
                 } else {
-                    build(&mut self.grid, p, self.brush_radius);
+                    build(&mut self.world.grid, p, self.brush_radius);
                 }
                 self.edit_ms = t.elapsed().as_secs_f64() * 1000.0;
                 self.edit_cooldown = 0.05;
             }
-        }
-        let t = Instant::now();
-        let n = self.renderer.sync(&mut self.grid);
-        if n > 0 {
-            self.sync_ms = t.elapsed().as_secs_f64() * 1000.0;
-            self.synced = n;
         }
     }
 
@@ -618,6 +762,30 @@ impl Viewer {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.update(dt);
+
+        // Draw each worm between where it was a tick ago and where it is now.
+        // Without this, on a display that is not exactly 60 Hz some frames would
+        // show two ticks of movement and some none, and the worm would judder.
+        let alpha = (self.acc / DT).clamp(0.0, 1.0);
+        let draw_pos: Vec<Vec3> =
+            self.world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
+        // Speed widens the view: the world streams past faster at the edges,
+        // which is a cheap way to make fast movement FEEL fast.
+        const CALM_SPEED: f32 = 8.0; // walking speed: no widening up to here
+        let speed = if self.fly { 0.0 } else { self.world.worms[0].vel.length() };
+        let widen = ((speed - CALM_SPEED) / 16.0).clamp(0.0, 1.0);
+        let target_fov = (70.0 + 14.0 * widen).to_radians();
+        self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
+        if !self.fly {
+            self.camera.follow(draw_pos[0] + Vec3::Y * (EYE_HEIGHT + 0.2), 5.0, &self.world.grid);
+        }
+        let capsules = worms::capsules(&self.world.worms, &draw_pos);
+        // Show where a dig would land (or, flying, where the brush would).
+        let brush = if self.fly {
+            aim_point(&self.world.grid, &self.camera).map(|p| (p, self.brush_radius))
+        } else {
+            dig_target(&self.world.grid, &self.world.worms[0]).map(|p| (p, DIG_RADIUS))
+        };
 
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) => (f, false),
@@ -636,7 +804,8 @@ impl Viewer {
         let view = frame.texture.create_view(&Default::default());
         let params = FrameParams {
             camera: &self.camera,
-            brush: aim_point(&self.grid, &self.camera).map(|p| (p, self.brush_radius)),
+            capsules: &capsules,
+            brush,
             time: (now - self.started).as_secs_f32(),
             shadows: self.shadows,
             ao: self.ao,
@@ -663,12 +832,14 @@ impl Viewer {
         if elapsed >= 0.5 {
             let on = |b| if b { "on" } else { "off" };
             self.window.set_title(&format!(
-                "liero3d M1 | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {}",
+                "liero3d M2 {} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {}",
+                if self.fly { "fly" } else { "worm" },
                 self.frames as f64 / elapsed,
                 elapsed * 1000.0 / self.frames as f64,
                 self.march_ms + self.post_ms,
                 self.march_ms,
                 self.post_ms,
+                self.sim_ms,
                 self.edit_ms,
                 self.sync_ms,
                 self.synced,

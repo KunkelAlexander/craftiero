@@ -1,1127 +1,1084 @@
-// The whole game state and the one function that advances it.
+// The world and the worm: movement against the signed distance field, jumping,
+// digging and the ninja rope.
 //
-// Pattern: Game Loop (fixed timestep). `step` always advances exactly 1/60 s.
-// The caller (the game, a server, a test) decides how often to call it. A
-// fixed step means physics behaves the same on a 30 Hz laptop and a 144 Hz
-// monitor, and that two machines fed the same inputs compute the same result.
+// Everything here is a plain struct and a plain function. `World::step` is the
+// only way the state changes, and it takes nothing but `Input`s, so a test can
+// replay a game from a list of inputs.
 //
-// Pattern: Update Method. Each kind of thing (player, projectile) has a step
-// function that moves it one tick. Plain loops over plain structs, no engine.
-//
-// Pattern: Event Queue. When something noteworthy happens (a shot, an
-// explosion, a death) the sim pushes an `Event`. It never plays a sound or
-// spawns a particle itself. Audio, particles and the network each read the
-// queue and react, and the sim stays ignorant of all of them.
-//
-// Networking note ("authority"): whoever calls `step` is the authority. It is
-// the only place where state is allowed to change. Today that is the local
-// game; in online play it is the host (a player's browser or, later, a
-// dedicated server). Everyone else just receives the result.
-
-use glam::{vec2, Vec2};
-use serde::{Deserialize, Serialize};
+// A note on determinism (the same inputs giving the same worm): +, -, *, / and
+// sqrt on f32 are exact IEEE operations and give identical bits everywhere.
+// `sin` and `cos` are not guaranteed to. That is fine today because only the
+// host runs the sim and clients draw its snapshots. If a client ever predicts
+// its own worm, swap `sin_cos` for a table or an approximation written here.
 
 use crate::input::Input;
-use crate::rng::Rng;
-use crate::tilemap::{tile_center, tile_coords, Tile, Tilemap, BRICK_HP, TILE};
-use crate::weapons::{Kind, Special, WeaponDef, WEAPONS};
+use glam::{Vec2, Vec3};
+use sdf::{Grid, Op, Shape};
 
+/// The sim runs at a fixed 60 Hz, whatever the frame rate of whoever draws it.
+/// A fixed step makes physics repeatable: variable steps change how high you
+/// jump and whether you tunnel through a wall.
 pub const DT: f32 = 1.0 / 60.0;
-pub const PLAYER_RADIUS: f32 = 10.0;
-const PROJECTILE_RADIUS: f32 = 3.0;
-const MOVE_SPEED: f32 = 220.0;
-/// How quickly velocity chases the wanted velocity. The same rule also bleeds
-/// off knockback, so being blown across the room needs no special code.
-const ACCEL: f32 = 12.0;
-const MAX_SPEED: f32 = 900.0;
-pub const MAX_HP: f32 = 100.0;
-pub const RESPAWN_TIME: f32 = 3.0;
-const SPAWN_INVULN: f32 = 2.0;
-/// The default kills to win. A match can choose another (`World::score_limit`).
-pub const SCORE_LIMIT: i32 = 15;
-/// You hurt yourself half as much as others, but get thrown just as far, so
-/// explosions work as a movement tool without being free.
-const SELF_DAMAGE: f32 = 0.5;
-/// A beam hits a player whose body is this close to its line, not only one it
-/// crosses. Networking note: the host sees players where they are now, but a
-/// joiner aims at a picture that is ~100 ms of interpolation plus their own lag
-/// in the past. An instant beam exactly as wide as a body would land far more
-/// often for the host than for friends; a little slack evens that out. (The
-/// full answer is lag compensation: the host rewinds to what the shooter saw.)
-const BEAM_SLACK: f32 = 4.0;
 
-// The dash has no button: let go of the movement keys (or lift the move thumb),
-// then push again, and the first push is a burst of speed. Phones play with two
-// thumbsticks and have no thumb left for a dash button, so the gesture IS the
-// button, and it works the same on a keyboard.
-/// How long the stick must rest before a push counts as a dash. Long enough
-/// that switching from W to D (a gap of a frame or two) never dashes.
-const DASH_REST: f32 = 0.12;
-/// A thumb on a floating stick starts at zero and takes a few frames to reach a
-/// full push, so the push may arrive this long after the rest ends.
-const DASH_WINDOW: f32 = 0.15;
-/// How far the stick must be pushed: enough to show which way you mean.
-const DASH_PUSH: f32 = 0.6;
-/// Speed at the start of a dash. The usual `ACCEL` rule then slows you back
-/// to walking speed within a quarter second, which adds about 1.5 tiles to the
-/// distance travelled: a dodge, not a teleport. Below `MAX_SPEED`.
-const DASH_SPEED: f32 = 850.0;
-const DASH_COOLDOWN: f32 = 1.2;
+// --- the worm's body -----------------------------------------------------
+pub const WORM_RADIUS: f32 = 0.45;
+pub const WORM_HEIGHT: f32 = 1.8;
+/// Eye (and aim origin) above the feet.
+pub const EYE_HEIGHT: f32 = 1.5;
+/// Height of the hand: where the rope and (later) the gun are.
+const HAND_HEIGHT: f32 = 1.1;
+/// Pattern: Spatial approximation. The collision shape is a capsule, tested as
+/// three spheres up its axis (feet, middle, head). A sphere against a distance
+/// field is one lookup: `distance < radius` means touching, and the gradient
+/// says which way to push out. The spheres are one radius apart, so they
+/// overlap and leave no gap a thin ledge could slip through.
+const BODY_SPHERES: [f32; 3] = [WORM_RADIUS, WORM_HEIGHT * 0.5, WORM_HEIGHT - WORM_RADIUS];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WeaponState {
-    /// Index into `WEAPONS`.
-    pub id: u8,
-    pub ammo: u8,
-    pub cooldown: f32,
-    /// Seconds of reload left; > 0 means "reloading". Each weapon reloads on
-    /// its own timer, so you can switch away and it keeps reloading.
-    pub reload: f32,
+// --- movement feel (metres, seconds) --------------------------------------
+const WALK_SPEED: f32 = 8.0;
+/// How fast the walking speed is reached on the ground. High, so the worm stops
+/// and starts crisply and standing still is not a slide.
+const GROUND_ACCEL: f32 = 70.0;
+/// Slowing down while still steering when faster than walking speed (landing
+/// from a swing, a bunny hop). Much gentler than `GROUND_ACCEL`, so momentum
+/// survives a landing: let go of the keys and the full friction stops you.
+const OVERSPEED_DRAG: f32 = 10.0;
+/// Steering in the air. It never BRAKES: the speed gained from a rope swing is
+/// kept, steering only adds speed up to the walking speed.
+const AIR_ACCEL: f32 = 20.0;
+const GRAVITY: f32 = 25.0;
+/// Falling is heavier than rising. A symmetric arc feels floaty; a quick drop
+/// makes jumps snappy. (Not while on a rope: a swing should be a pendulum.)
+const FALL_GRAVITY_MULT: f32 = 1.5;
+/// Rise = speed^2 / (2 * gravity) = 2.4 m, well above the worm's own height.
+const JUMP_SPEED: f32 = 11.0;
+/// Letting go of jump while still rising cuts the speed to this: a tap is a
+/// hop of about half a metre, holding gives the full jump.
+const JUMP_CUT_SPEED: f32 = 4.0;
+/// Pressing jump up to this many ticks (0.1 s) after walking off an edge still
+/// jumps ("coyote time"), and pressing it up to this many ticks before landing
+/// jumps on landing ("jump buffer"). Both forgive human timing; without them
+/// a jump that feels like it was pressed in time is sometimes eaten.
+const COYOTE_TICKS: u8 = 6;
+const JUMP_BUFFER_TICKS: u8 = 6;
+const MAX_SPEED: f32 = 40.0;
+/// A surface counts as ground when its normal is within ~41 degrees of up.
+/// Steeper is a wall: the worm slides along it instead of standing on it.
+/// (Not 45: at a wall-floor crease the foot sphere's blended normal is exactly
+/// 45 degrees, and a threshold there makes the answer flip from tick to tick.)
+const GROUND_COS: f32 = 0.75;
+/// Still "standing" when the feet are this far above the surface, and then the
+/// worm is pulled down onto it. It keeps the worm grounded while walking over
+/// bumps and down slopes, where each tick would otherwise be a tiny fall.
+const GROUND_SKIN: f32 = 0.1;
+/// A worm that was walking sticks to ground up to this far below it (crests of
+/// bumps, steps down), instead of launching off every crest like a ball.
+const STICK_DISTANCE: f32 = 0.3;
+/// Highest ledge the worm walks up without jumping.
+const STEP_UP: f32 = 0.5;
+/// Largest move between collision checks. The distance field is only valid in a
+/// 1 m band, and a fast worm could otherwise end a tick deeper in rock than the
+/// field can say which way is out.
+const MAX_STEP: f32 = 0.2;
+/// Largest correction per overlapping sphere and pass: a worm buried deeper
+/// than the field's band (where the gradient is zero) is pushed up gradually.
+const MAX_PUSH: f32 = 0.5;
+const PITCH_LIMIT: f32 = 1.553; // 89 degrees
+
+// --- digging --------------------------------------------------------------
+/// How far the worm can reach (from the eye to the rock).
+const DIG_REACH: f32 = 4.0;
+/// Radius of the hole, centred on the surface point the worm looks at.
+///
+/// Why this size: a tunnel is a row of overlapping bites, and where two bites
+/// meet the roof dips into a cusp. Bites one radius apart leave a cusp of
+/// 2 * sqrt(r^2 - (r/2)^2) = 1.73 r, which has to be taller than the worm
+/// (1.8 m), or the tunnel pinches it at every joint. 1.5 m gives 2.6 m, which
+/// also leaves room to walk over the bumps the bites leave in the floor.
+pub const DIG_RADIUS: f32 = 1.5;
+/// Ticks between digs while the button is held: 5 a second. Each dig advances
+/// about one radius (1.5 m), so digging forward goes at about walking speed.
+const DIG_INTERVAL: u8 = 12;
+
+// --- rope -----------------------------------------------------------------
+const ROPE_RANGE: f32 = 30.0;
+const ROPE_MIN: f32 = 1.0;
+/// How fast a reeled rope shortens (m/s).
+const REEL_SPEED: f32 = 12.0;
+/// Reeling in also ACCELERATES the worm towards the anchor, up to
+/// `REEL_MAX_SPEED`. The shortening alone would only drag the worm along at a
+/// fixed speed and leave it with nothing when it let go; the acceleration is
+/// what launches it out of a hole.
+const REEL_ACCEL: f32 = 45.0;
+const REEL_MAX_SPEED: f32 = 20.0;
+/// Steering on a rope in the air: a stronger push, and allowed to go much
+/// faster than walking, so pushing in the direction of the swing pumps it up
+/// like a child on a swing.
+const SWING_ACCEL: f32 = 30.0;
+const SWING_MAX_SPEED: f32 = 24.0;
+/// Pressing jump on the rope in the air lets go and kicks the worm upwards.
+const ROPE_JUMP: f32 = 7.0;
+/// The rope lets go when the rock it hangs from is dug away: the anchor sits on
+/// the surface (distance ~0), so air this far from it means the rock is gone.
+const ANCHOR_GONE: f32 = 0.3;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Rope {
+    pub anchor: Vec3,
+    /// Maximum distance from the hand to the anchor. The worm can swing at any
+    /// shorter distance (slack rope) but is pulled back from a longer one.
+    pub length: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Player {
-    pub pos: Vec2,
-    pub vel: Vec2,
-    pub aim: f32,
-    pub hp: f32,
-    pub alive: bool,
-    pub respawn_timer: f32,
-    /// Seconds of spawn protection left.
-    pub invuln: f32,
-    pub weapons: Vec<WeaponState>,
-    /// Index into `weapons`.
-    pub current: usize,
-    pub kills: i32,
-    pub deaths: i32,
-    /// Seconds the move input has been released (see `DASH_REST`).
-    pub still: f32,
-    /// Seconds left in which a push still counts as a dash (see `DASH_WINDOW`).
-    pub dash_armed: f32,
-    /// Seconds until the next dash is allowed.
-    pub dash_cooldown: f32,
+#[derive(Clone, Debug)]
+pub struct Worm {
+    /// The point between the feet. The capsule stands on it.
+    pub pos: Vec3,
+    pub vel: Vec3,
+    /// Where the worm looks (see `Input`).
+    pub yaw: f32,
+    pub pitch: f32,
+    pub on_ground: bool,
+    /// Normal of the ground the worm stands on (up when it is in the air).
+    pub ground_normal: Vec3,
+    /// Ticks until the next dig is allowed.
+    pub dig_cooldown: u8,
+    pub rope: Option<Rope>,
+    /// Was the rope button down last tick? (To react to the press, not the hold.)
+    rope_was_down: bool,
+    jump_was_down: bool,
+    /// True from a jump until the worm stops rising or lands: only then does
+    /// letting go of the button cut the jump short.
+    jumping: bool,
+    /// Ticks left in which a jump is still allowed after leaving the ground.
+    coyote: u8,
+    /// Ticks left in which an early jump press is remembered.
+    jump_buffer: u8,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Projectile {
-    pub pos: Vec2,
-    pub vel: Vec2,
-    pub weapon: u8,
-    pub owner: u8,
-    /// Seconds left to live.
-    pub life: f32,
-}
-
-/// Things that just happened. Consumers read these; the sim never reads them.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Event {
-    Shot { player: u8, weapon: u8, pos: Vec2 },
-    Beam { from: Vec2, to: Vec2 },
-    Explosion { pos: Vec2, radius: f32 },
-    Hit { victim: u8, pos: Vec2, damage: f32 },
-    /// A brick got damaged or destroyed. This doubles as the "dirty flag" of
-    /// the terrain: online, only these changes need to be sent, never the
-    /// whole map.
-    TileChanged { x: i32, y: i32, tile: Tile },
-    Died { victim: u8, killer: u8, pos: Vec2 },
-    /// `player` jumped from `from` to `to` (the Teleport gun).
-    Teleported { player: u8, from: Vec2, to: Vec2 },
-    /// `player` dashed from `pos` in direction `dir`.
-    Dashed { player: u8, pos: Vec2, dir: Vec2 },
-    Respawned { player: u8 },
-    MatchWon { player: u8 },
-}
-
-pub struct World {
-    pub map: Tilemap,
-    pub players: Vec<Player>,
-    pub projectiles: Vec<Projectile>,
-    /// Ticks simulated so far. Online, this is the shared clock that snapshots
-    /// and inputs are labelled with ("tick 1234").
-    pub tick: u32,
-    pub winner: Option<u8>,
-    /// Kills needed to win. A rule of this match, set by whoever creates it.
-    pub score_limit: i32,
-    events: Vec<Event>,
-    rng: Rng,
-}
-
-impl World {
-    /// `loadout` lists the weapon ids every player carries (a per-player
-    /// loadout comes with the loadout screen in M4).
-    pub fn new(map: Tilemap, player_count: usize, loadout: &[u8], seed: u32) -> World {
-        let players = (0..player_count)
-            .map(|i| Player {
-                pos: map.spawns[i % map.spawns.len()],
-                vel: Vec2::ZERO,
-                aim: 0.0,
-                hp: MAX_HP,
-                alive: true,
-                respawn_timer: 0.0,
-                invuln: 0.0,
-                weapons: loadout.iter().map(|&id| full_weapon(id)).collect(),
-                current: 0,
-                kills: 0,
-                deaths: 0,
-                still: 0.0,
-                dash_armed: 0.0,
-                dash_cooldown: 0.0,
-            })
-            .collect();
-        World {
-            map,
-            players,
-            projectiles: Vec::with_capacity(64),
-            tick: 0,
-            winner: None,
-            score_limit: SCORE_LIMIT,
-            events: Vec::new(),
-            rng: Rng::new(seed),
+impl Worm {
+    pub fn new(pos: Vec3) -> Worm {
+        Worm {
+            pos,
+            vel: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            on_ground: false,
+            ground_normal: Vec3::Y,
+            dig_cooldown: 0,
+            rope: None,
+            rope_was_down: false,
+            jump_was_down: false,
+            jumping: false,
+            coyote: 0,
+            jump_buffer: 0,
         }
     }
 
-    /// Replace a player's weapons with the ones they chose, all fully loaded.
-    /// The world does not judge the choice; whoever calls this (the host) has
-    /// already checked it with `weapons::valid_loadout`.
-    pub fn set_loadout(&mut self, player: usize, loadout: &[u8]) {
-        let p = &mut self.players[player];
-        p.weapons = loadout.iter().map(|&id| full_weapon(id)).collect();
-        p.current = 0;
+    /// Unit vector the worm looks along (the same maths as the viewer camera).
+    pub fn aim_dir(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        Vec3::new(sy * cp, sp, cy * cp)
     }
 
-    /// Take the events produced since the last call.
+    pub fn eye(&self) -> Vec3 {
+        self.pos + Vec3::Y * EYE_HEIGHT
+    }
+
+    pub fn hand(&self) -> Vec3 {
+        self.pos + Vec3::Y * HAND_HEIGHT
+    }
+}
+
+/// Something that happened this tick, for the renderer, the audio and (later)
+/// the network. Consumers read them with `World::drain_events`.
+#[derive(Clone, Copy, Debug)]
+pub enum Event {
+    /// The terrain was edited. This (a shape and an operation, a few bytes) is
+    /// also what the host will send to clients instead of the changed voxels.
+    Edit { shape: Shape, op: Op },
+}
+
+pub struct World {
+    /// The terrain. The renderer reads its dirty chunks after each step.
+    pub grid: Grid,
+    pub worms: Vec<Worm>,
+    pub tick: u32,
+    events: Vec<Event>,
+}
+
+impl World {
+    /// One worm per spawn column `(x, z)`, dropped from the top of the world
+    /// onto whatever ground is highest there. (The top must be open air.)
+    pub fn new(grid: Grid, spawns: &[(f32, f32)]) -> World {
+        let top = grid.size_metres().y - 0.5;
+        let worms = spawns
+            .iter()
+            .map(|&(x, z)| {
+                let y = grid.raycast(Vec3::new(x, top, z), -Vec3::Y, top).map_or(0.0, |t| top - t);
+                Worm::new(Vec3::new(x, y + 0.05, z))
+            })
+            .collect();
+        World { grid, worms, tick: 0, events: Vec::new() }
+    }
+
     pub fn drain_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
 
-    /// Advance the world by one tick. `inputs[i]` belongs to player `i`.
-    /// A missing input (shorter slice) counts as "no buttons pressed", which is
-    /// also exactly what we want for a player whose packet has not arrived.
+    /// Advance the game by one tick (`DT`). `inputs[i]` drives worm `i`; a
+    /// worm without an input stands still.
     pub fn step(&mut self, inputs: &[Input]) {
-        if self.winner.is_some() {
-            return; // match over: freeze the world
+        for (i, worm) in self.worms.iter_mut().enumerate() {
+            let input = clean(&inputs.get(i).copied().unwrap_or_default());
+            step_worm(&mut self.grid, worm, &input, &mut self.events);
         }
-        for i in 0..self.players.len() {
-            let input = inputs.get(i).copied().unwrap_or_default();
-            self.step_player(i, &input);
-        }
-        self.step_projectiles();
         self.tick += 1;
     }
+}
 
-    // ---------------------------------------------------------------- players
+/// Inputs come from outside, so they are untrusted: NaN would poison the
+/// worm's position for good (NaN compares false with everything, so every
+/// "is it inside the rock?" test would pass it), and a huge number could
+/// launch it through the world. Clamp everything to what a polite client sends.
+fn clean(i: &Input) -> Input {
+    let finite = |x: f32| if x.is_finite() { x } else { 0.0 };
+    // Clamp each axis first: the length of a 1e30 vector overflows to infinity.
+    let m = Vec2::new(finite(i.move_dir.x).clamp(-8.0, 8.0), finite(i.move_dir.y).clamp(-8.0, 8.0));
+    Input {
+        move_dir: m.clamp_length_max(1.0),
+        yaw: finite(i.yaw),
+        pitch: finite(i.pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT),
+        reel: finite(i.reel).clamp(-1.0, 1.0),
+        ..*i
+    }
+}
 
-    fn step_player(&mut self, i: usize, input: &Input) {
-        if !self.players[i].alive {
-            self.players[i].respawn_timer -= DT;
-            if self.players[i].respawn_timer <= 0.0 {
-                self.respawn(i);
-            }
-            return;
-        }
+fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, events: &mut Vec<Event>) {
+    worm.yaw = input.yaw;
+    worm.pitch = input.pitch;
 
-        let p = &mut self.players[i];
-        p.invuln = (p.invuln - DT).max(0.0);
-        if input.aim.is_finite() {
-            p.aim = input.aim;
+    // Rope button: a press shoots it, or lets go if it is out.
+    let rope_pressed = input.rope && !worm.rope_was_down;
+    worm.rope_was_down = input.rope;
+    if rope_pressed {
+        if worm.rope.is_some() {
+            worm.rope = None;
+        } else if let Some(t) = grid.raycast(worm.eye(), worm.aim_dir(), ROPE_RANGE) {
+            let anchor = worm.eye() + worm.aim_dir() * t;
+            worm.rope = Some(Rope { anchor, length: (anchor - worm.hand()).length().max(ROPE_MIN) });
         }
+    }
+    // Jump button: remember presses; coyote time counts down once off the ground.
+    let jump_pressed = input.jump && !worm.jump_was_down;
+    worm.jump_was_down = input.jump;
+    if jump_pressed {
+        worm.jump_buffer = JUMP_BUFFER_TICKS;
+    }
+    worm.coyote = if worm.on_ground { COYOTE_TICKS } else { worm.coyote.saturating_sub(1) };
+    // A new jump press in mid-air, on a rope: let go and kick upwards.
+    let rope_kick = jump_pressed && worm.coyote == 0 && worm.rope.is_some();
+    if rope_kick {
+        worm.rope = None;
+        worm.jump_buffer = 0;
+    }
 
-        for w in &mut p.weapons {
-            w.cooldown = (w.cooldown - DT).max(0.0);
-            if w.reload > 0.0 {
-                w.reload -= DT;
-                if w.reload <= 0.0 {
-                    w.reload = 0.0;
-                    w.ammo = WEAPONS[w.id as usize].mag;
-                }
-            }
-        }
-        if (input.weapon as usize) < p.weapons.len() {
-            p.current = input.weapon as usize;
-        }
-
-        // Movement. Never trust the input: clamp the length so nobody can
-        // send move_dir = (1000, 0) and run 1000x faster.
-        let dir = if input.move_dir.is_finite() { input.move_dir.clamp_length_max(1.0) } else { Vec2::ZERO };
-        let wanted = dir * MOVE_SPEED;
-        p.vel += (wanted - p.vel) * (ACCEL * DT).min(1.0);
-
-        // Dash: resting arms it, pushing uses it up (see `DASH_REST`).
-        p.dash_cooldown = (p.dash_cooldown - DT).max(0.0);
-        let mut dashed = false;
-        if dir.length() < 0.2 {
-            p.still += DT;
-            if p.still >= DASH_REST {
-                p.dash_armed = DASH_WINDOW;
-            }
-        } else {
-            p.still = 0.0;
-            if p.dash_armed > 0.0 && dir.length() >= DASH_PUSH && p.dash_cooldown == 0.0 {
-                // Set, not add: a dash out of a blast's knockback goes where
-                // you point, which is what makes it an escape.
-                p.vel = dir.normalize() * DASH_SPEED;
-                p.dash_armed = 0.0;
-                p.dash_cooldown = DASH_COOLDOWN;
-                dashed = true;
-            }
-            p.dash_armed = (p.dash_armed - DT).max(0.0);
-        }
-        p.vel = p.vel.clamp_length_max(MAX_SPEED);
-
-        // Move one axis at a time so a player slides along walls instead of
-        // sticking to them.
-        let nx = p.pos + vec2(p.vel.x * DT, 0.0);
-        if self.map.circle_hits_wall(nx, PLAYER_RADIUS) {
-            p.vel.x = 0.0;
-        } else {
-            p.pos = nx;
-        }
-        let ny = p.pos + vec2(0.0, p.vel.y * DT);
-        if self.map.circle_hits_wall(ny, PLAYER_RADIUS) {
-            p.vel.y = 0.0;
-        } else {
-            p.pos = ny;
-        }
-        if dashed {
-            let (pos, vel) = (p.pos, p.vel);
-            self.events.push(Event::Dashed { player: i as u8, pos, dir: vel.normalize_or_zero() });
-        }
-
-        if input.fire {
-            self.try_fire(i);
+    let hand = worm.hand();
+    if let Some(rope) = &mut worm.rope {
+        // Reeling in first takes up any slack (a slack rope would waste the
+        // pull), then shortens. Paying out just lengthens.
+        let base = if input.reel > 0.0 { rope.length.min((rope.anchor - hand).length()) } else { rope.length };
+        rope.length = (base - input.reel * REEL_SPEED * DT).clamp(ROPE_MIN, ROPE_RANGE);
+        if grid.sample(rope.anchor) > ANCHOR_GONE {
+            worm.rope = None;
         }
     }
 
-    fn try_fire(&mut self, i: usize) {
-        let p = &self.players[i];
-        let (pos, aim, slot) = (p.pos, p.aim, p.current);
-        let w = &p.weapons[slot];
-        if w.cooldown > 0.0 || w.reload > 0.0 || w.ammo == 0 {
-            return;
+    // Velocity. Movement is relative to where the worm looks.
+    let (sy, cy) = worm.yaw.sin_cos();
+    let forward = Vec3::new(sy, 0.0, cy);
+    let right = Vec3::new(-cy, 0.0, sy);
+    let wish = forward * input.move_dir.y + right * input.move_dir.x;
+    let mut vel = worm.vel;
+    if worm.on_ground {
+        // Walk ALONG the ground, not horizontally: a horizontal walk into a
+        // slope loses a quarter of its speed to the push-out every tick. So
+        // work in the ground's plane: tilt the wish into it (keeping its
+        // length) and accelerate the sideways-to-the-normal part of the velocity.
+        // Gravity is not applied: the ground would cancel it anyway, and the
+        // leftover pull along a slope would make a standing worm creep downhill.
+        // (`settle_on_ground` keeps the worm touching the surface instead.)
+        let n = worm.ground_normal;
+        let tilted = wish - n * wish.dot(n);
+        let target = if tilted.length() > 1.0e-4 { tilted / tilted.length() * wish.length() } else { Vec3::ZERO };
+        let along = vel - n * vel.dot(n);
+        // Approach the wanted velocity at a fixed rate. With no input the wanted
+        // velocity is zero, so this is also the friction that stops the worm.
+        // Faster than wanted while steering (landing from a swing): only a
+        // gentle drag, so momentum survives the landing.
+        let wanted = target * WALK_SPEED;
+        let delta = wanted - along;
+        let overspeed = wanted.length() > 0.1 && along.length() > wanted.length() + 0.5;
+        let max_change = if overspeed { OVERSPEED_DRAG } else { GROUND_ACCEL } * DT;
+        vel = along + if delta.length() <= max_change { delta } else { delta / delta.length() * max_change };
+    } else {
+        // In the air: add speed only in the wished direction and only up to a
+        // cap, so steering never removes a swing's momentum. On a rope the push
+        // is stronger and the cap much higher: pumping a swing.
+        let (accel, cap) = if worm.rope.is_some() { (SWING_ACCEL, SWING_MAX_SPEED) } else { (AIR_ACCEL, WALK_SPEED) };
+        let w = wish.length();
+        if w > 1.0e-4 {
+            let dir = wish / w;
+            let flat = Vec3::new(vel.x, 0.0, vel.z);
+            let add = (cap * w - flat.dot(dir)).clamp(0.0, accel * DT);
+            vel += dir * add;
         }
-        let id = w.id;
-        let def = &WEAPONS[id as usize];
-        let dir = vec2(aim.cos(), aim.sin());
-        // Find the build spot before spending a charge: aiming at a wall
-        // should not cost you a block.
-        let build_at = match def.kind {
-            Kind::Build => match self.build_spot(pos, dir, def.range) {
-                Some(spot) => Some(spot),
-                None => return,
-            },
-            _ => None,
-        };
-
-        // Shooting gives up spawn protection: it is there to let you get your
-        // bearings, not to fight for two seconds without being hurt.
-        self.players[i].invuln = 0.0;
-        let w = &mut self.players[i].weapons[slot];
-        w.ammo -= 1;
-        w.cooldown = def.cooldown;
-        if w.ammo == 0 {
-            w.reload = def.reload; // auto-reload as soon as the magazine empties
-        }
-
-        // A weapon with no speed (the bomb) is dropped at your feet, not thrown.
-        // A block "fires" where it appears, so the flash marks the new brick.
-        let muzzle = match build_at {
-            Some((tx, ty)) => tile_center(tx, ty),
-            None if def.kind == Kind::Projectile && def.speed == 0.0 => pos,
-            None => pos + dir * (PLAYER_RADIUS + 4.0),
-        };
-        self.events.push(Event::Shot { player: i as u8, weapon: id, pos: muzzle });
-
-        match def.kind {
-            // A swarm is one shot that makes several projectiles, each with
-            // its own random error.
-            Kind::Projectile => {
-                for _ in 0..def.pellets {
-                    let angle = aim + self.rng.range(-def.spread, def.spread);
-                    self.projectiles.push(Projectile {
-                        pos: muzzle,
-                        vel: vec2(angle.cos(), angle.sin()) * def.speed,
-                        weapon: id,
-                        owner: i as u8,
-                        life: def.lifetime,
-                    });
-                }
-            }
-            Kind::Beam => {
-                let angle = aim + self.rng.range(-def.spread, def.spread);
-                self.fire_beam(i, def, muzzle, vec2(angle.cos(), angle.sin()));
-            }
-            // A placed block is an ordinary brick, so it needs no new rules,
-            // drawing or network message: joiners learn about it from the same
-            // `TileChanged` event that reports a destroyed one.
-            Kind::Build => {
-                if let Some((tx, ty)) = build_at {
-                    self.map.set(tx, ty, Tile::Brick(BRICK_HP));
-                    self.events.push(Event::TileChanged { x: tx, y: ty, tile: Tile::Brick(BRICK_HP) });
-                }
-            }
-        }
+        let falling = vel.y < 0.0 && worm.rope.is_none();
+        vel.y -= GRAVITY * if falling { FALL_GRAVITY_MULT } else { 1.0 } * DT;
     }
 
-    /// Where the build tool puts its brick: the first empty tile along the aim,
-    /// within `range`, that no living player touches (a brick on top of someone
-    /// would trap them inside a wall) and that is not a spawn point (or someone
-    /// could wall it up and respawn inside it). A wall on the way ends the
-    /// search: you cannot build on the far side of one.
-    fn build_spot(&self, from: Vec2, dir: Vec2, range: f32) -> Option<(i32, i32)> {
-        let mut d = 0.0;
-        while d <= range {
-            let (tx, ty) = tile_coords(from + dir * d);
-            if self.map.get(tx, ty).blocks() {
-                return None;
-            }
-            let min = vec2(tx as f32 * TILE, ty as f32 * TILE);
-            let occupied = self
-                .players
-                .iter()
-                .any(|p| p.alive && p.pos.clamp(min, min + Vec2::splat(TILE)).distance(p.pos) < PLAYER_RADIUS);
-            if !occupied && !self.map.spawns.contains(&tile_center(tx, ty)) {
-                return Some((tx, ty));
-            }
-            d += 4.0;
-        }
-        None
-    }
-
-    /// Hitscan: no flying object, the line is resolved instantly.
-    fn fire_beam(&mut self, owner: usize, def: &WeaponDef, origin: Vec2, dir: Vec2) {
-        // 1) The beam ends at the first wall or brick, and leaves it whole.
-        let end = origin + dir * self.map.distance_to_wall(origin, dir, def.range);
-        self.events.push(Event::Beam { from: origin, to: end });
-
-        // 2) Everything within reach of that line gets hit. The beam pierces
-        //    players, so it is not a "first hit only" test.
-        for v in 0..self.players.len() {
-            if v == owner || !self.players[v].alive {
-                continue;
-            }
-            if point_segment_distance(self.players[v].pos, origin, end) < PLAYER_RADIUS + BEAM_SLACK {
-                self.damage_player(v, def.damage, owner, dir * def.knockback);
-            }
+    // Reeling in accelerates the worm towards the anchor, up to a top speed.
+    if let (Some(rope), true) = (worm.rope, input.reel > 0.0) {
+        let to_anchor = rope.anchor - worm.hand();
+        let dist = to_anchor.length();
+        if dist > 1.0e-4 {
+            let dir = to_anchor / dist;
+            let room = (REEL_MAX_SPEED - vel.dot(dir)).max(0.0);
+            vel += dir * (REEL_ACCEL * input.reel * DT).min(room);
         }
     }
-
-    fn respawn(&mut self, i: usize) {
-        // Pick the spawn point farthest from living enemies, with a little
-        // random jitter so ties are not always broken the same way.
-        let enemies: Vec<Vec2> = (0..self.players.len())
-            .filter(|&j| j != i && self.players[j].alive)
-            .map(|j| self.players[j].pos)
-            .collect();
-        let mut best = (f32::MIN, self.map.spawns[0]);
-        for &s in &self.map.spawns.clone() {
-            let nearest = enemies.iter().map(|e| e.distance(s)).fold(f32::MAX, f32::min);
-            let score = nearest.min(2000.0) + self.rng.range(0.0, 50.0);
-            if score > best.0 {
-                best = (score, s);
-            }
-        }
-        let p = &mut self.players[i];
-        p.pos = best.1;
-        p.vel = Vec2::ZERO;
-        p.hp = MAX_HP;
-        p.alive = true;
-        p.invuln = SPAWN_INVULN;
-        p.weapons = p.weapons.iter().map(|w| full_weapon(w.id)).collect();
-        self.events.push(Event::Respawned { player: i as u8 });
+    if rope_kick {
+        vel.y += ROPE_JUMP;
     }
 
-    /// The single place where a player loses health. Funnelling every source of
-    /// damage through one function means self-damage, spawn protection, kill
-    /// credit and scoring live in exactly one spot.
-    fn damage_player(&mut self, victim: usize, amount: f32, source: usize, impulse: Vec2) {
-        let p = &mut self.players[victim];
-        if !p.alive || p.invuln > 0.0 {
-            return;
-        }
-        let amount = if victim == source { amount * SELF_DAMAGE } else { amount };
-        p.hp -= amount;
-        p.vel += impulse; // knockback is NOT reduced for self-hits
-        let pos = p.pos;
-        let dead = p.hp <= 0.0;
-        if amount > 0.0 {
-            self.events.push(Event::Hit { victim: victim as u8, pos, damage: amount });
-        }
-        if dead {
-            let p = &mut self.players[victim];
-            p.alive = false;
-            p.hp = 0.0;
-            p.respawn_timer = RESPAWN_TIME;
-            p.deaths += 1;
-            // Killing yourself costs a point; killing someone else earns one.
-            self.players[source].kills += if victim == source { -1 } else { 1 };
-            self.events.push(Event::Died { victim: victim as u8, killer: source as u8, pos });
-            let score = self.players[source].kills;
-            if score >= self.score_limit && self.winner.is_none() {
-                self.winner = Some(source as u8);
-                self.events.push(Event::MatchWon { player: source as u8 });
-            }
+    // Jump: a held button jumps on every landing, a press just before landing
+    // is remembered, and `coyote` > 0 means "on the ground, or only just left it".
+    let mut jumped = false;
+    if (worm.jump_buffer > 0 || input.jump) && worm.coyote > 0 {
+        jumped = true;
+        vel.y = JUMP_SPEED;
+        worm.coyote = 0;
+        worm.jump_buffer = 0;
+        worm.jumping = true;
+    }
+    worm.jump_buffer = worm.jump_buffer.saturating_sub(1);
+    // Variable jump height: letting go while rising cuts the jump short.
+    if worm.jumping {
+        if vel.y <= 0.0 {
+            worm.jumping = false;
+        } else if !input.jump && vel.y > JUMP_CUT_SPEED {
+            vel.y = JUMP_CUT_SPEED;
+            worm.jumping = false;
         }
     }
+    worm.vel = vel.clamp_length_max(MAX_SPEED);
 
-    // ------------------------------------------------------------ projectiles
-
-    fn step_projectiles(&mut self) {
-        // Take the list out so we can call `&mut self` methods while looping,
-        // then put the survivors back.
-        let old = std::mem::take(&mut self.projectiles);
-        let mut keep = Vec::with_capacity(old.len());
-        'next: for mut pr in old {
-            let def = &WEAPONS[pr.weapon as usize];
-            pr.life -= DT;
-            if let Special::Homing(turn) = def.special {
-                self.steer(&mut pr, turn);
-            }
-
-            // Move in sub-steps of at most 8 px so a fast bolt cannot jump
-            // over a thin wall or a player between two ticks ("tunnelling").
-            let n = ((pr.vel.length() * DT) / 8.0).ceil().max(1.0) as i32;
-            let mut step = pr.vel * DT / n as f32;
-            let mut dir = pr.vel.normalize_or_zero();
-            for _ in 0..n {
-                pr.pos += step;
-
-                let (tx, ty) = tile_coords(pr.pos);
-                if self.map.get(tx, ty).blocks() {
-                    if def.bounce {
-                        // Ricochet: undo the step, then find which wall face we
-                        // hit by trying each axis on its own, and mirror that
-                        // part of the velocity.
-                        pr.pos -= step;
-                        let hit_x = self.map.tile_at(pr.pos + vec2(step.x, 0.0)).blocks();
-                        let hit_y = self.map.tile_at(pr.pos + vec2(0.0, step.y)).blocks();
-                        // Neither axis alone is blocked: we came at a corner,
-                        // so bounce straight back.
-                        let corner = !hit_x && !hit_y;
-                        if hit_x || corner {
-                            pr.vel.x = -pr.vel.x;
-                            step.x = -step.x;
-                        }
-                        if hit_y || corner {
-                            pr.vel.y = -pr.vel.y;
-                            step.y = -step.y;
-                        }
-                        dir = pr.vel.normalize_or_zero();
-                        continue;
-                    }
-                    self.impact(&pr, def, dir, None, Some((tx, ty)));
-                    continue 'next;
-                }
-                // A Cluster shell flies through players and bursts only at a
-                // wall or at the end of its fuse. Bursting on someone put all
-                // seven bomblets on them at once: a one-shot kill up close,
-                // which is not what an area weapon is for.
-                let passes_players = matches!(def.special, Special::Cluster(..));
-                let hit = (0..self.players.len()).find(|&j| {
-                    !passes_players
-                        && j != pr.owner as usize
-                        && self.players[j].alive
-                        && self.players[j].pos.distance(pr.pos) < PLAYER_RADIUS + PROJECTILE_RADIUS
-                });
-                if let Some(j) = hit {
-                    self.impact(&pr, def, dir, Some(j), None);
-                    continue 'next;
-                }
-            }
-
-            if pr.life <= 0.0 {
-                // The end of the flight is an impact with nothing: shells burst,
-                // orbs land and rockets blow up where they are.
-                if def.blast_radius > 0.0 || matches!(def.special, Special::Cluster(..) | Special::Teleport) {
-                    self.impact(&pr, def, dir, None, None);
-                }
-                continue;
-            }
-            keep.push(pr);
-        }
-        // A burst this tick put its children into the (emptied) list: keep them.
-        keep.append(&mut self.projectiles);
-        self.projectiles = keep;
+    // Move in small steps, pushing out of the rock after each. If a ledge blocks
+    // a walking worm, try again from half a metre higher.
+    let was_on_ground = worm.on_ground;
+    let start = worm.pos;
+    let disp = worm.vel * DT;
+    let mut grounded = slide(grid, worm, disp);
+    if was_on_ground && wish.length_squared() > 1.0e-6 {
+        let intended = Vec3::new(disp.x, 0.0, disp.z).length();
+        grounded |= try_step_up(grid, worm, start, intended, wish * (WALK_SPEED * DT));
     }
 
-    /// Homing: turn the velocity towards the nearest living enemy, by at most
-    /// `turn` radians per second. The speed never changes, only the heading, so
-    /// a missile can be out-run around a corner and it still dies on walls.
-    fn steer(&self, pr: &mut Projectile, turn: f32) {
-        let target = (0..self.players.len())
-            .filter(|&j| j != pr.owner as usize && self.players[j].alive)
-            .map(|j| self.players[j].pos)
-            .min_by(|a, b| a.distance_squared(pr.pos).total_cmp(&b.distance_squared(pr.pos)));
-        let Some(target) = target else { return };
-        let want = target - pr.pos;
-        let diff = want.y.atan2(want.x) - pr.vel.y.atan2(pr.vel.x);
-        // Wrap to -PI..PI so it always turns the short way round.
-        let diff = (diff + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
-        let (sin, cos) = diff.clamp(-turn * DT, turn * DT).sin_cos();
-        pr.vel = vec2(pr.vel.x * cos - pr.vel.y * sin, pr.vel.x * sin + pr.vel.y * cos);
-    }
-
-    /// The nearest spot to `pos`, walking back along `-dir`, where a circle of
-    /// `radius` fits. A projectile that hit a wall is a few pixels inside it.
-    fn free_point(&self, pos: Vec2, dir: Vec2, radius: f32) -> Option<Vec2> {
-        (0..20).map(|k| pos - dir * (2.0 * k as f32)).find(|&p| !self.map.circle_hits_wall(p, radius))
-    }
-
-    /// Cluster: the shell splits into `count` children, spread evenly around the
-    /// circle with a random twist so no two bursts look alike. The twist comes
-    /// from the sim's own `rng`, so every machine bursts the same way.
-    fn burst(&mut self, pr: &Projectile, dir: Vec2, count: u8, child: u8) {
-        let def = &WEAPONS[child as usize];
-        let at = self.free_point(pr.pos, dir, PROJECTILE_RADIUS).unwrap_or(pr.pos);
-        let twist = self.rng.range(0.0, std::f32::consts::TAU);
-        for k in 0..count {
-            let a = twist + std::f32::consts::TAU * k as f32 / count as f32;
-            self.projectiles.push(Projectile {
-                pos: at,
-                vel: vec2(a.cos(), a.sin()) * def.speed * self.rng.range(0.6, 1.0),
-                weapon: child,
-                owner: pr.owner,
-                life: def.lifetime * self.rng.range(0.7, 1.0),
-            });
+    // Rope: a taut rope is a hard limit on the distance to the anchor. Pull the
+    // worm back inside it and cancel the speed that was taking it further away.
+    // What is left is sideways speed, which is what makes it a pendulum.
+    if let Some(rope) = worm.rope {
+        let to_anchor = rope.anchor - worm.hand();
+        let dist = to_anchor.length();
+        if dist > rope.length && dist > 1.0e-4 {
+            let dir = to_anchor / dist;
+            worm.pos += dir * (dist - rope.length);
+            worm.vel -= dir * worm.vel.dot(dir).min(0.0);
+            // The pull may have dragged the worm into rock.
+            grounded |= push_out_of_rock(grid, worm, false);
         }
     }
-
-    /// Teleport: the owner appears where the orb landed, or swaps places with
-    /// the player it hit. If the orb landed in a spot too tight to stand in,
-    /// nothing happens (a fizzle), which is better than getting stuck in a wall.
-    fn teleport(&mut self, pr: &Projectile, dir: Vec2, victim: Option<usize>) {
-        let owner = pr.owner as usize;
-        if !self.players[owner].alive {
-            return; // shot, then died before it landed
-        }
-        let from = self.players[owner].pos;
-        let to = match victim {
-            Some(v) => {
-                let to = self.players[v].pos;
-                self.players[v].pos = from;
-                self.players[v].vel = Vec2::ZERO;
-                Some(to)
-            }
-            None => self.free_point(pr.pos, dir, PLAYER_RADIUS),
-        };
-        let Some(to) = to else { return };
-        self.players[owner].pos = to;
-        self.players[owner].vel = Vec2::ZERO;
-        self.events.push(Event::Teleported { player: owner as u8, from, to });
+    // Stick to the ground if walking, but not after a jump or while reeling in.
+    let stick = was_on_ground && !jumped && !worm.jumping && !(worm.rope.is_some() && input.reel > 0.0);
+    let settled = settle_on_ground(grid, worm, stick);
+    worm.on_ground = grounded || settled;
+    if worm.on_ground {
+        worm.jumping = false;
     }
-
-    /// A projectile ended its flight against a wall or a player.
-    fn impact(&mut self, pr: &Projectile, def: &WeaponDef, dir: Vec2, victim: Option<usize>, wall: Option<(i32, i32)>) {
-        match def.special {
-            Special::Cluster(count, child) => return self.burst(pr, dir, count, child),
-            Special::Teleport => return self.teleport(pr, dir, victim),
-            _ => {}
-        }
-        if def.blast_radius > 0.0 {
-            // A shell that hit a wall is a few pixels inside it. Blow it up on
-            // the side it came from, so the wall it hit is between the blast
-            // and whoever hides behind it.
-            let at = self.free_point(pr.pos, dir, PROJECTILE_RADIUS).unwrap_or(pr.pos);
-            self.explode(at, def, pr.owner as usize);
-            return;
-        }
-        if let Some(v) = victim {
-            self.damage_player(v, def.damage, pr.owner as usize, dir * def.knockback);
-        }
-        if let Some((tx, ty)) = wall {
-            if def.tile_damage > 0 {
-                self.hurt_tile(tx, ty, def.tile_damage);
-            }
-        }
+    if !worm.on_ground {
+        worm.ground_normal = Vec3::Y;
     }
+    // Safety net: nothing legitimate leaves the world (outside counts as rock),
+    // but a bug or a freak push must never lose a worm for good.
+    let size = grid.size_metres();
+    let lo = Vec3::new(WORM_RADIUS, 0.0, WORM_RADIUS);
+    worm.pos = worm.pos.clamp(lo, Vec3::new(size.x - WORM_RADIUS, size.y - WORM_HEIGHT, size.z - WORM_RADIUS));
 
-    /// Damage falls off linearly with distance, and only reaches players who
-    /// can see the blast: walls and bricks are cover. That is what makes a
-    /// built block an answer to a rocket or a Nova. Players are hurt before
-    /// the bricks are, so the brick that a blast destroys still shields you
-    /// from that blast: it absorbs exactly one hit.
-    fn explode(&mut self, pos: Vec2, def: &WeaponDef, owner: usize) {
-        self.events.push(Event::Explosion { pos, radius: def.blast_radius });
-
-        for v in 0..self.players.len() {
-            let offset = self.players[v].pos - pos;
-            let reach = def.blast_radius + PLAYER_RADIUS;
-            let d = offset.length();
-            if !self.players[v].alive || d >= reach || !self.map.line_of_sight(pos, self.players[v].pos) {
-                continue;
-            }
-            let falloff = 1.0 - d / reach;
-            let impulse = offset.normalize_or_zero() * def.knockback * falloff;
-            self.damage_player(v, def.blast_damage * falloff, owner, impulse);
-        }
-
-        if def.tile_damage > 0 {
-            let (x0, y0) = tile_coords(pos - Vec2::splat(def.blast_radius));
-            let (x1, y1) = tile_coords(pos + Vec2::splat(def.blast_radius));
-            for ty in y0..=y1 {
-                for tx in x0..=x1 {
-                    if tile_center(tx, ty).distance(pos) < def.blast_radius + TILE * 0.25 {
-                        self.hurt_tile(tx, ty, def.tile_damage);
-                    }
-                }
-            }
-        }
-    }
-
-
-    fn hurt_tile(&mut self, tx: i32, ty: i32, amount: u8) {
-        if let Some(tile) = self.map.damage(tx, ty, amount) {
-            self.events.push(Event::TileChanged { x: tx, y: ty, tile });
+    // Dig. After the move, so the hole is where the worm is looking now.
+    worm.dig_cooldown = worm.dig_cooldown.saturating_sub(1);
+    if input.dig && worm.dig_cooldown == 0 {
+        if let Some(centre) = dig_target(grid, worm) {
+            let shape = Shape::Sphere { center: centre, radius: DIG_RADIUS };
+            grid.apply(shape, Op::Carve);
+            events.push(Event::Edit { shape, op: Op::Carve });
+            worm.dig_cooldown = DIG_INTERVAL;
         }
     }
 }
 
-fn full_weapon(id: u8) -> WeaponState {
-    WeaponState { id, ammo: WEAPONS[id as usize].mag, cooldown: 0.0, reload: 0.0 }
+/// Where a dig would be centred: the first rock the worm looks at within reach.
+/// The viewer uses this too, to preview the hole.
+pub fn dig_target(grid: &Grid, worm: &Worm) -> Option<Vec3> {
+    let dir = worm.aim_dir();
+    grid.raycast(worm.eye(), dir, DIG_REACH).map(|t| worm.eye() + dir * t)
 }
 
-fn point_segment_distance(p: Vec2, a: Vec2, b: Vec2) -> f32 {
-    let ab = b - a;
-    let len2 = ab.length_squared();
-    let t = if len2 == 0.0 { 0.0 } else { ((p - a).dot(ab) / len2).clamp(0.0, 1.0) };
-    p.distance(a + ab * t)
+/// Resolve the overlaps between the body spheres and the terrain. Returns true
+/// if the worm is pushed up by something ground-like.
+///
+/// Pushing a sphere out of a distance field: the field value is how far the
+/// sphere's centre is from the surface, so `radius - value` is how deep it is
+/// in, and the gradient is the way out. Several spheres can push in different
+/// directions (a worm in a corner), so repeat a few passes until none is
+/// touching.
+///
+/// `roll_over_edges` keeps the tilted normal at an edge. Only the step-up uses
+/// it: lowering the worm onto a ledge it relies on the foot rolling up the
+/// corner, which a sideways-only push forbids.
+fn push_out_of_rock(grid: &Grid, worm: &mut Worm, roll_over_edges: bool) -> bool {
+    let mut grounded = false;
+    for _ in 0..4 {
+        let mut pushed = false;
+        for offset in BODY_SPHERES {
+            let centre = worm.pos + Vec3::Y * offset;
+            let d = grid.sample(centre);
+            if d >= WORM_RADIUS {
+                continue;
+            }
+            let mut normal = grid.gradient(centre);
+            if normal == Vec3::ZERO {
+                normal = Vec3::Y; // buried deeper than the field knows: go up
+            }
+            let ground_like = normal.y > GROUND_COS;
+            // A wall pushes sideways only. Pushed along its own (slightly tilted)
+            // normal, a worm running into a wall was lifted a little each tick, and
+            // at the crease where wall meets floor, where the normal is diagonal,
+            // it climbed the wall. (A ceiling, normal.y < 0, still pushes down.)
+            if !roll_over_edges && !ground_like && normal.y > 0.0 {
+                let sideways = Vec3::new(normal.x, 0.0, normal.z);
+                if sideways.length() > 1.0e-3 {
+                    normal = sideways.normalize();
+                }
+            }
+            worm.pos += normal * (WORM_RADIUS - d).min(MAX_PUSH);
+            // Remove the part of the velocity that points into the surface, keep
+            // the rest: that is sliding along a wall.
+            let into = worm.vel.dot(normal);
+            if into < 0.0 {
+                worm.vel -= normal * into;
+            }
+            grounded |= ground_like;
+            pushed = true;
+        }
+        if !pushed {
+            break;
+        }
+    }
+    grounded
+}
+
+/// Move by `disp` in steps of at most `MAX_STEP`, pushing out of the rock after
+/// each. Returns true if something ground-like pushed the worm.
+fn slide(grid: &Grid, worm: &mut Worm, disp: Vec3) -> bool {
+    let steps = (disp.length() / MAX_STEP).ceil().max(1.0);
+    let mut grounded = false;
+    for _ in 0..steps as u32 {
+        worm.pos += disp / steps;
+        grounded |= push_out_of_rock(grid, worm, false);
+    }
+    grounded
+}
+
+/// A worm walking into a ledge is stopped by the rounded foot touching its edge.
+/// If the walk made less than a quarter of the horizontal distance it meant to
+/// (`intended`), try a full tick of walking (`want`) from `STEP_UP` higher, then
+/// lower the worm onto whatever is there. Keeps the result only if it got
+/// further. `want` is not the real velocity because the wall has just cancelled
+/// that (and a worm starting to walk has not got up to speed either).
+fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: Vec3) -> bool {
+    let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
+    let got = flat(worm.pos - start);
+    if got >= intended * 0.25 {
+        return false; // not blocked
+    }
+    let (blocked_pos, blocked_vel) = (worm.pos, worm.vel);
+    worm.pos = start + Vec3::Y * STEP_UP;
+    let fits = BODY_SPHERES.iter().all(|&h| grid.sample(worm.pos + Vec3::Y * h) >= WORM_RADIUS * 0.99);
+    if fits {
+        slide(grid, worm, want);
+        // Lower the worm until its foot touches something, a little at a time. (Dropping
+        // it the whole way and pushing it out again would shove it back off the
+        // ledge's corner by as much as it had just moved forward.)
+        let mut dropped = 0.0;
+        while dropped < STEP_UP && grid.sample(worm.pos + Vec3::Y * WORM_RADIUS) > WORM_RADIUS + 0.02 {
+            worm.pos.y -= 0.05;
+            dropped += 0.05;
+        }
+        let grounded = push_out_of_rock(grid, worm, true);
+        if flat(worm.pos - start) > got + 0.02 {
+            worm.vel = Vec3::new(want.x / DT, worm.vel.y, want.z / DT);
+            return grounded;
+        }
+    }
+    worm.pos = blocked_pos;
+    worm.vel = blocked_vel;
+    false
+}
+
+/// Is the worm standing on something? If the feet are within `GROUND_SKIN`
+/// above ground-like terrain, and not moving away from it, pull the worm down
+/// onto it (along the normal, so a slope does not make it slide).
+///
+/// With `stick` (the worm was walking), the reach is `STICK_DISTANCE` and
+/// "moving away" is ignored: a worm walking over a crest has upward speed from
+/// the slope it just climbed, and without this it would launch off every bump.
+/// Its speed is turned into the new ground's plane instead.
+///
+/// The normal is taken at the feet, not at the foot sphere's centre: where a
+/// wall meets the floor the field is the minimum of two planes, and at the
+/// sphere's centre the gradient points diagonally between them.
+fn settle_on_ground(grid: &Grid, worm: &mut Worm, stick: bool) -> bool {
+    let reach = if stick { STICK_DISTANCE } else { GROUND_SKIN };
+    let d = grid.sample(worm.pos + Vec3::Y * WORM_RADIUS);
+    if d >= WORM_RADIUS + reach {
+        return false;
+    }
+    let normal = grid.gradient(worm.pos);
+    if normal.y <= GROUND_COS || (!stick && worm.vel.dot(normal) > 0.5) {
+        return false; // a wall, or flying away (a jump just started)
+    }
+    // The feet themselves must be near the ground. The foot sphere can be close
+    // to a WALL while the feet hang half a metre above the floor; that is not
+    // standing. (On a slope the feet sit a little above the surface point the
+    // sphere touches, hence the allowance.)
+    if grid.sample(worm.pos) > reach + WORM_RADIUS * (1.0 - normal.y) {
+        return false;
+    }
+    if d > WORM_RADIUS {
+        worm.pos -= normal * (d - WORM_RADIUS);
+    }
+    if stick {
+        let away = worm.vel.dot(normal);
+        if away > 0.0 {
+            worm.vel -= normal * away;
+        }
+    }
+    worm.ground_normal = normal;
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tilemap::MAP_GRID;
-    use crate::weapons::{ARSENAL, BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT};
+    use glam::IVec3;
+    use std::f32::consts::FRAC_PI_2;
 
-    // These tests need no window, GPU or sound: the payoff of keeping the sim
-    // free of rendering code.
+    // Test worlds are 32 x 16 x 32 m. Each is a distance function (negative =
+    // rock) turned into a grid with `Grid::from_fn`, so they build in
+    // milliseconds even in a debug build.
+    const SIZE: IVec3 = IVec3::new(8, 4, 8);
 
-    fn two_player_world() -> World {
-        let mut w = World::new(Tilemap::from_ascii(MAP_GRID), 2, &[BLASTER, ROCKET, RAILGUN], 1);
-        // Row 1 of the Grid map: tiles 2 and 3 are empty, 4 and 5 are bricks, 6 is empty.
-        w.players[0].pos = tile_center(1, 1);
-        w.players[1].pos = tile_center(3, 1);
+    /// Rock below y = 4.
+    fn flat(p: Vec3) -> f32 {
+        p.y - 4.0
+    }
+
+    /// The flat ground plus a wall: rock for x > 20.
+    fn walled(p: Vec3) -> f32 {
+        (p.y - 4.0).min(20.0 - p.x)
+    }
+
+    /// The flat ground plus a ceiling: rock above y = 14.
+    fn ceilinged(p: Vec3) -> f32 {
+        (p.y - 4.0).min(14.0 - p.y)
+    }
+
+    /// A 30 degree ramp rising towards +x. Exact distance to the plane.
+    fn ramp(p: Vec3) -> f32 {
+        let (s, c) = 30f32.to_radians().sin_cos();
+        (p.y - 4.0 - p.x * s / c) * c
+    }
+
+    fn world(f: fn(Vec3) -> f32, spawn: (f32, f32)) -> World {
+        World::new(Grid::from_fn(SIZE, f), &[spawn])
+    }
+
+    fn run(w: &mut World, ticks: usize, input: Input) {
+        for _ in 0..ticks {
+            w.step(&[input]);
+        }
+    }
+
+    fn settled(f: fn(Vec3) -> f32, spawn: (f32, f32)) -> World {
+        let mut w = world(f, spawn);
+        // `World::new` drops worms from the top of the world, which is rock in
+        // the ceiling world, so put the worm on the ground by hand.
+        w.worms[0].pos.y = 4.05;
+        run(&mut w, 60, Input::default());
         w
     }
 
-    fn fire_once(w: &mut World, who: usize, weapon: u8, aim: f32) {
-        let mut inputs = vec![Input::default(); w.players.len()];
-        inputs[who] = Input { fire: true, weapon, aim, ..Default::default() };
-        w.step(&inputs);
-        for _ in 0..30 {
-            w.step(&[]);
+    fn walk(yaw: f32) -> Input {
+        Input { move_dir: Vec2::new(0.0, 1.0), yaw, ..Input::default() }
+    }
+
+    #[test]
+    fn a_worm_lands_on_flat_ground_and_stays_put() {
+        let mut w = world(flat, (16.0, 16.0));
+        assert!(w.worms[0].pos.y > 4.0, "spawns just above the ground");
+        run(&mut w, 60, Input::default());
+        let at = w.worms[0].pos;
+        run(&mut w, 120, Input::default());
+        let worm = &w.worms[0];
+        assert!(worm.on_ground);
+        assert!((worm.pos.y - 4.0).abs() < 0.02, "rests on the surface: {}", worm.pos.y);
+        assert!((worm.pos - at).length() < 0.01, "does not creep");
+    }
+
+    #[test]
+    fn walking_goes_where_the_worm_looks_at_walking_speed() {
+        let mut w = settled(flat, (16.0, 16.0));
+        let start = w.worms[0].pos;
+        run(&mut w, 30, walk(0.0)); // yaw 0 looks along +z
+        let moved = w.worms[0].pos - start;
+        assert!(moved.z > 3.0 && moved.z < 4.0, "half a second at 8 m/s minus the start-up: {moved:?}");
+        assert!(moved.x.abs() < 0.01);
+        run(&mut w, 30, walk(FRAC_PI_2)); // a quarter turn left looks along +x
+        assert!(w.worms[0].pos.x - start.x > 2.0, "turned: {:?}", w.worms[0].pos);
+        // Strafing right while looking along +z goes towards -x.
+        let mut w = settled(flat, (16.0, 16.0));
+        let x = w.worms[0].pos.x;
+        run(&mut w, 30, Input { move_dir: Vec2::new(1.0, 0.0), ..Input::default() });
+        assert!(w.worms[0].pos.x < x - 2.0);
+    }
+
+    #[test]
+    fn a_worm_stops_when_the_input_stops() {
+        let mut w = settled(flat, (16.0, 16.0));
+        run(&mut w, 30, walk(0.0));
+        run(&mut w, 15, Input::default());
+        assert!(w.worms[0].vel.length() < 0.01, "{:?}", w.worms[0].vel);
+    }
+
+    #[test]
+    fn a_wall_stops_the_worm_and_it_does_not_get_inside() {
+        let mut w = settled(walled, (16.0, 16.0));
+        run(&mut w, 180, walk(FRAC_PI_2));
+        let worm = &w.worms[0];
+        let reach = 20.0 - WORM_RADIUS;
+        assert!(worm.pos.x > reach - 0.1 && worm.pos.x < reach + 0.05, "x = {}", worm.pos.x);
+        assert!(worm.on_ground);
+    }
+
+    /// Highest the worm gets above `ground` in `ticks` ticks of `input`.
+    fn apex(w: &mut World, ground: f32, ticks: usize, input: Input) -> f32 {
+        let mut apex: f32 = 0.0;
+        for _ in 0..ticks {
+            w.step(&[input]);
+            apex = apex.max(w.worms[0].pos.y - ground);
         }
+        apex
     }
 
     #[test]
-    fn blaster_bolt_damages_enemy() {
-        let mut w = two_player_world();
-        fire_once(&mut w, 0, 0, 0.0);
-        assert!(w.players[1].hp < MAX_HP);
+    fn holding_jump_rises_two_and_a_half_metres_and_a_tap_hops_low() {
+        let mut w = settled(flat, (16.0, 16.0));
+        let ground = w.worms[0].pos.y;
+        let up = apex(&mut w, ground, 30, Input { jump: true, ..Input::default() });
+        assert!(up > 2.0 && up < 2.6, "held jump apex {up}");
+        run(&mut w, 90, Input::default());
+        assert!(w.worms[0].on_ground, "back on the ground");
+
+        let mut w = settled(flat, (16.0, 16.0));
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        let hop = apex(&mut w, ground, 90, Input::default());
+        assert!(hop > 0.15 && hop < 1.0, "a tap is a hop: {hop}");
     }
 
     #[test]
-    fn killing_scores_and_victim_respawns() {
-        let mut w = two_player_world();
-        w.players[1].hp = 5.0;
-        fire_once(&mut w, 0, 0, 0.0);
-        assert!(!w.players[1].alive);
-        assert_eq!(w.players[0].kills, 1);
-        for _ in 0..(RESPAWN_TIME / DT) as i32 + 5 {
-            w.step(&[]);
+    fn there_is_no_jumping_in_mid_air() {
+        let mut w = settled(flat, (16.0, 16.0));
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        run(&mut w, 10, Input { jump: true, ..Input::default() });
+        let worm = &w.worms[0];
+        assert!(!worm.on_ground);
+        assert!(worm.vel.y < JUMP_SPEED - 3.0, "still slowing down, no second jump: {}", worm.vel.y);
+    }
+
+    #[test]
+    fn a_jump_pressed_just_before_landing_still_happens() {
+        let mut w = settled(flat, (16.0, 16.0));
+        w.worms[0].pos.y += 1.5;
+        w.worms[0].on_ground = false;
+        while !(w.worms[0].vel.y < 0.0 && w.worms[0].pos.y < 4.0 + 0.4) {
+            w.step(&[Input::default()]); // fall until just above the ground
         }
-        assert!(w.players[1].alive);
-        assert_eq!(w.players[1].hp, MAX_HP);
+        w.step(&[Input { jump: true, ..Input::default() }]); // a press, too early
+        let mut best: f32 = 0.0;
+        for _ in 0..20 {
+            w.step(&[Input::default()]);
+            best = best.max(w.worms[0].vel.y);
+        }
+        assert!(best > 3.0, "the buffered press jumped on landing: {best}");
     }
 
     #[test]
-    fn rocket_destroys_brick_and_reports_it() {
-        let mut w = two_player_world();
-        w.players[1].pos = tile_center(30, 10); // out of the way
-        w.drain_events();
-        fire_once(&mut w, 0, 1, 0.0);
-        assert_eq!(w.map.get(4, 1), Tile::Empty);
+    fn a_jump_pressed_just_after_walking_off_an_edge_still_works() {
+        // A 3 m cliff: ground at y = 4 for x < 18, at y = 1 beyond.
+        fn cliff(p: Vec3) -> f32 {
+            (p.y - 4.0).max(p.x - 18.0).min(p.y - 1.0)
+        }
+        let mut w = settled(cliff, (14.0, 16.0));
+        let go = walk(FRAC_PI_2);
+        for _ in 0..200 {
+            w.step(&[go]);
+            if !w.worms[0].on_ground {
+                break;
+            }
+        }
+        assert!(!w.worms[0].on_ground, "walked off the edge");
+        run(&mut w, 3, go);
+        w.step(&[Input { jump: true, ..go }]);
+        assert!(w.worms[0].vel.y > 5.0, "coyote time: {}", w.worms[0].vel.y);
+        // But not long after.
+        let mut w = settled(cliff, (14.0, 16.0));
+        for _ in 0..200 {
+            w.step(&[go]);
+            if !w.worms[0].on_ground {
+                break;
+            }
+        }
+        run(&mut w, 12, go);
+        w.step(&[Input { jump: true, ..go }]);
+        assert!(w.worms[0].vel.y < 0.0, "too late: {}", w.worms[0].vel.y);
+    }
+
+    #[test]
+    fn speed_from_the_air_survives_a_landing_while_steering_but_not_without_keys() {
+        let landing = |input: Input| {
+            let mut w = settled(flat, (6.0, 16.0));
+            w.worms[0].pos.y += 0.3;
+            w.worms[0].on_ground = false;
+            w.worms[0].vel = Vec3::new(16.0, -2.0, 0.0);
+            run(&mut w, 30, input);
+            w.worms[0].vel.x
+        };
+        assert!(landing(walk(FRAC_PI_2)) > 11.0, "steering keeps momentum: {}", landing(walk(FRAC_PI_2)));
+        assert!(landing(Input::default()) < 1.0, "letting go of the keys brakes: {}", landing(Input::default()));
+    }
+
+    #[test]
+    fn a_worm_stands_on_a_slope_without_sliding_and_can_climb_it() {
+        // Low on the ramp: it rises 0.58 m per metre and the test world is only
+        // 16 m tall, so a worm higher up would soon bump its head on the world top.
+        let mut w = settled(ramp, (6.0, 16.0));
+        let at = w.worms[0].pos;
+        assert!(w.worms[0].on_ground);
+        run(&mut w, 120, Input::default());
+        let drift = Vec3::new(w.worms[0].pos.x - at.x, 0.0, w.worms[0].pos.z - at.z).length();
+        assert!(drift < 0.05, "slid {drift} m in 2 s");
+        run(&mut w, 60, walk(FRAC_PI_2)); // +x is uphill
+        let climbed = w.worms[0].pos.x - at.x;
+        assert!(climbed > 3.0, "climbed {climbed} m in a second");
+        assert!(w.worms[0].on_ground);
+    }
+
+    #[test]
+    fn a_worm_buried_in_rock_is_pushed_out() {
+        let mut w = settled(flat, (16.0, 16.0));
+        w.worms[0].pos.y = 3.3; // the body is half inside the ground
+        run(&mut w, 60, Input::default());
+        assert!((w.worms[0].pos.y - 4.0).abs() < 0.05, "{}", w.worms[0].pos.y);
+    }
+
+    #[test]
+    fn digging_carves_the_rock_it_looks_at_and_reports_the_edit() {
+        let mut w = settled(walled, (17.5, 16.0));
+        let look = Input { yaw: FRAC_PI_2, dig: true, ..Input::default() };
+        let eye_y = w.worms[0].eye().y;
+        assert!(w.grid.sample(Vec3::new(20.5, eye_y, 16.0)) < 0.0);
+        w.step(&[look]);
+        assert!(w.grid.sample(Vec3::new(20.5, eye_y, 16.0)) > 0.0, "a hole in the wall");
         let events = w.drain_events();
-        assert!(events.iter().any(|e| matches!(e, Event::TileChanged { x: 4, y: 1, tile: Tile::Empty })));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::Edit { op: Op::Carve, .. }));
+        assert!(w.drain_events().is_empty(), "drained");
+        assert!(!w.grid.take_dirty().is_empty(), "the renderer is told which chunks changed");
     }
 
     #[test]
-    fn rocket_at_own_feet_is_halved_and_scores_nothing() {
-        let mut w = two_player_world();
-        w.players[1].pos = tile_center(30, 10);
-        w.players[0].pos = tile_center(1, 1);
-        // Aim at the wall right behind us (left).
-        fire_once(&mut w, 0, 1, std::f32::consts::PI);
-        let p = &w.players[0];
-        assert!(p.hp < MAX_HP && p.hp > MAX_HP - 40.0, "self damage is halved, hp = {}", p.hp);
-        assert_eq!(w.players[0].kills, 0); // surviving a self-hit scores nothing
+    fn digging_is_rate_limited_and_needs_rock_within_reach() {
+        // Looking at the sky: nothing to dig.
+        let mut w = settled(flat, (16.0, 16.0));
+        run(&mut w, 30, Input { pitch: 1.0, dig: true, ..Input::default() });
+        assert!(w.drain_events().is_empty());
+        // Digging into a wall while walking forward for 3 s: one dig per
+        // DIG_INTERVAL ticks at most, and plenty of them.
+        let mut w = settled(walled, (17.5, 16.0));
+        let dig_in = Input { yaw: FRAC_PI_2, pitch: -0.15, dig: true, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+        run(&mut w, 180, dig_in);
+        let n = w.drain_events().len();
+        assert!(n >= 4, "only {n} digs in 3 s");
+        assert!(n <= 180 / DIG_INTERVAL as usize + 1, "{n} digs in 3 s is faster than the limit");
     }
 
     #[test]
-    fn railgun_stops_at_a_brick_and_leaves_it_whole() {
-        let mut w = two_player_world();
-        w.players[1].pos = tile_center(6, 1); // behind bricks at tiles 4 and 5
-        fire_once(&mut w, 0, 2, 0.0);
-        assert_eq!(w.map.get(4, 1), Tile::Brick(BRICK_HP));
-        assert_eq!(w.players[1].hp, MAX_HP, "a brick is cover from the rail");
+    fn a_worm_can_dig_its_own_tunnel_into_a_hillside() {
+        let mut w = settled(walled, (17.5, 16.0));
+        // Looking slightly down so the hole reaches the floor the worm stands on.
+        let dig_in = Input { yaw: FRAC_PI_2, pitch: -0.15, dig: true, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+        run(&mut w, 300, dig_in);
+        let x = w.worms[0].pos.x;
+        assert!(x > 20.0 + 4.0, "walked 4 m into the wall, x = {x}");
     }
 
     #[test]
-    fn railgun_forgives_a_near_miss() {
-        // 12 px off the beam's line: outside the body (10 px), inside the
-        // beam's extra width.
-        let mut w = World::new(Tilemap::from_ascii(crate::tilemap::MAP_HUB), 2, &[RAILGUN], 1);
-        w.players[0].pos = tile_center(5, 4);
-        w.players[1].pos = tile_center(15, 4) + vec2(0.0, 12.0);
-        fire_once(&mut w, 0, 0, 0.0);
-        assert!(w.players[1].hp < MAX_HP);
+    fn the_rope_hangs_on_the_ceiling_and_reeling_pulls_the_worm_up() {
+        let mut w = settled(ceilinged, (16.0, 16.0));
+        let shoot = Input { pitch: 1.0, rope: true, ..Input::default() };
+        w.step(&[shoot]);
+        let rope = w.worms[0].rope.expect("attached");
+        assert!((rope.anchor.y - 14.0).abs() < 0.1, "anchored on the ceiling: {:?}", rope.anchor);
+        run(&mut w, 1, Input { pitch: 1.0, ..Input::default() }); // button up
+        let before = w.worms[0].pos.y;
+        run(&mut w, 30, Input { pitch: 1.0, reel: 1.0, ..Input::default() });
+        let worm = &w.worms[0];
+        let rope = worm.rope.expect("still attached");
+        assert!(rope.length < 8.0, "reeled in 3 m: {}", rope.length);
+        assert!((rope.anchor - worm.hand()).length() <= rope.length + 0.1, "never further than the rope");
+        assert!(worm.pos.y > before + 0.5, "pulled off the ground");
     }
 
     #[test]
-    fn firing_ends_spawn_protection() {
-        let mut w = two_player_world();
-        w.players[0].invuln = SPAWN_INVULN;
-        w.step(&[Input { fire: true, ..Default::default() }]);
-        assert_eq!(w.players[0].invuln, 0.0);
-    }
-
-    #[test]
-    fn bouncer_kills_in_four_hits() {
-        let damage = WEAPONS[BOUNCER as usize].damage;
-        assert!(4.0 * damage >= MAX_HP && 3.0 * damage < MAX_HP);
-    }
-
-    #[test]
-    fn empty_magazine_triggers_reload() {
-        let mut w = two_player_world();
-        w.players[1].pos = tile_center(30, 10);
-        // Railgun has a 1-round magazine.
-        let shoot = [Input { fire: true, weapon: 2, ..Default::default() }];
-        w.step(&shoot);
-        assert_eq!(w.players[0].weapons[2].ammo, 0);
-        assert!(w.players[0].weapons[2].reload > 0.0);
-        for _ in 0..(2.6 / DT) as i32 {
-            w.step(&[Input { weapon: 2, ..Default::default() }]);
-        }
-        assert_eq!(w.players[0].weapons[2].ammo, 1);
-    }
-
-    /// Two players in the Grid map's top-left corner with every weapon, and the
-    /// slot number of `weapon` in that loadout.
-    fn armed_world(weapon: u8) -> (World, u8) {
-        let mut w = World::new(Tilemap::from_ascii(MAP_GRID), 2, &ARSENAL, 1);
-        w.players[0].pos = tile_center(1, 1);
-        w.players[1].pos = tile_center(3, 1);
-        (w, ARSENAL.iter().position(|&id| id == weapon).unwrap() as u8)
-    }
-
-    #[test]
-    fn block_is_built_on_the_first_free_tile_in_front() {
-        let (mut w, slot) = armed_world(BUILD);
-        w.drain_events();
-        // Aim down: our own tile is taken by us, so the block lands one below.
-        w.step(&[Input { fire: true, weapon: slot, aim: std::f32::consts::FRAC_PI_2, ..Default::default() }]);
-        assert_eq!(w.map.get(1, 2), Tile::Brick(BRICK_HP));
-        assert_eq!(w.players[0].weapons[slot as usize].ammo, WEAPONS[BUILD as usize].mag - 1);
-        assert!(w.drain_events().iter().any(|e| matches!(e, Event::TileChanged { x: 1, y: 2, .. })));
-    }
-
-    #[test]
-    fn building_into_a_wall_costs_nothing() {
-        let (mut w, slot) = armed_world(BUILD);
-        w.step(&[Input { fire: true, weapon: slot, aim: std::f32::consts::PI, ..Default::default() }]);
-        assert_eq!(w.players[0].weapons[slot as usize].ammo, WEAPONS[BUILD as usize].mag);
-    }
-
-    #[test]
-    fn a_block_never_traps_a_player() {
-        let (mut w, slot) = armed_world(BUILD);
-        w.players[1].pos = tile_center(2, 1); // standing right in front of us
-        w.step(&[Input { fire: true, weapon: slot, ..Default::default() }]);
-        assert_eq!(w.map.get(2, 1), Tile::Empty, "not on top of the enemy");
-        assert_eq!(w.map.get(3, 1), Tile::Brick(BRICK_HP), "but just behind them");
-    }
-
-    #[test]
-    fn a_block_absorbs_one_rocket_blast() {
-        // A rocket fired at a player with a block right in front of them: the
-        // blast is close enough to hurt, but the block is in between.
-        let mut w = World::new(Tilemap::from_ascii(crate::tilemap::MAP_HUB), 2, &[ROCKET], 1);
-        w.players[0].pos = tile_center(20, 4);
-        w.players[1].pos = tile_center(10, 4);
-        w.map.set(11, 4, Tile::Brick(BRICK_HP));
-        let fire_left = |w: &mut World| {
-            w.step(&[Input { fire: true, aim: std::f32::consts::PI, ..Default::default() }]);
-            for _ in 0..90 {
-                w.step(&[]);
-            }
-        };
-        fire_left(&mut w);
-        assert_eq!(w.players[1].hp, MAX_HP, "the block took the whole blast");
-        assert_eq!(w.map.get(11, 4), Tile::Empty, "and was destroyed by it");
-        fire_left(&mut w);
-        assert!(w.players[1].hp < MAX_HP, "so the next rocket gets through");
-    }
-
-    #[test]
-    fn bouncer_ricochets_off_a_wall() {
-        let (mut w, slot) = armed_world(BOUNCER);
-        w.players[1].pos = tile_center(30, 10);
-        // Fire left, straight into the border wall two tiles away.
-        w.step(&[Input { fire: true, weapon: slot, aim: std::f32::consts::PI, ..Default::default() }]);
-        for _ in 0..10 {
-            w.step(&[]);
-        }
-        assert_eq!(w.projectiles.len(), 1, "it must survive the wall");
-        assert!(w.projectiles[0].vel.x > 0.0, "and now fly back the other way");
-    }
-
-    /// Two players in the open middle of the menu map, the first one carrying
-    /// only `weapon`.
-    fn open_world(weapon: u8, me: (i32, i32), enemy: (i32, i32)) -> World {
-        let mut w = World::new(Tilemap::from_ascii(crate::tilemap::MAP_HUB), 2, &[weapon], 1);
-        w.players[0].pos = tile_center(me.0, me.1);
-        w.players[1].pos = tile_center(enemy.0, enemy.1);
-        w
-    }
-
-    #[test]
-    fn bomb_blast_is_round_and_reaches_the_diagonal() {
-        let mut w = open_world(BOMB, (19, 4), (20, 5)); // diagonal: the old plus missed here
-        w.map.set(17, 4, Tile::Brick(BRICK_HP));
-        w.step(&[Input { fire: true, ..Default::default() }]);
-        // Dropped at the owner's feet, not thrown.
-        assert_eq!(w.projectiles[0].pos, tile_center(19, 4));
-        for _ in 0..(1.3 / DT) as i32 {
-            w.step(&[]);
-        }
-        assert!(w.projectiles.is_empty(), "the fuse ran out");
-        assert!(w.players[1].hp < MAX_HP - 50.0, "hp = {}", w.players[1].hp);
-        assert!(w.players[0].hp < MAX_HP, "the one who dropped it is hurt too");
-        assert_eq!(w.map.get(17, 4), Tile::Empty, "and the brick next to it is gone");
-    }
-
-    #[test]
-    fn bomb_goes_off_when_an_enemy_steps_on_it() {
-        let mut w = open_world(BOMB, (19, 4), (22, 4));
-        w.step(&[Input { fire: true, ..Default::default() }]);
-        w.players[0].pos = tile_center(19, 1); // walk away from it
-        let walk_left = Input { move_dir: vec2(-1.0, 0.0), ..Default::default() };
+    fn a_rope_swing_builds_speed_and_letting_go_keeps_it() {
+        let mut w = settled(ceilinged, (16.0, 16.0));
+        // Hang in mid-air under the ceiling and shoot the rope up and forward.
+        w.worms[0].pos = Vec3::new(16.0, 8.0, 16.0);
+        w.worms[0].on_ground = false;
+        let press = Input { pitch: 0.9, rope: true, ..Input::default() };
+        let hold = Input { pitch: 0.9, ..Input::default() };
+        w.step(&[press]);
+        // Holding the button is not pressing it again.
+        run(&mut w, 5, press);
+        assert!(w.worms[0].rope.is_some(), "holding is not pressing again");
+        // The rope is taut from the start, so gravity swings the worm down and
+        // forward like a pendulum.
+        let mut fastest: f32 = 0.0;
         for _ in 0..45 {
-            w.step(&[Input::default(), walk_left]);
+            w.step(&[hold]);
+            fastest = fastest.max(w.worms[0].vel.length());
+            let worm = &w.worms[0];
+            let rope = worm.rope.unwrap();
+            assert!((rope.anchor - worm.hand()).length() <= rope.length + 0.1, "stretched the rope");
+            assert!(!worm.on_ground, "the swing stays in the air");
         }
-        assert!(w.projectiles.is_empty(), "it went off before its fuse");
-        assert!(w.players[1].hp < MAX_HP);
+        assert!(fastest > 5.0, "a swing from rest builds speed: {fastest}");
+        // Second press: let go.
+        w.step(&[press]);
+        assert!(w.worms[0].rope.is_none());
+        let flat = |w: &World| Vec3::new(w.worms[0].vel.x, 0.0, w.worms[0].vel.z).length();
+        let before = flat(&w);
+        run(&mut w, 5, hold);
+        assert!(flat(&w) > before * 0.9, "no air drag: {before} -> {}", flat(&w));
     }
 
     #[test]
-    fn cluster_shell_flies_through_players() {
-        // Point-blank, the shell used to burst on the enemy and all seven
-        // bomblets went off on them: a one-shot kill. Now it bursts far behind.
-        let mut w = open_world(CLUSTER, (10, 4), (12, 4));
-        fire_once(&mut w, 0, 0, 0.0);
-        for _ in 0..60 {
-            w.step(&[]);
-        }
-        assert_eq!(w.players[1].hp, MAX_HP);
+    fn the_rope_lets_go_when_its_rock_is_dug_away() {
+        let mut w = settled(walled, (17.5, 16.0));
+        w.step(&[Input { yaw: FRAC_PI_2, rope: true, ..Input::default() }]);
+        let anchor = w.worms[0].rope.expect("attached").anchor;
+        w.grid.apply(Shape::Sphere { center: anchor, radius: 1.5 }, Op::Carve);
+        w.step(&[Input { yaw: FRAC_PI_2, ..Input::default() }]);
+        assert!(w.worms[0].rope.is_none());
     }
 
     #[test]
-    fn cluster_shell_bursts_into_bomblets() {
-        let (mut w, slot) = armed_world(CLUSTER);
-        w.players[1].pos = tile_center(30, 10);
-        w.drain_events();
-        // Straight into the border wall, 16 px away: it bursts at once.
-        w.step(&[Input { fire: true, weapon: slot, aim: std::f32::consts::PI, ..Default::default() }]);
-        assert_eq!(w.projectiles.len(), 7);
-        assert!(w.projectiles.iter().all(|p| p.weapon == BOMBLET));
-        assert!(w.projectiles.iter().all(|p| !w.map.circle_hits_wall(p.pos, 3.0)), "none may start inside the wall");
-        for _ in 0..60 {
-            w.step(&[]);
+    fn a_worm_walks_up_a_low_ledge_but_not_a_high_wall() {
+        // The ground plus a block for x > 18, 0.4 m and 1.2 m high.
+        // (`Grid::from_fn` wants a plain fn pointer, so no closure over the height.)
+        fn low(p: Vec3) -> f32 {
+            (p.y - 4.0).min((p.y - 4.4).max(18.0 - p.x))
         }
-        assert!(w.projectiles.is_empty(), "every bomblet went off");
-        let blasts = w.drain_events().iter().filter(|e| matches!(e, Event::Explosion { .. })).count();
-        assert!(blasts >= 5, "blasts = {blasts}");
+        fn high(p: Vec3) -> f32 {
+            (p.y - 4.0).min((p.y - 5.2).max(18.0 - p.x))
+        }
+        let mut w = settled(low, (16.0, 16.0));
+        run(&mut w, 120, walk(FRAC_PI_2));
+        let worm = &w.worms[0];
+        assert!(worm.pos.x > 19.0, "got up the 0.4 m ledge: x = {}", worm.pos.x);
+        assert!((worm.pos.y - 4.4).abs() < 0.05 && worm.on_ground, "stands on it: y = {}", worm.pos.y);
+
+        let mut w = settled(high, (16.0, 16.0));
+        run(&mut w, 120, walk(FRAC_PI_2));
+        assert!(w.worms[0].pos.x < 18.0 - WORM_RADIUS + 0.05, "a 1.2 m wall stops it: x = {}", w.worms[0].pos.x);
+    }
+
+
+
+    /// A pit 10 m deep and 6 m wide in ground at y = 10, centred on (16, 16).
+    fn pit(p: Vec3) -> f32 {
+        let r = ((p.x - 16.0).powi(2) + (p.z - 16.0).powi(2)).sqrt();
+        (p.y - 10.0).max(3.0 - r)
     }
 
     #[test]
-    fn swarm_missile_curls_towards_the_enemy() {
-        // The same projectile, once as a homing missile and once as a plain
-        // bolt: the enemy is 32 px off its line, so only homing can hit.
-        let fly = |weapon: u8| {
-            let (mut w, _) = armed_world(SWARM);
-            w.players[0].pos = tile_center(14, 9);
-            w.players[1].pos = tile_center(22, 8);
-            w.projectiles.push(Projectile { pos: tile_center(15, 9), vel: vec2(300.0, 0.0), weapon, owner: 0, life: 2.0 });
-            for _ in 0..60 {
-                w.step(&[]);
+    fn the_rope_launches_a_worm_out_of_a_pit_it_cannot_jump_out_of() {
+        let towards_wall = Input { yaw: FRAC_PI_2, pitch: 1.2, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+
+        // Without the rope: jump and push at the wall for five seconds.
+        let mut w = settled(pit, (16.0, 16.0));
+        let floor = w.worms[0].pos.y;
+        let best = apex(&mut w, floor, 300, Input { jump: true, ..towards_wall });
+        assert!(best < 4.0, "a 10 m pit is no place for jumping: rose {best} m");
+
+        // With it: shoot at the wall just under the rim, reel in (which
+        // accelerates the worm up the wall), and kick off with a jump at the top.
+        let mut w = settled(pit, (16.0, 16.0));
+        w.step(&[Input { rope: true, ..towards_wall }]);
+        let rope = w.worms[0].rope.expect("the rope caught the wall");
+        assert!(rope.anchor.y > 8.0 && rope.anchor.y < 10.0, "anchored just under the rim: {:?}", rope.anchor);
+        let reel = Input { reel: 1.0, ..towards_wall };
+        for _ in 0..180 {
+            w.step(&[reel]);
+            if (rope.anchor - w.worms[0].hand()).length() < 2.0 {
+                break;
             }
-            w.players[1].hp
+        }
+        w.step(&[Input { jump: true, ..towards_wall }]); // the rope kick
+        assert!(w.worms[0].rope.is_none(), "jumping lets go of the rope");
+        run(&mut w, 120, towards_wall);
+        let worm = &w.worms[0];
+        assert!(worm.pos.y > 9.9, "up on the ground above the pit: y = {}", worm.pos.y);
+        assert!(worm.on_ground, "standing there");
+        assert!(worm.pos.x > 16.0 + 3.2, "beyond the rim, not in the pit: x = {}", worm.pos.x);
+    }
+
+    #[test]
+    fn steering_on_the_rope_pumps_the_swing_beyond_walking_speed() {
+        // Same hang as the swing test: under a ceiling, rope up and forward.
+        let swing = |steer: bool| {
+            let mut w = settled(ceilinged, (16.0, 16.0));
+            w.worms[0].pos = Vec3::new(16.0, 8.0, 16.0);
+            w.worms[0].on_ground = false;
+            let hold = Input { pitch: 0.9, ..Input::default() };
+            w.step(&[Input { rope: true, ..hold }]);
+            let mut fastest: f32 = 0.0;
+            for t in 0..150 {
+                // Push the way the worm is already swinging (what a player does).
+                let along = w.worms[0].vel.z;
+                let push = if steer && t > 10 { along.signum() } else { 0.0 };
+                w.step(&[Input { move_dir: Vec2::new(0.0, push), ..hold }]);
+                fastest = fastest.max(Vec3::new(w.worms[0].vel.x, 0.0, w.worms[0].vel.z).length());
+            }
+            fastest
         };
-        assert!(fly(SWARM) < MAX_HP, "the missile should find its target");
-        assert_eq!(fly(BLASTER), MAX_HP, "a plain bolt flies past");
+        let (idle, pumped) = (swing(false), swing(true));
+        assert!(pumped > WALK_SPEED + 3.0, "pumped swing {pumped}");
+        assert!(pumped > idle * 1.4, "pumping beats hanging on: {idle} -> {pumped}");
     }
 
     #[test]
-    fn teleport_orb_moves_the_owner_to_where_it_lands() {
-        let (mut w, slot) = armed_world(TELEPORT);
-        w.players[1].pos = tile_center(30, 10);
-        w.drain_events();
-        w.step(&[Input { fire: true, weapon: slot, ..Default::default() }]);
-        for _ in 0..20 {
-            w.step(&[]);
+    fn walking_over_bumpy_ground_keeps_the_pace() {
+        // Bumps 0.15 m high every 1.2 m, up to 38 degrees: rougher than the floor
+        // a digger leaves. (Scaled by 0.8 so the field never over-estimates distance.)
+        fn bumpy(p: Vec3) -> f32 {
+            (p.y - 4.0 - 0.15 * (p.x * 5.2).sin()) * 0.8
         }
-        // The orb stopped at the brick in tile 4 (x from 128 px): the owner stands just short of it.
-        let p = &w.players[0];
-        assert!(p.pos.x > 100.0 && p.pos.x < 119.0, "x = {}", p.pos.x);
-        assert!(!w.map.circle_hits_wall(p.pos, PLAYER_RADIUS));
-        assert_eq!(w.map.get(4, 1), Tile::Brick(3), "teleporting hurts no brick");
-        assert!(w.drain_events().iter().any(|e| matches!(e, Event::Teleported { player: 0, .. })));
-    }
-
-    #[test]
-    fn teleport_orb_hitting_a_player_swaps_places() {
-        let (mut w, slot) = armed_world(TELEPORT);
-        w.step(&[Input { fire: true, weapon: slot, ..Default::default() }]);
-        for _ in 0..20 {
-            w.step(&[]);
+        let mut w = settled(bumpy, (6.0, 16.0));
+        let start = w.worms[0].pos.x;
+        let mut grounded = 0;
+        for _ in 0..120 {
+            w.step(&[walk(FRAC_PI_2)]);
+            grounded += w.worms[0].on_ground as u32;
         }
-        assert_eq!(w.players[0].pos, tile_center(3, 1));
-        assert_eq!(w.players[1].pos, tile_center(1, 1));
-        assert_eq!(w.players[1].hp, MAX_HP, "a swap is harmless");
+        let went = w.worms[0].pos.x - start;
+        assert!(went > 12.0, "2 s at 8 m/s is 16 m, minus the start: only {went}");
+        assert!(grounded > 100, "stays on the ground instead of hopping: {grounded}/120");
     }
 
     #[test]
-    fn nova_blast_clears_a_room() {
-        let (mut w, slot) = armed_world(NOVA);
-        w.players[1].pos = tile_center(30, 10);
-        w.drain_events();
-        w.step(&[Input { fire: true, weapon: slot, ..Default::default() }]);
-        for _ in 0..40 {
-            w.step(&[]);
+    fn a_worm_can_walk_back_out_of_the_tunnel_it_dug() {
+        // The floor of a dug tunnel is a row of bowls, not a plane.
+        let mut w = settled(walled, (17.5, 16.0));
+        let dig_in = Input { yaw: FRAC_PI_2, pitch: -0.15, dig: true, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+        run(&mut w, 300, dig_in);
+        let deep = w.worms[0].pos.x;
+        assert!(deep > 24.0, "dug in first: {deep}");
+        // Turn round (looking along -x) and walk out.
+        let out = Input { yaw: -FRAC_PI_2, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+        let mut ticks = 0;
+        while w.worms[0].pos.x > 19.0 && ticks < 600 {
+            w.step(&[out]);
+            ticks += 1;
         }
-        assert_eq!(w.map.get(4, 1), Tile::Empty);
-        assert_eq!(w.map.get(5, 1), Tile::Empty);
-        assert!(w.players[0].hp < MAX_HP - 30.0, "even halved, standing this close hurts: hp = {}", w.players[0].hp);
-        assert!(w.drain_events().iter().any(|e| matches!(e, Event::Explosion { radius, .. } if *radius == 230.0)));
+        assert!(w.worms[0].pos.x <= 19.0, "stuck in the tunnel at x = {}", w.worms[0].pos.x);
+        // ~6 m of tunnel at walking speed is under a second; allow for the bumps.
+        assert!(ticks < 120, "took {ticks} ticks to walk {} m", deep - 19.0);
     }
 
     #[test]
-    fn a_chosen_loadout_replaces_the_weapons() {
-        let mut w = two_player_world();
-        w.players[0].current = 2;
-        w.set_loadout(0, &[NOVA, BOMB]);
-        let ids: Vec<u8> = w.players[0].weapons.iter().map(|s| s.id).collect();
-        assert_eq!(ids, [NOVA, BOMB]);
-        assert_eq!(w.players[0].current, 0);
-        assert_eq!(w.players[1].weapons.len(), 3, "nobody else is touched");
-        // And a respawn keeps what was chosen.
-        w.players[0].alive = false;
-        w.players[0].respawn_timer = 0.0;
-        w.step(&[]);
-        assert_eq!(w.players[0].weapons.iter().map(|s| s.id).collect::<Vec<_>>(), [NOVA, BOMB]);
-    }
-
-    #[test]
-    fn only_five_different_arsenal_weapons_are_a_loadout() {
-        use crate::weapons::{valid_loadout, DEFAULT_LOADOUT};
-        assert!(valid_loadout(&DEFAULT_LOADOUT));
-        assert!(!valid_loadout(&[BLASTER, ROCKET]), "too few");
-        assert!(!valid_loadout(&[0, 1, 2, 3, 4, 5]), "too many");
-        assert!(!valid_loadout(&[BLASTER, BLASTER, ROCKET, BOMB, RAILGUN]), "a weapon twice");
-        assert!(!valid_loadout(&[BLASTER, ROCKET, BOMB, RAILGUN, BOMBLET]), "bomblets are not for picking");
-        assert!(!valid_loadout(&[BLASTER, ROCKET, BOMB, RAILGUN, 200]), "no such weapon");
-    }
-
-    #[test]
-    fn oversized_move_input_is_clamped() {
-        let mut w = two_player_world();
-        w.players[1].pos = tile_center(30, 10);
-        let cheat = Input { move_dir: vec2(1000.0, 0.0), ..Default::default() };
-        for _ in 0..60 {
-            w.step(&[cheat]);
+    fn nonsense_input_cannot_break_the_worm() {
+        let mut w = settled(walled, (17.5, 16.0));
+        let junk = [f32::NAN, f32::INFINITY, -f32::INFINITY, 1.0e30, -1.0e30];
+        for &x in &junk {
+            let input = Input {
+                move_dir: Vec2::new(x, x),
+                yaw: x,
+                pitch: x,
+                reel: x,
+                jump: true,
+                dig: true,
+                rope: true,
+                ..Input::default()
+            };
+            run(&mut w, 10, input);
+            run(&mut w, 2, Input::default());
         }
-        // One second at full speed is at most ~MOVE_SPEED px.
-        assert!(w.players[0].vel.length() <= MOVE_SPEED + 1.0);
-    }
-
-    /// One player in the open middle of the menu map, feeding it one move
-    /// input per tick. Returns the fastest speed reached and the dash count.
-    fn run_moves(moves: &[Vec2]) -> (f32, usize) {
-        let mut w = World::new(Tilemap::from_ascii(crate::tilemap::MAP_HUB), 1, &[BLASTER], 1);
-        w.players[0].pos = tile_center(19, 4);
-        let mut top = 0.0f32;
-        for &move_dir in moves {
-            w.step(&[Input { move_dir, ..Default::default() }]);
-            top = top.max(w.players[0].vel.length());
-        }
-        let dashes = w.drain_events().iter().filter(|e| matches!(e, Event::Dashed { .. })).count();
-        (top, dashes)
-    }
-
-    fn ticks(n: usize, v: Vec2) -> Vec<Vec2> {
-        vec![v; n]
-    }
-
-    #[test]
-    fn rest_then_push_is_a_dash() {
-        let moves = [ticks(10, Vec2::ZERO), ticks(5, vec2(1.0, 0.0))].concat();
-        let (top, dashes) = run_moves(&moves);
-        assert_eq!(dashes, 1);
-        assert!(top > MOVE_SPEED * 3.0, "top = {top}");
-    }
-
-    #[test]
-    fn a_slow_thumb_still_dashes() {
-        // A floating stick grows from zero over a few frames.
-        let ramp = [0.3, 0.45, 0.7].map(|x| vec2(x, 0.0));
-        let moves = [ticks(10, Vec2::ZERO), ramp.to_vec()].concat();
-        assert_eq!(run_moves(&moves).1, 1);
-    }
-
-    #[test]
-    fn walking_and_switching_keys_never_dash() {
-        // From a standstill at spawn (no rest yet), then a two-tick gap
-        // between letting go of D and pressing W.
-        let moves = [ticks(30, vec2(1.0, 0.0)), ticks(2, Vec2::ZERO), ticks(30, vec2(0.0, -1.0))].concat();
-        let (top, dashes) = run_moves(&moves);
-        assert_eq!(dashes, 0);
-        assert!(top <= MOVE_SPEED + 1.0);
-    }
-
-    #[test]
-    fn dash_has_a_cooldown() {
-        let tap = [ticks(10, Vec2::ZERO), ticks(5, vec2(1.0, 0.0))].concat();
-        assert_eq!(run_moves(&tap.repeat(2)).1, 1, "15 ticks apart is too soon");
-        assert_eq!(run_moves(&tap.repeat(6)).1, 2, "every ~1.2 s is fine");
+        let worm = &w.worms[0];
+        assert!(worm.pos.is_finite() && worm.vel.is_finite(), "{worm:?}");
+        assert!(worm.vel.length() <= MAX_SPEED + 0.01);
+        let size = w.grid.size_metres();
+        assert!(worm.pos.cmpge(Vec3::ZERO).all() && worm.pos.cmple(size).all(), "still in the world");
     }
 
     #[test]
     fn same_inputs_give_same_world() {
-        // The property netcode will lean on: the sim is deterministic.
-        let script = |t: u32| Input {
-            move_dir: vec2((t as f32 * 0.1).cos(), (t as f32 * 0.07).sin()),
-            aim: t as f32 * 0.05,
-            fire: t % 7 == 0,
-            weapon: ((t / 50) % 3) as u8,
-            ..Default::default()
+        // A busy script: turning, walking, jumping, digging, roping.
+        let script = |t: usize| Input {
+            move_dir: Vec2::new(if t % 90 < 30 { 1.0 } else { 0.0 }, if t % 70 < 50 { 1.0 } else { -0.5 }),
+            yaw: t as f32 * 0.013,
+            pitch: ((t % 100) as f32 - 50.0) * 0.01,
+            jump: t % 45 == 0,
+            dig: t % 3 != 0,
+            rope: t % 37 == 0,
+            reel: if t % 11 < 3 { 1.0 } else { 0.0 },
+            ..Input::default()
         };
-        let run = || {
-            let mut w = World::new(Tilemap::from_ascii(MAP_GRID), 3, &[BLASTER, ROCKET, RAILGUN], 42);
-            for t in 0..900 {
-                w.step(&[script(t), script(t + 100), script(t + 200)]);
+        let play = || {
+            let mut w = world(walled, (17.0, 16.0));
+            for t in 0..600 {
+                w.step(&[script(t)]);
             }
             w
         };
-        let (a, b) = (run(), run());
-        for (pa, pb) in a.players.iter().zip(&b.players) {
-            assert_eq!(pa.pos, pb.pos);
-            assert_eq!(pa.hp, pb.hp);
-            assert_eq!(pa.kills, pb.kills);
-        }
-        for y in 0..crate::tilemap::MAP_H as i32 {
-            for x in 0..crate::tilemap::MAP_W as i32 {
-                assert_eq!(a.map.get(x, y), b.map.get(x, y));
-            }
-        }
+        let (a, b) = (play(), play());
+        assert_eq!(a.grid.checksum(), b.grid.checksum());
+        let bits = |w: &World| {
+            let v = &w.worms[0];
+            [v.pos.x, v.pos.y, v.pos.z, v.vel.x, v.vel.y, v.vel.z].map(f32::to_bits)
+        };
+        assert_eq!(bits(&a), bits(&b));
+        assert_ne!(a.grid.checksum(), world(walled, (17.0, 16.0)).grid.checksum(), "the script did dig");
     }
 }

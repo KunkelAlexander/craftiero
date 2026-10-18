@@ -13,6 +13,10 @@ use sdf::Grid;
 /// 128 x 64 x 128 m: 32 x 16 x 32 chunks of 16 voxels of 0.25 m.
 pub const WORLD_CHUNKS: IVec3 = IVec3::new(32, 16, 32);
 
+/// Where worms start, as (x, z) columns: they drop from the sky onto the hills
+/// in view of the spawn camera. The second one is a target dummy for now.
+pub const SPAWNS: [(f32, f32); 2] = [(64.0, 38.0), (69.0, 41.0)];
+
 pub fn build() -> Grid {
     Grid::from_fn(WORLD_CHUNKS, terrain)
 }

@@ -32,6 +32,14 @@ pub fn post() -> String {
 // One uniform block shared by both passes. Everything is vec4 so the Rust side
 // needs no padding thought (WGSL aligns vec3 to 16 bytes, which bites).
 const COMMON_UNIFORMS: &str = r#"
+// A worm part: a segment from `a` to `b` swept by a sphere of radius a.w.
+// (`array<Capsule, 32>` below must match MAX_CAPSULES in renderer.rs.)
+struct Capsule {
+    a: vec4<f32>,           // xyz: start, w: radius
+    b: vec4<f32>,           // xyz: end, w: radius of a sphere around the whole capsule
+    col: vec4<f32>,         // rgb, as picked in a paint program (sRGB)
+}
+
 struct U {
     cam_pos: vec4<f32>,
     cam_right: vec4<f32>,   // right * tan(fov/2) * aspect
@@ -41,6 +49,11 @@ struct U {
     brush: vec4<f32>,       // xyz: centre, w: radius (0 = no brush)
     flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
+    counts: vec4<f32>,      // x: number of capsules in use, y: shadow casters (the first y)
+    caps: array<Capsule, 32>,
+    // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
+    // which capsules can be seen in the tile.
+    tiles: array<vec4<u32>, 144>,
 }
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -176,6 +189,60 @@ fn box_hit(ro: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(t_near, t_far, axis);
 }
 
+// Ray against a capsule: the distance along the ray to the first hit, or -1.
+// Closed form (no marching): solve the ray against the infinite cylinder around
+// the segment, and if the hit lies beyond the segment's ends, against the sphere
+// at that end instead.
+//
+// Optimisation: almost every ray misses almost every capsule, and the closed
+// form is expensive (divisions, square roots, ~60 operations). So first test the
+// ray against a sphere around the whole capsule (`rb`, centred on the middle):
+// that rejects a miss in a handful of operations.
+fn cap_hit(ro: vec3<f32>, rd: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>, ra: f32, rb: f32) -> f32 {
+    let mid = (pa + pb) * 0.5;
+    let om = ro - mid;
+    let bm = dot(om, rd);
+    let cm = dot(om, om) - rb * rb;
+    if (bm * bm < cm || (bm > 0.0 && cm > 0.0)) { return -1.0; }   // misses, or is behind
+    let ba = pb - pa;
+    let oa = ro - pa;
+    let baba = dot(ba, ba);
+    let bard = dot(ba, rd);
+    let baoa = dot(ba, oa);
+    let rdoa = dot(rd, oa);
+    let oaoa = dot(oa, oa);
+    let a = baba - bard * bard;
+    var b = baba * rdoa - baoa * bard;
+    var c = baba * oaoa - baoa * baoa - ra * ra * baba;
+    var h = b * b - a * c;
+    if (h >= 0.0) {
+        let t = (-b - sqrt(h)) / a;
+        let y = baoa + t * bard;   // where along the segment (0 = a, baba = b)
+        if (y > 0.0 && y < baba) { return t; }
+        let oc = select(ro - pb, oa, y <= 0.0);   // the end sphere on that side
+        b = dot(rd, oc);
+        c = dot(oc, oc) - ra * ra;
+        h = b * b - c;
+        if (h > 0.0) { return -b - sqrt(h); }
+    }
+    return -1.0;
+}
+
+fn cap_normal(p: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>) -> vec3<f32> {
+    let ba = pb - pa;
+    let k = clamp(dot(p - pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return normalize(p - (pa + ba * k));
+}
+
+// Does a shadow caster block this ray? (For shadows on the terrain. The casters
+// are the first `counts.y` capsules.)
+fn caps_block(ro: vec3<f32>, rd: vec3<f32>) -> bool {
+    for (var i = 0; i < i32(u.counts.y); i++) {
+        if (cap_hit(ro, rd, u.caps[i].a.xyz, u.caps[i].b.xyz, u.caps[i].a.w, u.caps[i].b.w) > 0.0) { return true; }
+    }
+    return false;
+}
+
 // The palette below is written the way you would pick colours in a paint
 // program (sRGB). Shading happens in linear light, so convert on the way in:
 // without this everything looks washed out.
@@ -228,7 +295,21 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     let ro = u.cam_pos.xyz;
     let rd = normalize(u.cam_fwd.xyz + ndc.x * u.cam_right.xyz + ndc.y * u.cam_up.xyz);
 
-    var kind = 0;   // 0 sky, 1 terrain, 2 arena wall (the box edge counts as rock)
+    var kind = 0;   // 0 sky, 1 terrain, 2 arena wall (the box edge counts as rock), 3 capsule
+    // The nearest capsule on this ray. Done first because it also shortens the
+    // terrain march: no need to look for rock behind a worm. Only the capsules
+    // whose bit is set for this pixel's tile are tested, usually none.
+    var tc = 1.0e9;
+    var ci = -1;
+    let tile = min(vec2<u32>(uv * vec2<f32>(32.0, 18.0)), vec2<u32>(31u, 17u));
+    let tile_i = tile.y * 32u + tile.x;
+    var mask = u.tiles[tile_i >> 2u][tile_i & 3u];
+    while (mask != 0u) {
+        let i = i32(firstTrailingBit(mask));
+        mask = mask & (mask - 1u);   // clear the lowest set bit
+        let h = cap_hit(ro, rd, u.caps[i].a.xyz, u.caps[i].b.xyz, u.caps[i].a.w, u.caps[i].b.w);
+        if (h > 0.0 && h < tc) { tc = h; ci = i; }
+    }
     var t = 400.0;
     var n = vec3<f32>(0.0);
 
@@ -243,10 +324,13 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             t = 0.01;
             n = -rd;
         } else {
-            let th = trace(ro, rd, t_start, bx.y, 160, 0.003, 0.5 * pix_angle());
+            let th = trace(ro, rd, t_start, min(bx.y, tc), 160, 0.003, 0.5 * pix_angle());
             if (th >= 0.0) {
                 kind = 1;
                 t = th;
+            } else if (ci >= 0 && tc < bx.y) {
+                kind = 3;   // the march gave up at the capsule: nothing nearer
+                t = tc;
             } else if (!(bx.z == 1.0 && rd.y > 0.0)) {
                 // Left through a side or the floor: that is the closed arena's wall.
                 // (Out through the top is open sky, purely for looks.)
@@ -263,10 +347,16 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
 
     var col = sky(rd);
     let fog_col = srgb(vec3<f32>(0.93, 0.86, 0.72));
-    if (kind == 1) {
+    if (kind == 1 || kind == 3) {
         let p = ro + rd * t;
-        n = normal_at(p);
-        let base = albedo(p, n);
+        var base = vec3<f32>(0.0);
+        if (kind == 1) {
+            n = normal_at(p);
+            base = albedo(p, n);
+        } else {
+            n = cap_normal(p, u.caps[ci].a.xyz, u.caps[ci].b.xyz);
+            base = srgb(u.caps[ci].col.rgb);
+        }
 
         // Hard shadow ray towards the sun. Pattern: it reuses `trace`, so it
         // gets the empty-space skipping for free.
@@ -274,6 +364,9 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         if (u.flags.y > 0.5 && lit > 0.0) {
             let so = p + n * 0.08;
             if (trace(so, u.sun.xyz, 0.0, 60.0, 128, 0.02, 0.002) >= 0.0) { lit = 0.0; }
+            // Worms shadow the terrain (a shadow under the feet is what tells
+            // you how high you are), but not themselves: that would speckle.
+            if (kind == 1 && caps_block(so, u.sun.xyz)) { lit = 0.0; }
         }
         var occl = 1.0;
         if (u.flags.z > 0.5) {
@@ -301,7 +394,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         col += base * vec3<f32>(1.0, 0.78, 0.5) * toon(lamp) * 0.5 * (1.0 - toon(lit)) * mix(0.5, 1.0, occl);
 
         // The brush: tint the terrain it would change and draw its rim.
-        if (u.brush.w > 0.0) {
+        if (kind == 1 && u.brush.w > 0.0) {
             let dist = length(p - u.brush.xyz);
             let inside_brush = 1.0 - smoothstep(u.brush.w - 0.03, u.brush.w, dist);
             let ring = 1.0 - smoothstep(0.0, 0.07, abs(dist - u.brush.w));
@@ -414,3 +507,21 @@ fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(col, 1.0);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::{MAX_CAPSULES, TILES_X, TILES_Y};
+
+    // The WGSL has these numbers written out; the Rust side owns them. A
+    // mismatch would silently read the wrong tile or overrun the uniform.
+    #[test]
+    fn shader_constants_match_the_renderer() {
+        assert!(COMMON_UNIFORMS.contains(&format!("array<Capsule, {MAX_CAPSULES}>")));
+        assert!(COMMON_UNIFORMS.contains(&format!("array<vec4<u32>, {}>", TILES_X * TILES_Y / 4)));
+        assert!(MARCH.contains(&format!("vec2<f32>({TILES_X}.0, {TILES_Y}.0)")));
+        assert!(MARCH.contains(&format!("vec2<u32>({}u, {}u)", TILES_X - 1, TILES_Y - 1)));
+        assert!(MARCH.contains(&format!("tile.y * {TILES_X}u")));
+        assert!(MAX_CAPSULES <= 32, "the tile mask has one bit per capsule in a u32");
+    }
+}

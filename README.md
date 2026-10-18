@@ -9,10 +9,11 @@ It is also a learning project: the code is commented to explain *why*, names the
 patterns from *Game Programming Patterns* where they are used, and will explain
 the networking concepts where they appear.
 
-**Where it is:** milestone M1 of seven. You can fly through a cave-and-hills
-world and dig, build and blast it with the mouse at 60 fps on an integrated
-laptop GPU. There are no worms, weapons or multiplayer yet (those are M2-M6, see
-[PLAN.md](PLAN.md)).
+**Where it is:** milestone M2 of seven. You play a worm in a cave-and-hills
+world: walk, jump, dig tunnels with the mouse and swing on a ninja rope, at 60
+fps on an integrated laptop GPU, with a rope that flings you around. The rules run in a pure `sim` crate, with
+headless tests. There are no weapons or multiplayer yet (M3-M6, see
+[PLAN.md](PLAN.md)). The M1 fly camera and brush are still there (press F).
 
 | | |
 |---|---|
@@ -35,24 +36,32 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 
 | Input | Does |
 |---|---|
-| W A S D, Space / Ctrl, Shift | fly, up / down, fast |
-| left mouse (hold) | carve a sphere at the crosshair |
-| right mouse (hold) | build: new material pushed out along the wall, blended in like clay |
-| mouse wheel | brush radius |
+| W A S D, mouse | walk, look and aim |
+| Space | jump: hold for a high jump, tap for a hop; holding it hops on every landing |
+| left mouse (hold) | dig: a 1.5 m hole where you look (up to 4 m away), five a second |
+| right mouse | shoot the ninja rope at what you look at; press again to let go |
+| E / Q | reel the rope in / out. Reeling in *pulls* you (up to 20 m/s), so you can launch yourself out of a hole |
+| Space on the rope | let go with an upward kick |
+| W A S D on the rope | pump the swing: steering adds speed up to 24 m/s |
+| F | switch to the M1 fly camera and brush (below) |
+| *fly mode:* W A S D, Space / Ctrl, Shift | fly, up / down, fast |
+| *fly mode:* left / right mouse (hold) | carve / build with the brush (build blends in like clay) |
+| *fly mode:* mouse wheel | brush radius |
 | 1 / 2 / 3 | fixed render resolution 100% / 75% / 50% |
 | T | automatic resolution (default): scales the resolution to hold ~60 fps |
 | G / H / O / V | shadows / ambient occlusion / ink outlines / vsync |
 | R | regenerate the map (about half a second) |
 
-The window title shows fps, GPU milliseconds per pass, the cost of the last edit
-and upload, the brush size and the render scale.
+The window title shows fps, GPU milliseconds per pass, the sim, edit and upload
+cost, the brush size and the render scale.
 
 Headless modes (no window needed):
 
 ```
 cargo run -p viewer --release -- --shot out.png --edits --cam 62,36,54,180,-12
+cargo run -p viewer --release -- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12
 cargo run -p viewer --release -- --bench --size 1920x1080
-cargo test -p sdf -p viewer
+cargo test -p sdf -p sim -p viewer
 ```
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
@@ -71,12 +80,21 @@ over the network.
   edits, `sample` / `gradient` / `raycast` for collision, parallel map
   generation, dirty-chunk tracking, checksums. Collision will sample the grid
   directly; there is no collision mesh.
-* **[`viewer/`](viewer/)** is the M1 tech demo. It copies the grid into a 3D
+* **[`sim/`](sim/)** is the game's rules, also pure (no window, GPU or clock).
+  `World::step(&[Input])` is the only way state changes. A worm is a capsule
+  tested as three spheres against the distance field: push out along the
+  gradient, walk along slopes, step up small ledges, jump, dig, and a rope that
+  is a hard distance limit (so swinging is a pendulum). Read `world.rs`; its
+  tests are the specification.
+* **[`viewer/`](viewer/)** copies the grid into a 3D
   texture and **raymarches it on the GPU** (sphere tracing), shades it with a
   three-band toon ramp, and draws ink outlines from a depth/normal buffer.
-  After an edit only the changed chunks are re-uploaded. Read it in this order:
-  `main.rs` (window, input, brush), `renderer.rs` (textures, passes, uploads, GPU
-  timers), `shaders.rs` (the WGSL), `world.rs` (the demo map), `camera.rs`.
+  After an edit only the changed chunks are re-uploaded. Worms are analytic
+  capsules found by a closed-form ray test inside the same shader, so they get
+  shadows, AO and outlines for free. It runs the sim at a fixed 60 Hz and
+  draws between ticks. Read it in this order: `main.rs` (window, input, game
+  loop), `worms.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),
+  `shaders.rs` (the WGSL), `world.rs` (the demo map), `camera.rs`.
 
 Why raymarch instead of meshing the terrain? The first plan used Surface Nets
 meshes. At 0.25 m voxels a mesh looks faceted, and toon bands plus outlines make
@@ -105,8 +123,8 @@ Milestones (full detail and decisions in [PLAN.md](PLAN.md)):
 | | |
 |---|---|
 | M0 | `sdf` crate and terrain spike: **done** |
-| M1 | Raymarched viewer with brush editing: **built, awaiting review** |
-| M2 | A worm in the sim: capsule against the SDF, jump, dig, aim |
+| M1 | Raymarched viewer with brush editing: **done** |
+| M2 | A worm in the sim: capsule against the SDF, jump, dig, rope, aim: **built, awaiting review** |
 | M3 | Weapons as data rows: explosions carve, build adds, tractor beam |
 | M4 | Host + loopback + replica: offline play through the same pipeline as online |
 | M5 | Online: relay server, late join, edit events, checksums |
@@ -116,13 +134,14 @@ Milestones (full detail and decisions in [PLAN.md](PLAN.md)):
 
 | Path | What |
 |---|---|
-| `sdf/`, `viewer/` | the 3D code (in the workspace) |
-| `sim/`, `protocol/`, `host/`, `server/`, `game/src/{share,local,join,net,socket}.rs` | the 2D game's simulation, networking and relay, kept to be ported at M2-M5; they do not compile yet |
+| `sdf/`, `sim/`, `viewer/` | the 3D code (in the workspace) |
+| `sim/old2d/` | the 2D game's weapons, bots and world, kept to be ported at M3 |
+| `protocol/`, `host/`, `server/`, `game/src/{share,local,join,net,socket}.rs` | the 2D game's networking and relay, kept to be ported at M4-M5; they do not compile yet |
 | [`PLAN.md`](PLAN.md), [`CLAUDE.md`](CLAUDE.md) | the plan and decisions; the working rules for the code |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | performance log |
 | [`docs/NETWORKING.md`](docs/NETWORKING.md), [`docs/DEPLOY.md`](docs/DEPLOY.md) | written for the 2D game's relay; they apply again from M5 |
 | [`docs/PLAN_2D.md`](docs/PLAN_2D.md) | the 2D game's plan |
-| `screenshots/` | M1 screenshots used above |
+| `screenshots/` | screenshots used above |
 
 This project began as a fork of **Bomblero**, a 2D neon-cave arena shooter
 (macroquad, browser and native, online through a relay). Its history is kept: the

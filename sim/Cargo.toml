@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Same version and features macroquad uses, so `sim::Vec2` IS `macroquad::Vec2`.
-# The `serde` feature lets a Vec2 travel over the wire.
+# The terrain. The sim edits it (digging) and samples it (collision).
+sdf = { path = "../sdf" }
+# Same version the viewer uses, so `sim::Vec3` IS the viewer's `Vec3`.
+# The `serde` feature lets vectors travel over the wire later (M4+).
 glam = { version = "0.27", features = ["scalar-math", "serde"] }
 # Only the derive macros: they let the sim's data types be turned into bytes by
 # the `protocol` crate. The sim itself never serializes anything and still does

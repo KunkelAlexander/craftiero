@@ -205,12 +205,62 @@ A test checks the shortcuts change no voxel (`from_fn_shortcuts_change_no_voxel`
 - **Vulkan backend crashes** (access violation inside `request_device`) on this
   Intel driver; DX12 works. Windows now defaults to DX12.
 
+### 8. Worms (M2): looping over capsules per pixel cost 6-10 ms
+
+Worms are drawn as analytic capsules inside the raymarcher (body, two eyes, gun,
+rope: 5 per worm). A first version looped over all of them for every pixel, and
+again in the terrain shadow ray. With four worms and one rope (17 capsules) on
+screen, open hills at 1280 x 720:
+
+| Version | frame | cost of the worms |
+|---|---|---|
+| no worms | 18.5 ms | |
+| loop over all capsules, per pixel and per shadow ray | 28.2 ms | +9.8 ms |
+| + a bounding-sphere early-out before the full capsule test | 26.6 ms | +8.0 ms |
+| (experiment) shadow loop off | 25.1 ms | +6.4 ms |
+| (experiment) loop body replaced by one comparison against a loaded value | 24.5 ms | +5.6 ms |
+| **tile masks** (below), eyes and rope no longer cast shadows | **19.6 ms** | **+0.6 ms** |
+
+The surprise is the fourth row: even with almost no arithmetic, the loop alone
+cost ~5.6 ms, so the maths was never the problem. My reading (not verified in a
+profiler) is that a dynamic loop over a dynamically indexed uniform array is
+slow on this GPU, probably because each iteration waits for a load. The fix is
+to avoid the loop instead of making it cheaper: the CPU projects each capsule's
+bounding sphere onto a 32 x 18 grid of screen tiles and uploads one bitmask per
+tile. A pixel reads its tile's mask and, almost everywhere, finds it zero. Only
+the terrain shadow ray still loops, over the worm bodies alone. A test
+(`tile_masks_cover_every_visible_point_of_a_capsule`) checks the masks never
+miss a visible point, and another checks that the constants in the WGSL match
+the Rust ones.
+
+How these were measured: the first four rows come from separate benchmark runs
+(each compares "everything" and "everything + worms" within one run, so the
+difference is meaningful even though the absolute times drift). The last row
+comes from the benchmark's new alternating mode (no worms, worms, no worms, ...,
+best of five rounds each: 19.0 vs 19.6 ms), because the clock changes slowly and
+a one-after-the-other comparison can land the change on one variant.
+
+### 9. Background load looks like a performance bug
+
+For a stretch of this session the same benchmark binary gave 18.8, 37, 44 and
+61 ms for the same row (worst single frame 511 ms), and nothing in my code had
+changed. The OS reported no throttling (`% Passive Limit` 100, 60 C), nothing
+else was using the GPU, but a `backgrounddownload` process was using ~46% of the
+CPU. The CPU and the iGPU share one ~15 W budget, so CPU work from anything
+else takes clock speed from the GPU. After the power mode was switched to Best
+performance the numbers were steady again (19.0 ms); I cannot say whether that
+was the mode or the download ending. The CPU-side edit cost shows the same
+effect: the r = 3 m crater measured 2.73, 1.02, 1.11 and 0.63 ms in four runs
+of unchanged code. If the game feels uneven on this laptop, check for
+background CPU load and the Windows power mode before suspecting the code.
+
 ## What did not help (so nobody repeats it)
 
 | Experiment | Result |
 |---|---|
 | Widen the stored distance band from 4 to 8 voxels (so a step can be up to 2 m, not 1 m) | no rendering gain within noise (e.g. open hills 18.8 -> 21.1 ms, ground 28.8 -> 26.1 ms); CPU edit cost **doubled** (0.98 -> 2.35 ms). Reverted. |
 | Shadow rays capped at 48 steps | thin light slivers in long shadows; saving unmeasurable. 128 kept. |
+| A per-capsule bounding-sphere early-out inside the per-pixel loop | 9.8 -> 8.0 ms worm cost: the loop itself was the cost (section 8). Kept, it is cheap, but the tile masks are what fixed it. |
 | Treat the benchmark's single averages as precise | the machine's clock varied 2x between identical runs, so the bench now reports the best of three batches. |
 
 ## Where the time still goes, and what is next
@@ -222,6 +272,9 @@ At 1280 x 720, 100% scale, current build (GPU ms, best of three):
 | open hills | 18.6 | 11.7 | 9.5 |
 | cavern | 18.0 | 13.7 | 11.6 |
 | ground level | 23.2 | 16.7 | 16.5 |
+
+With four worms and a rope on screen the open-hills frame is 0.6 ms slower
+(section 8).
 
 Remaining ideas, with my estimate of the gain (not yet tried unless noted):
 

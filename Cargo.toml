@@ -11,7 +11,7 @@
 # dedicated server tomorrow. That keeps the door open to a central server
 # without a rewrite.
 [workspace]
-members = ["sdf", "viewer"]  # sim, protocol, host, server, game return as they are ported to 3D (see PLAN.md)
+members = ["sdf", "sim", "viewer"]  # protocol, host, server, game return as they are ported to 3D (see PLAN.md)
 resolver = "2"
 
 [profile.release]

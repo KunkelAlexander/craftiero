@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 sdf = { path = "../sdf" }
+sim = { path = "../sim" }
 glam = { version = "0.27", features = ["scalar-math"] }
 # Window and GPU. Native first; wgpu also targets WebGPU for the later web build.
 winit = "0.30"

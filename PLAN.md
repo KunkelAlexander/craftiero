@@ -5,10 +5,24 @@ Goal: a 3D, Liero-style worm shooter with fully destructible/formable terrain ba
 Decisions from the user: **native first, web later**; **full 3D volume, small arena** (caves/tunnels, ~128x64x128 m at ~0.25 m voxels); **raymarch the SDF, do not mesh it** (decided at M1, see Status).
 
 ## Status (read this first)
-- **Done:** fork + prune of the 2D repo (history kept), `CLAUDE.md` rewritten for 3D, **M0** the `sdf` crate, **M1** the `viewer` tech demo. **M1 is built and measured, and waits for the owner's review** (art style, feel, speed).
-- **Workspace:** `sdf` and `viewer` are `members`. `sim`, `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are 2D code kept for porting and do not compile yet (sim lost `tilemap.rs`). Re-add each at its milestone.
-- **Not committed:** nothing from the fork, `sdf` or `viewer` is committed. `git status` shows the staged 2D deletions, the new crates, this file, `CLAUDE.md` and `screenshots/M1_*.png`. Review, then commit.
-- **Tests:** `cargo test -p sdf -p viewer` (10 + 7 headless tests, all pass).
+- **Done:** fork + prune of the 2D repo (history kept), `CLAUDE.md` rewritten for 3D, **M0** the `sdf` crate, **M1** the `viewer` tech demo (committed), **M2** a worm in the `sim` crate with a third-person mode in the viewer. **M2 is built and tested, and waits for the owner's review** (feel above all: see "M2" below).
+- **Workspace:** `sdf`, `sim` and `viewer` are `members`. `sim/old2d/` holds the 2D weapons, bots and world for M3. `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are 2D code kept for porting and do not compile yet. Re-add each at its milestone.
+- **Not committed:** the M2 work (new `sim`, `viewer/src/worms.rs`, shader and renderer changes, the docs). M1 is committed.
+- **Tests:** `cargo test -p sdf -p sim -p viewer` (10 + 24 + 11 headless tests, all pass).
+
+### M2: the worm (built)
+What exists: `sim::World` (grid + worms, `step(&[Input])` at a fixed 60 Hz, events drained by consumers), `sim::Worm` (capsule of three spheres, walk, jump, dig, rope), a 3D `Input` (move, absolute yaw and pitch, jump, dig, rope, reel; sanitised against NaN and huge values), a third-person camera that is pulled in by rock, worms drawn as capsules in the raymarcher, fixed-timestep loop with drawing between ticks. The 2D `sim` files moved to `sim/old2d/`; only `input.rs` and `rng.rs` survive in `sim/src`.
+
+Design decisions, each with its reason in the code comments:
+- **Collision:** each body sphere reads one distance, pushes out along the gradient; walking happens in the ground's plane (a horizontal walk into a slope lost a quarter of its speed per tick, measured); the ground normal is taken at the feet, not at the foot sphere's centre (at a wall-floor crease the sphere's gradient points diagonally and ground detection flickered); a worm is pulled onto ground within 10 cm instead of hovering; ledges up to 0.5 m are stepped up.
+- **Dig:** radius 1.5 m centred on the surface point, 5 per second, reach 4 m. The size has a floor that is derived, not tuned: bites a radius apart leave a roof cusp of 1.73 r, which must exceed the worm's 1.8 m (a 1.1 m radius pinched the worm at every joint, found by a test).
+- **Rope:** press shoots (raycast along the aim, 30 m), press again lets go; a taut rope is a hard distance limit that cancels outward speed, so swinging is a pendulum and speed is kept on release (air control never brakes); the rope lets go if its rock is dug away. Dynamics pass: reeling in (E) also accelerates the worm towards the anchor (45 m/s^2, up to 20 m/s) on top of shortening the rope at 12 m/s; steering on the rope pushes harder (30 m/s^2) with a 24 m/s cap, so it pumps the swing; Space in mid-air on the rope lets go and kicks up 7 m/s. A test shows a worm that cannot jump out of a 10 m pit (rose under 4 m in 5 s) rope-launching itself out.
+- **Movement feel (dynamics pass):** walk 8 m/s with 70 m/s^2 ground acceleration; jump 11 m/s (2.4 m held, a tap hops about half a metre); falling gravity x1.5 (not on a rope); coyote time and jump buffer of 0.1 s each; holding Space bunny-hops on every landing; speed above walking speed is only gently dragged while steering (10 m/s^2) but fully braked with no keys; air control 20 m/s^2 up to walking speed, never braking. The view widens up to +14 degrees of field of view above 8 m/s.
+- **Uneven ground:** walls push sideways only (a tilted push lifted a worm running into a wall, and at the wall-floor crease it climbed the wall); ground slopes up to 41 degrees count as ground; a walking worm sticks to ground up to 0.3 m below it instead of launching off the crest of every bump (it was airborne 102 of 120 ticks on 0.15 m bumps before); ledges up to 0.5 m are stepped up. Tests: bumpy ground keeps the pace, and a worm walks back out of the tunnel it dug.
+- **Determinism:** same inputs give the same worm bit for bit and the same terrain checksum on one machine (test). `sin`/`cos` are not guaranteed identical across CPUs, which only matters if a client ever predicts; noted in `world.rs`.
+- **Rendering:** capsules are tested with a closed-form ray test in the march shader; worm bodies shadow the terrain; per-screen-tile bitmasks keep the cost at +0.6 ms for four worms (a plain loop cost 6-10 ms, `docs/PERFORMANCE.md` section 8).
+
+How to look at it without a window: `-- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12` (add `--rope` for a swinging worm; `--worm 64,22,180 --rope --cam 76,28,26,270,-0.05` shows one hanging on a mountain).
 
 ### Run it
 ```
@@ -18,10 +32,16 @@ Click the window to capture the mouse, Esc releases it (again to quit).
 
 | Input | Does |
 |---|---|
-| W A S D, Space / Ctrl, Shift | fly, up / down, fast |
-| left mouse (hold) | carve a sphere at the crosshair, repeats at 20 Hz |
-| right mouse (hold) | build: a sphere pushed out along the wall, blended in like clay |
-| wheel | brush radius (0.5 to 8 m) |
+| W A S D, mouse | walk, look and aim |
+| Space | jump |
+| left mouse (hold) | dig, five holes a second |
+| right mouse | shoot the rope / let go |
+| E / Q | reel the rope in / out |
+| F | fly camera with the M1 brush (below) |
+| *fly:* W A S D, Space / Ctrl, Shift | fly, up / down, fast |
+| *fly:* left mouse (hold) | carve a sphere at the crosshair, repeats at 20 Hz |
+| *fly:* right mouse (hold) | build: a sphere pushed out along the wall, blended in like clay |
+| *fly:* wheel | brush radius (0.5 to 8 m) |
 | 1 / 2 / 3 | fixed render resolution 100% / 75% / 50% |
 | T | automatic resolution (default): holds ~60 fps by scaling it |
 | G / H / O / V | shadows / ambient occlusion / ink outlines / vsync |
@@ -73,9 +93,14 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 - Thin features under about a voxel (0.25 m) cannot exist. Hard `min`/`max` creases came out as sawteeth, so the demo map uses smooth operations. Player craters are still hard-edged and looked fine in the screenshots; a smooth carve (`Op::SmoothCarve`) is a possible later polish.
 - The map generator only claims "never over-estimates the distance", enforced by a test (`distance_is_never_overestimated`). Mountain flanks gave a slope-corrected estimate that broke it deep underground; the fix is documented in `world::ground`.
 - The empty-space map is per chunk (4 m). Rays that hug the ground spend most of their steps inside the one-chunk shell around the surface.
-- No worms, collision against anything but the brush ray, or weapons yet: M1 is a viewer.
+- The M1 brush edits the grid directly and bypasses the sim (fly mode only, a developer tool); worm digging goes through `World::step`.
+- Worms cannot die, take damage or fire anything yet (M3). The second worm is an idle dummy to dig around.
+- The arena has an invisible ceiling at 64 m (outside the grid counts as rock), and the camera is held under it.
+- A worm has no ragdoll or tilt: the capsule always stands upright.
+- The M1 edit cost finding is still open: large brushes (r = 3 to 8 m) cost 7-37 ms of CPU per edit in a logged session, against 0.6-2.7 ms for the r = 3 m benchmark crater. Fly mode only; worm digging uses a 1.2 m hole.
 
 ### What I could not verify
+- **M2 feel.** I could not play it. The numbers (walk 8 m/s, jump 2.4 m, gravity 25, dig 5 per second, camera 5 m behind) are first guesses written down as constants at the top of `sim/src/world.rs`; the tests prove they are consistent (a worm stands, climbs, jumps 2 m, digs a tunnel it can walk through, swings), not that they are fun. The window was smoke-run for 8 s (no panic or GPU validation error), and screenshots show the worm, eyes, gun, shadow and a rope swing. Nobody has steered it with a mouse. Whether third-person aiming feels right (the crosshair marks the camera's ray; the dig ring marks where the worm's eye ray lands, slightly different) is the main open question.
 - **Interactive input was never exercised by a person here.** Mouse capture and look, hold-to-dig, the 20 Hz repeat, window resize, the G/H/O/V/T/R keys: the code paths exist and the window was launched four times (it runs, reaches 60 fps, title updates), but nobody clicked. Rendering and edits are covered by headless screenshots (`--shot --edits`) and the bench's 100-crater loop.
 - The art style was judged from screenshots only (`screenshots/M1_overview.png`, `M1_cavern.png`, `M1_craters.png`). Colours and outline weight are a first guess for the owner to react to.
 - Other GPUs, drivers, Linux and macOS were not tried. The shaders use no extensions, but timestamp queries are optional (the title then shows no GPU ms and automatic resolution stays at 100%).
@@ -85,7 +110,8 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 2. **Speed.** If 60 fps at ~65% is not enough on your target hardware, the next options in order of expected gain: finer empty-space bricks (8 voxels instead of 16, perhaps 25% less), shadows at half resolution, a low-resolution pre-pass for the ray start (helps views down at the ground, not grazing ones).
 3. **M0 follow-up:** speed up `Grid::apply` (per-chunk row access instead of per-voxel lookups). Recommendation: when M3 needs it (a tractor beam applies an edit every tick), not now.
 4. **Commit** (and whether to keep `screenshots/` in the repo).
-5. **Next milestone, M2 (worm in sim):** port `sim` to `Vec3`, capsule collision against `Grid::sample`, jump, dig. It needs no renderer change beyond drawing a capsule worm.
+5. **Review M2.** Play it: walk, jump, dig a tunnel, swing from the ceiling of the cavern. Tell me what feels wrong (speeds, camera distance and height, dig size and rate, rope length and reel speed); they are single constants. Also: is the worm's look (capsule, eyes, gun) the direction you want?
+6. **Next milestone, M3 (weapons):** port `WeaponDef`, projectiles, explosions = carve, build = add, tractor beam. It will need the faster `Grid::apply` (item 3).
 
 ### M0 results (Surface Nets meshing, 2D-to-3D go/no-go), kept for reference
 `cargo run -p sdf --release --example bench`, single thread, 128 x 64 x 128 m world. The viewer does not remesh any more, so only the edit rows still matter.
@@ -156,8 +182,8 @@ Tractor beam / "forming": a moving SDF shape applied each tick as add (smooth-mi
 
 ## Milestones (each ends runnable, owner reviews before next)
 - **M0 Terrain spike (go/no-go): DONE.** `sdf` crate + tests + timing harness. The edit cost (1.0-1.7 ms) is the open item.
-- **M1 Viewer: BUILT, awaiting review.** wgpu window, fly camera, click-to-carve/build, raymarched toon shading, ink outlines, automatic resolution. Gate: art style approved.
-- **M2 Worm in sim:** capsule-vs-SDF movement, jump, dig, rope, `Input` with aim; headless tests for determinism.
+- **M1 Viewer: DONE (committed).** wgpu window, fly camera, click-to-carve/build, raymarched toon shading, ink outlines, automatic resolution. Gate: art style approved.
+- **M2 Worm in sim: BUILT, awaiting review.** Capsule-vs-SDF movement, jump, dig, rope, `Input` with aim, headless tests (including determinism), third-person viewer mode.
 - **M3 Weapons:** port `WeaponDef` table, projectile raycast, explosions = carve, build = add, tractor beam.
 - **M4 Host + loopback + Replica (Vec3):** offline play via the same pipeline as the 2D game.
 - **M5 Online:** relay (reused), late join, edit events, checksums.
@@ -193,4 +219,4 @@ Recommendations, ordered by value. Crate versions and APIs are from memory/searc
 | Bots | hand-written steering | keep; later navigation in SDF space is custom anyway | Keep |
 
 ## Next step
-Owner review of M1 (Status, "Next decisions"). Then M2 (worm in sim) or, if the look needs work, a tuning round first. Stop and report before M2.
+Owner review of M2 (Status, "Next decisions"). Then M3 (weapons) or, if the feel needs work, a tuning round first. Stop and report before M3.

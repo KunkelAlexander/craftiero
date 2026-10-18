@@ -10,6 +10,7 @@
 
 use crate::camera::Camera;
 use crate::shaders;
+use bytemuck::Zeroable;
 use glam::{IVec3, Vec3};
 use sdf::{Grid, CHUNK, CHUNK_VOL};
 use std::time::Instant;
@@ -58,6 +59,8 @@ impl Gpu {
 /// the textures and is updated by `Renderer::sync`.
 pub struct FrameParams<'a> {
     pub camera: &'a Camera,
+    /// Worms, guns and ropes (at most `MAX_CAPSULES`, the rest are dropped).
+    pub capsules: &'a [DrawCapsule],
     /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
     pub brush: Option<(Vec3, f32)>,
     pub time: f32,
@@ -66,7 +69,42 @@ pub struct FrameParams<'a> {
     pub outlines: bool,
 }
 
-// Must match `struct U` in shaders.rs: eight vec4s, so no padding questions.
+/// How many capsules the shader's uniform block holds (`array<Capsule, 32>`).
+pub const MAX_CAPSULES: usize = 32;
+
+/// A line segment swept by a sphere. Worms are drawn as these: the ray-capsule
+/// test has a closed-form answer, so the raymarcher finds them with a few
+/// multiplications per pixel instead of a mesh pass or a second distance field.
+#[derive(Clone, Copy)]
+pub struct DrawCapsule {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub radius: f32,
+    /// The colour as picked in a paint program (sRGB); the shader converts it.
+    pub colour: Vec3,
+    /// Does it cast a shadow on the terrain? (Bodies do; eyes and ropes are too
+    /// small to matter, and every caster costs every terrain pixel a test.)
+    pub shadow: bool,
+}
+
+/// The screen is cut into 32 x 18 tiles, and every tile gets a bitmask of the
+/// capsules that can be seen in it. Why: looping over all capsules for every
+/// pixel cost ~6 ms for a handful of worms on this GPU, even with a trivial
+/// loop body (measured: docs/PERFORMANCE.md). With the mask, a pixel far from
+/// every worm reads one number, sees zero, and skips all of it.
+pub const TILES_X: usize = 32;
+pub const TILES_Y: usize = 18;
+
+// Must match `struct Capsule` in shaders.rs: three vec4s.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuCapsule {
+    a: [f32; 4],      // xyz: start, w: radius
+    b: [f32; 4],      // xyz: end, w: radius of a sphere around the whole capsule
+    colour: [f32; 4], // rgb
+}
+
+// Must match `struct U` in shaders.rs: vec4s all the way, so no padding questions.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -78,6 +116,55 @@ struct Uniforms {
     brush: [f32; 4],
     flags: [f32; 4],
     size: [f32; 4],
+    counts: [f32; 4], // x: number of capsules in use, y: shadow casters (the first y)
+    capsules: [GpuCapsule; MAX_CAPSULES],
+    tiles: [[u32; 4]; TILES_X * TILES_Y / 4],
+}
+
+/// For every screen tile, which capsules (bit i = capsule i) might be seen in it.
+/// Conservative: a tile may be marked without a capsule in it, never the reverse.
+fn tile_masks(cam: &Camera, aspect: f32, capsules: &[&DrawCapsule]) -> [[u32; 4]; TILES_X * TILES_Y / 4] {
+    let mut words = [0u32; TILES_X * TILES_Y];
+    let (right, up) = cam.right_up();
+    let fwd = cam.forward();
+    let (hy, hx) = ((cam.fov_y * 0.5).tan(), (cam.fov_y * 0.5).tan() * aspect);
+    for (i, c) in capsules.iter().enumerate() {
+        // A sphere around the whole capsule, then the sphere's rectangle on screen.
+        let mid = (c.a + c.b) * 0.5;
+        let r = c.radius + (c.b - c.a).length() * 0.5;
+        let rel = mid - cam.pos;
+        let depth = rel.dot(fwd);
+        if depth + r < 0.0 {
+            continue; // entirely behind the camera
+        }
+        let (mut x0, mut x1, mut y0, mut y1) = (0, TILES_X - 1, 0, TILES_Y - 1);
+        if depth - r > 0.1 {
+            // (nx, ny): the centre in screen coordinates, -1..1, y up.
+            let (nx, ny) = (rel.dot(right) / (depth * hx), rel.dot(up) / (depth * hy));
+            // Off to the side a sphere looks stretched; this is generous (the true
+            // factor is its square root) and costs only a few extra tiles.
+            let stretch = 1.0 + (nx * hx) * (nx * hx) + (ny * hy) * (ny * hy);
+            let (rx, ry) = (r / (depth * hx) * stretch, r / (depth * hy) * stretch);
+            // To tile coordinates (y down), with one tile of margin.
+            let tx = |n: f32| (n * 0.5 + 0.5) * TILES_X as f32;
+            let ty = |n: f32| (0.5 - n * 0.5) * TILES_Y as f32;
+            let tile = |v: f32, count: usize| (v.floor() as i32).clamp(0, count as i32 - 1) as usize;
+            x0 = tile(tx(nx - rx) - 1.0, TILES_X);
+            x1 = tile(tx(nx + rx) + 1.0, TILES_X);
+            y0 = tile(ty(ny + ry) - 1.0, TILES_Y);
+            y1 = tile(ty(ny - ry) + 1.0, TILES_Y);
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                words[y * TILES_X + x] |= 1 << i;
+            }
+        }
+    }
+    let mut packed = [[0u32; 4]; TILES_X * TILES_Y / 4];
+    for (k, w) in words.iter().enumerate() {
+        packed[k / 4][k % 4] = *w;
+    }
+    packed
 }
 
 pub struct Renderer {
@@ -411,6 +498,25 @@ impl Renderer {
         let aspect = self.screen.0 as f32 / self.screen.1 as f32;
         let (brush_pos, brush_r) = f.brush.unwrap_or((Vec3::ZERO, 0.0));
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        // Shadow casters first: the shader's shadow loop runs over just those.
+        let ordered: Vec<&DrawCapsule> = (f.capsules.iter().filter(|c| c.shadow))
+            .chain(f.capsules.iter().filter(|c| !c.shadow))
+            .take(MAX_CAPSULES)
+            .collect();
+        let casters = ordered.iter().filter(|c| c.shadow).count();
+        let tiles = tile_masks(cam, aspect, &ordered);
+        let mut capsules = [GpuCapsule::zeroed(); MAX_CAPSULES];
+        let used = ordered.len();
+        for (gpu, c) in capsules.iter_mut().zip(&ordered) {
+            *gpu = GpuCapsule {
+                a: c.a.extend(c.radius).to_array(),
+                // The bounding sphere (centred on the middle) is what lets the
+                // shader skip a capsule with two multiplications instead of the
+                // full test: see `cap_hit`.
+                b: c.b.extend(c.radius + (c.b - c.a).length() * 0.5).to_array(),
+                colour: c.colour.extend(0.0).to_array(),
+            };
+        }
         let u = Uniforms {
             cam_pos: cam.pos.extend(0.0).to_array(),
             cam_right: (right * half * aspect).extend(0.0).to_array(),
@@ -420,6 +526,9 @@ impl Renderer {
             brush: brush_pos.extend(brush_r).to_array(),
             flags: [f.time, flag(f.shadows), flag(f.ao), flag(f.outlines)],
             size: [self.gbuf.0 as f32, self.gbuf.1 as f32, self.screen.0 as f32, self.screen.1 as f32],
+            counts: [used as f32, casters as f32, 0.0, 0.0],
+            capsules,
+            tiles,
         };
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
@@ -883,6 +992,62 @@ impl Offscreen {
 mod tests {
     use super::*;
     use sdf::{Op, Shape};
+
+    fn caps(a: Vec3, b: Vec3, radius: f32) -> DrawCapsule {
+        DrawCapsule { a, b, radius, colour: Vec3::ONE, shadow: true }
+    }
+
+    fn bit_set(masks: &[[u32; 4]], tx: usize, ty: usize, bit: usize) -> bool {
+        let k = ty * TILES_X + tx;
+        (masks[k / 4][k % 4] & (1u32 << bit)) != 0u32
+    }
+
+    #[test]
+    fn tile_masks_cover_every_visible_point_of_a_capsule() {
+        // The culling must be conservative: if any pixel could see the capsule,
+        // its tile must say so, or a worm would be cut off along a tile edge.
+        let aspect = 16.0 / 9.0;
+        let (hy, hx) = ((70f32.to_radians() * 0.5).tan(), (70f32.to_radians() * 0.5).tan() * aspect);
+        let capsule = caps(Vec3::new(2.0, -1.0, 12.0), Vec3::new(2.5, 1.0, 14.0), 0.45);
+        for yaw in [-1.2f32, -0.5, 0.0, 0.4, 1.3] {
+            for pitch in [-0.8f32, 0.0, 0.6] {
+                let cam = Camera { pos: Vec3::new(0.3, 0.2, 0.0), yaw, pitch, fov_y: 70f32.to_radians() };
+                let masks = tile_masks(&cam, aspect, &[&capsule]);
+                let (right, up) = cam.right_up();
+                let fwd = cam.forward();
+                // Points on and around the capsule's surface.
+                for k in 0..=10 {
+                    let centre = capsule.a.lerp(capsule.b, k as f32 / 10.0);
+                    for dir in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
+                        let rel = centre + dir * capsule.radius - cam.pos;
+                        let depth = rel.dot(fwd);
+                        if depth < 0.2 {
+                            continue;
+                        }
+                        let (nx, ny) = (rel.dot(right) / (depth * hx), rel.dot(up) / (depth * hy));
+                        if nx.abs() >= 1.0 || ny.abs() >= 1.0 {
+                            continue; // off screen
+                        }
+                        let tx = ((nx * 0.5 + 0.5) * TILES_X as f32) as usize;
+                        let ty = ((0.5 - ny * 0.5) * TILES_Y as f32) as usize;
+                        assert!(bit_set(&masks, tx, ty, 0), "yaw {yaw} pitch {pitch}: tile ({tx},{ty}) misses a visible point");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tile_masks_leave_the_rest_of_the_screen_alone() {
+        let cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 70f32.to_radians() };
+        let far = caps(Vec3::new(0.0, 0.0, 30.0), Vec3::new(0.0, 1.0, 30.0), 0.45);
+        let behind = caps(Vec3::new(0.0, 0.0, -30.0), Vec3::new(0.0, 1.0, -30.0), 0.45);
+        let masks = tile_masks(&cam, 16.0 / 9.0, &[&far, &behind]);
+        let set = |bit: usize| (0..TILES_X * TILES_Y).filter(|&k| (masks[k / 4][k % 4] & (1u32 << bit)) != 0u32).count();
+        assert!(set(0) >= 1 && set(0) <= 25, "a distant worm covers a few of the 576 tiles: {}", set(0));
+        assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 0) || bit_set(&masks, TILES_X / 2 - 1, TILES_Y / 2, 0));
+        assert_eq!(set(1), 0, "behind the camera is nowhere");
+    }
 
     #[test]
     fn coarse_map_counts_chunks_to_the_nearest_surface() {
