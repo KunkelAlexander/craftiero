@@ -1,6 +1,7 @@
 // The viewer. M1: a destructible SDF world, raymarched on the GPU, drawn with a
 // toon ramp and ink outlines. M2: a worm from the `sim` crate that you walk,
-// jump, dig and swing around it. (F switches to the M1 fly camera and brush.)
+// jump, dig and swing around it. M3: eleven weapons, damage and respawning.
+// (F switches to the M1 fly camera and brush.)
 //
 //   cargo run -p viewer --release                  the interactive viewer
 //   cargo run -p viewer --release -- --shot a.png  render one frame to a PNG
@@ -10,16 +11,18 @@
 // `sim::Input`s, steps `sim::World` at a fixed 60 Hz and draws what it holds.
 
 mod camera;
+mod effects;
 mod renderer;
 mod shaders;
 mod world;
 mod worms;
 
 use camera::Camera;
+use effects::Effects;
 use glam::{Vec2, Vec3};
 use renderer::{FrameParams, Gpu, Offscreen, Renderer};
 use sdf::{Grid, Op, Shape};
-use sim::{dig_target, Input, World, DIG_RADIUS, DT, EYE_HEIGHT};
+use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, WEAPONS};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,12 +37,15 @@ const HELP: &str = "\
 Controls
   click the window  capture the mouse        Esc  release it (again to quit)
   W A S D           walk                     Space  jump        mouse  look and aim
-  left mouse        dig (hold)               right mouse  shoot the rope / let go
+  left mouse        fire (hold)              right mouse  shoot the rope / let go
+  1-9 0 -           pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
+                    Bomb Cluster Swarm Teleport Nova Block Tractor
+  Left Shift        dig (hold); the ring shows where the hole will be
   E / Q             reel the rope in (pulls you, so you can launch yourself) / out
   Space on the rope let go with an upward kick; steer while swinging to pump it up
   F                 fly camera with the M1 brush: W A S D Space Ctrl Shift fly,
                     left mouse carve, right mouse build, mouse wheel brush size
-  1 2 3             fixed render resolution 100% / 75% / 50%
+  F1 F2 F3          fixed render resolution 100% / 75% / 50%
   T                 automatic resolution (default): holds ~60 fps by scaling it
   G shadows   H ambient occlusion   O ink outlines   V vsync   R reset the world";
 
@@ -56,6 +62,9 @@ struct Config {
     worm: Option<[f32; 3]>,
     /// `--rope`: that worm has just shot its rope and swings from it.
     rope: bool,
+    /// `--fire weapon_id[,ticks]`: that worm fires once and the picture is taken
+    /// this many ticks later (default 10), so projectiles and blasts can be seen.
+    fire: Option<(u8, u32)>,
     brush: bool,
     shadows: bool,
     ao: bool,
@@ -73,6 +82,7 @@ fn parse_args() -> Config {
         edits: false,
         worm: None,
         rope: false,
+        fire: None,
         brush: true,
         shadows: true,
         ao: true,
@@ -104,6 +114,11 @@ fn parse_args() -> Config {
                 c.worm = Some(v.try_into().expect("--worm x,z,yaw_deg"));
             }
             "--rope" => c.rope = true,
+            "--fire" => {
+                let v = value("--fire");
+                let (id, ticks) = v.split_once(',').unwrap_or((&v, "10"));
+                c.fire = Some((id.trim().parse().expect("--fire weapon_id[,ticks]"), ticks.trim().parse().expect("ticks")));
+            }
             "--no-brush" => c.brush = false,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
@@ -112,6 +127,27 @@ fn parse_args() -> Config {
         }
     }
     c
+}
+
+/// The seed of the sim's random numbers (weapon spread, bomblets).
+const SEED: u32 = 1;
+
+/// The weapon a number-row key picks: 1 to 9 are the first nine, 0 the tenth.
+fn weapon_key(key: KeyCode) -> Option<u8> {
+    Some(match key {
+        KeyCode::Digit1 => 0,
+        KeyCode::Digit2 => 1,
+        KeyCode::Digit3 => 2,
+        KeyCode::Digit4 => 3,
+        KeyCode::Digit5 => 4,
+        KeyCode::Digit6 => 5,
+        KeyCode::Digit7 => 6,
+        KeyCode::Digit8 => 7,
+        KeyCode::Digit9 => 8,
+        KeyCode::Digit0 => 9,
+        KeyCode::Minus => 10,
+        _ => return None,
+    })
 }
 
 fn spawn_camera() -> Camera {
@@ -198,9 +234,10 @@ fn headless_gpu() -> Gpu {
 
 /// The world for a screenshot: the map, plus one worm if `--worm` asked for it,
 /// settled on the ground (and swinging from its rope after `--rope`).
-fn shot_world(cfg: &Config) -> World {
+fn shot_world(cfg: &Config) -> (World, Effects) {
     let spawns: Vec<(f32, f32)> = cfg.worm.iter().map(|w| (w[0], w[1])).collect();
-    let mut world = World::new(world::build(), &spawns);
+    let mut world = World::new(world::build(), &spawns, SEED);
+    let mut effects = Effects::default();
     if let Some([_, _, yaw]) = cfg.worm {
         let look = Input { yaw: yaw.to_radians(), ..Input::default() };
         for _ in 0..60 {
@@ -214,16 +251,26 @@ fn shot_world(cfg: &Config) -> World {
                 world.step(&[Input { rope: false, ..shoot }]);
             }
         }
+        if let Some((weapon, ticks)) = cfg.fire {
+            world.drain_events();
+            for t in 0..=ticks {
+                world.step(&[Input { fire: t == 0, weapon, pitch: 0.05, ..look }]);
+                for e in world.drain_events() {
+                    effects.add(&e);
+                }
+                effects.update(DT);
+            }
+        }
     }
     for (i, w) in world.worms.iter().enumerate() {
         println!("worm {i} stands at {:.1}, {:.1}, {:.1}{}", w.pos.x, w.pos.y, w.pos.z, if w.rope.is_some() { " on its rope" } else { "" });
     }
-    world
+    (world, effects)
 }
 
 fn run_shot(cfg: &Config, path: &str) {
     let gpu = headless_gpu();
-    let mut world = shot_world(cfg);
+    let (mut world, effects) = shot_world(cfg);
     let mut renderer = Renderer::new(&gpu, Offscreen::FORMAT, cfg.size, cfg.scale, &mut world.grid);
     if cfg.edits {
         demo_edits(&mut world.grid);
@@ -232,7 +279,9 @@ fn run_shot(cfg: &Config, path: &str) {
     let cam = camera_from(cfg);
     let target = Offscreen::new(&gpu.device, cfg.size);
     let positions: Vec<Vec3> = world.worms.iter().map(|w| w.pos).collect();
-    let capsules = worms::capsules(&world.worms, &positions);
+    let mut capsules = worms::capsules(&world.worms, &positions);
+    capsules.extend(effects::projectiles(&world.projectiles, 1.0));
+    capsules.extend(effects.capsules());
     let params = FrameParams {
         camera: &cam,
         capsules: &capsules,
@@ -378,35 +427,39 @@ fn run_bench(cfg: &Config) {
     // Edit cost: the CPU edit, the texture upload, and the frame after it.
     let cam = &views[0].1;
     let params = FrameParams { camera: cam, capsules: &[], brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
-    let (mut edit, mut sync, mut chunks) = (0.0, 0.0, 0usize);
+    // A rocket's crater (r = 3 m) and a Nova's (r = 8 m). The Nova ones are 9 m
+    // apart, so they overlap and the later ones are a little cheaper than the first.
     let n = 100;
-    for i in 0..n {
-        let x = 20.0 + (i % 10) as f32 * 9.0;
-        let z = 20.0 + (i / 10) as f32 * 9.0;
-        let Some(t) = grid.raycast(Vec3::new(x, 60.0, z), -Vec3::Y, 80.0) else { continue };
-        let t0 = Instant::now();
-        carve(&mut grid, Vec3::new(x, 60.0 - t, z), 3.0);
-        edit += t0.elapsed().as_secs_f64() * 1000.0;
-        let t1 = Instant::now();
-        chunks += renderer.sync(&mut grid);
-        sync += t1.elapsed().as_secs_f64() * 1000.0;
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        renderer.render(&mut encoder, &target.view, &params);
-        gpu.queue.submit([encoder.finish()]);
-        renderer.end_frame();
+    for radius in [3.0f32, 8.0] {
+        let (mut edit, mut sync, mut chunks) = (0.0, 0.0, 0usize);
+        for i in 0..n {
+            let x = 20.0 + (i % 10) as f32 * 9.0;
+            let z = 20.0 + (i / 10) as f32 * 9.0;
+            let Some(t) = grid.raycast(Vec3::new(x, 60.0, z), -Vec3::Y, 80.0) else { continue };
+            let t0 = Instant::now();
+            carve(&mut grid, Vec3::new(x, 60.0 - t, z), radius);
+            edit += t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = Instant::now();
+            chunks += renderer.sync(&mut grid);
+            sync += t1.elapsed().as_secs_f64() * 1000.0;
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            renderer.render(&mut encoder, &target.view, &params);
+            gpu.queue.submit([encoder.finish()]);
+            renderer.end_frame();
+        }
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        println!(
+            "r={radius} m crater x{n}: CPU edit {:.2} ms, upload {:.2} ms ({:.1} chunks) per edit",
+            edit / n as f64,
+            sync / n as f64,
+            chunks as f64 / n as f64
+        );
     }
-    gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     let t = Instant::now();
     for _ in 0..50 {
         std::hint::black_box(renderer::coarse_map(&grid));
     }
     println!("empty-space map rebuild: {:.3} ms", t.elapsed().as_secs_f64() * 1000.0 / 50.0);
-    println!(
-        "r=3 m crater x{n}: CPU edit {:.2} ms, upload {:.2} ms ({:.1} chunks) per edit",
-        edit / n as f64,
-        sync / n as f64,
-        chunks as f64 / n as f64
-    );
     renderer.set_scale(1.0);
 }
 
@@ -425,6 +478,10 @@ struct Viewer {
     /// Where each worm was before the last tick, for drawing between ticks.
     prev_pos: Vec<Vec3>,
     seq: u32,
+    /// Fireballs and beams, started by the sim's events.
+    effects: Effects,
+    /// The weapon worm 0 holds (an id, see `sim::weapons`).
+    weapon: u8,
     /// The M1 mode: a free camera and the brush instead of the worm.
     fly: bool,
     camera: Camera,
@@ -461,7 +518,7 @@ impl Viewer {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("liero3d M2")
+                        .with_title("liero3d M3")
                         // Physical pixels, not logical: on a display scaled to 150%+ a
                         // logical 1280 x 720 window is 2-4x the pixels and the frame
                         // time would depend on the user's desktop scaling.
@@ -493,7 +550,7 @@ impl Viewer {
         surface.configure(&gpu.device, &surface_cfg);
 
         println!("window {}x{} px, display scale {:.2}", size.width, size.height, window.scale_factor());
-        let mut world = World::new(world::build(), &world::SPAWNS);
+        let mut world = World::new(world::build(), &world::SPAWNS, SEED);
         let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
         let now = Instant::now();
@@ -507,6 +564,8 @@ impl Viewer {
             acc: 0.0,
             prev_pos,
             seq: 0,
+            effects: Effects::default(),
+            weapon: 0,
             // An explicit --cam means "look at this spot", which only the free camera can.
             fly: cfg.cam.is_some(),
             camera: camera_from(cfg),
@@ -618,9 +677,9 @@ impl Viewer {
                 }
             }
             // A fixed scale turns the automatic one off, so the choice sticks.
-            KeyCode::Digit1 => self.set_fixed_scale(1.0),
-            KeyCode::Digit2 => self.set_fixed_scale(0.75),
-            KeyCode::Digit3 => self.set_fixed_scale(0.5),
+            KeyCode::F1 => self.set_fixed_scale(1.0),
+            KeyCode::F2 => self.set_fixed_scale(0.75),
+            KeyCode::F3 => self.set_fixed_scale(0.5),
             KeyCode::KeyT => {
                 self.auto_res = !self.auto_res;
                 self.gpu_ms = 0.0;
@@ -636,7 +695,8 @@ impl Viewer {
             }
             KeyCode::KeyF => self.fly = !self.fly,
             KeyCode::KeyR => {
-                self.world = World::new(world::build(), &world::SPAWNS);
+                self.world = World::new(world::build(), &world::SPAWNS, SEED);
+                self.effects = Effects::default();
                 self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
                 self.renderer = Renderer::new(
                     &self.gpu,
@@ -646,7 +706,12 @@ impl Viewer {
                     &mut self.world.grid,
                 );
             }
-            _ => {}
+            // The number row picks the weapon with that id; `-` is the 11th.
+            other => {
+                if let Some(id) = weapon_key(other) {
+                    self.weapon = id;
+                }
+            }
         }
     }
 
@@ -655,7 +720,7 @@ impl Viewer {
         let worm = &self.world.worms[0];
         if self.fly {
             // The free camera has the keys: the worm just stands and looks as before.
-            return Input { yaw: worm.yaw, pitch: worm.pitch, ..Input::default() };
+            return Input { yaw: worm.yaw, pitch: worm.pitch, weapon: self.weapon, ..Input::default() };
         }
         let held = |k| self.keys.contains(&k);
         let axis = |plus, minus| (if held(plus) { 1.0 } else { 0.0 }) - (if held(minus) { 1.0 } else { 0.0 });
@@ -665,9 +730,11 @@ impl Viewer {
             yaw: self.camera.yaw,
             pitch: self.camera.pitch,
             jump: held(KeyCode::Space),
-            dig: self.grabbed && self.lmb,
+            dig: self.grabbed && held(KeyCode::ShiftLeft),
             rope: self.grabbed && self.rmb,
             reel: axis(KeyCode::KeyE, KeyCode::KeyQ),
+            fire: self.grabbed && self.lmb,
+            weapon: self.weapon,
         }
     }
 
@@ -692,10 +759,18 @@ impl Viewer {
         if ticks > 0 {
             self.sim_ms = t.elapsed().as_secs_f64() * 1000.0;
         }
-        // Nothing listens to the sim's events yet (sound and particles will, at
-        // M6); drain them so they do not pile up. The renderer needs no event
-        // for terrain edits: it asks the grid which chunks changed.
-        self.world.drain_events();
+        // The sim's events start the effects (a fireball per explosion, a line per
+        // beam); sound will listen too, at M6. The renderer needs no event for
+        // terrain edits: it asks the grid which chunks changed.
+        for event in self.world.drain_events() {
+            self.effects.add(&event);
+            // A worm the rules moved (a respawn, a teleport) must not be drawn
+            // sliding there from where it stood.
+            if let Event::Respawned { worm } | Event::Teleported { worm, .. } = event {
+                self.prev_pos[worm as usize] = self.world.worms[worm as usize].pos;
+            }
+        }
+        self.effects.update(dt);
 
         if self.fly {
             self.fly_and_edit(dt);
@@ -779,7 +854,9 @@ impl Viewer {
         if !self.fly {
             self.camera.follow(draw_pos[0] + Vec3::Y * (EYE_HEIGHT + 0.2), 5.0, &self.world.grid);
         }
-        let capsules = worms::capsules(&self.world.worms, &draw_pos);
+        let mut capsules = worms::capsules(&self.world.worms, &draw_pos);
+        capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
+        capsules.extend(self.effects.capsules());
         // Show where a dig would land (or, flying, where the brush would).
         let brush = if self.fly {
             aim_point(&self.world.grid, &self.camera).map(|p| (p, self.brush_radius))
@@ -831,8 +908,20 @@ impl Viewer {
         let elapsed = self.stats_since.elapsed().as_secs_f64();
         if elapsed >= 0.5 {
             let on = |b| if b { "on" } else { "off" };
+            // No text rendering yet (the HUD is M6): the title bar carries it.
+            let me = &self.world.worms[0];
+            let gun = &me.weapons[me.current];
+            let def = &WEAPONS[gun.id as usize];
+            let ammo = if !me.alive {
+                format!("dead, back in {:.0} s", me.respawn_timer.max(0.0))
+            } else if gun.reload > 0.0 {
+                format!("reloading {:.1} s", gun.reload)
+            } else {
+                format!("{}/{}", gun.ammo, def.mag)
+            };
+            let hud = format!("hp {:.0} | {} {} | kills {} deaths {}", me.hp, def.name, ammo, me.kills, me.deaths);
             self.window.set_title(&format!(
-                "liero3d M2 {} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {}",
+                "liero3d M3 {} | {hud} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {}",
                 if self.fly { "fly" } else { "worm" },
                 self.frames as f64 / elapsed,
                 elapsed * 1000.0 / self.frames as f64,
@@ -906,7 +995,14 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                v.brush_radius = (v.brush_radius * 1.12f32.powf(lines)).clamp(0.5, 8.0);
+                if v.fly {
+                    v.brush_radius = (v.brush_radius * 1.12f32.powf(lines)).clamp(0.5, 8.0);
+                } else if lines != 0.0 {
+                    // Scrolling up is the next weapon.
+                    let n = ARSENAL.len() as i32;
+                    let at = ARSENAL.iter().position(|&id| id == v.weapon).unwrap_or(0) as i32;
+                    v.weapon = ARSENAL[(at + if lines > 0.0 { 1 } else { -1 }).rem_euclid(n) as usize];
+                }
             }
             WindowEvent::RedrawRequested => v.frame(event_loop),
             _ => {}

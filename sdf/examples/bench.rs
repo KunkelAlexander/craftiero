@@ -92,6 +92,29 @@ fn main() {
     }
     println!("tractor beam, 60 ticks: {:.3} ms/tick avg ({:.1} chunks/tick)", ms(t) / 60.0, beam_chunks as f64 / 60.0);
 
+    // The edits alone (no remeshing, which the viewer does not do): what a
+    // weapon costs the sim per shot. Big craters are the Nova, the beam is the
+    // tractor, which edits every tick while the trigger is held.
+    for radius in [1.5, 3.0, 8.0] {
+        let n = 100;
+        let t = Instant::now();
+        for _ in 0..n {
+            let x = 10.0 + rng.next() * 108.0;
+            let z = 10.0 + rng.next() * 108.0;
+            let y = 24.0 + 6.0 * (x * 0.1).sin() * (z * 0.13).cos();
+            grid.apply(Shape::Sphere { center: Vec3::new(x, y, z), radius }, Op::Carve);
+        }
+        println!("edit only, carve r={radius} m: {:.3} ms", ms(t) / n as f64);
+        grid.take_dirty();
+    }
+    let t = Instant::now();
+    for i in 0..60 {
+        let a = Vec3::new(40.0 + i as f32 * 0.2, 30.0, 70.0);
+        grid.apply(Shape::Sphere { center: a, radius: 0.8 }, Op::Smooth(0.4));
+    }
+    println!("edit only, tractor blob r=0.8 m smooth: {:.3} ms/tick", ms(t) / 60.0);
+    grid.take_dirty();
+
     // Collision-style queries.
     let t = Instant::now();
     let mut acc = 0.0;

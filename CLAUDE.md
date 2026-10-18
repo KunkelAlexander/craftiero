@@ -77,8 +77,8 @@ Fork of the 2D "Neon Bomber-Liero" (see git history before the "Fork for 3D" com
 - Fixed 60 Hz sim; render at display rate. Weapons are data rows (`WeaponDef`).
 
 ## Workspace state
-`sdf` (M0), `sim` (M2: the worm, pure, headless-tested) and `viewer` (wgpu raymarcher plus the M2 game loop, becomes `game` later) are in the workspace. `sim/old2d/` (weapons, bots, the 2D world) is kept for porting at M3. `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are the 2D code kept for porting; they do not compile yet. Re-add each to `members` at its milestone.
+`sdf` (M0), `sim` (M2-M3: worms, weapons, combat, pure, headless-tested) and `viewer` (wgpu raymarcher plus the game loop and effects, becomes `game` later) are in the workspace. `sim/old2d/` (the 2D bots) is kept for porting at M6; the 2D weapons and world were ported at M3 and deleted (git history has them). `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are the 2D code kept for porting; they do not compile yet. Re-add each to `members` at its milestone.
 
 ## Commands
 - `cargo test -p sdf -p sim -p viewer`, `cargo run -p sdf --release --example bench`
-- `cargo run -p viewer --release` (interactive), `-- --shot out.png [--edits --cam x,y,z,yaw,pitch --worm x,z,yaw [--rope]]` (headless screenshot), `-- --bench` (GPU ms per pass). Windows defaults to DX12; `WGPU_BACKEND=vulkan` overrides.
+- `cargo run -p viewer --release` (interactive), `-- --shot out.png [--edits --cam x,y,z,yaw,pitch --worm x,z,yaw [--rope]]` (headless screenshot; `--fire id[,ticks]` fires that weapon and shoots the picture some ticks later), `-- --bench` (GPU ms per pass). Windows defaults to DX12; `WGPU_BACKEND=vulkan` overrides.

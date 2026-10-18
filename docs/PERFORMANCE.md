@@ -8,10 +8,12 @@ numbers" first.
 
 - **Machine:** a laptop with an Intel UHD integrated GPU (shared memory, Intel
   driver 31.0.101.2135), Windows 11, DX12 backend, `cargo --release`.
-- **It throttles.** Intel's thermal framework (`dptf_helper`) was running, and
+- **Timings drift.** Intel's thermal framework (`dptf_helper`) was running, and
   identical runs differed by up to 2x. Twice the whole machine was ~2x slow for a
-  minute (even the CPU-only map generation took 1.3 s instead of 0.6 s). Treat
-  differences under about 30% as noise.
+  minute (even the CPU-only map generation took 1.3 s instead of 0.6 s). I first
+  put this down to thermal throttling, which was never measured; section 9 found
+  a real cause (background CPU load sharing the power budget). Treat differences
+  under about 30% as noise.
 - **Two measuring methods were used.** Early numbers are the wall-clock time of
   "submit, wait for the GPU, return", averaged over one batch. Later numbers use
   the GPU's own timestamp queries (per pass) and the best of three batches. The
@@ -254,6 +256,29 @@ effect: the r = 3 m crater measured 2.73, 1.02, 1.11 and 0.63 ms in four runs
 of unchanged code. If the game feels uneven on this laptop, check for
 background CPU load and the Windows power mode before suspecting the code.
 
+### 10. Edits for weapons (M3): the faster `Grid::apply` was not needed
+
+M3 was expected to need a faster `Grid::apply` (explosions, a tractor that edits
+every few ticks). Measured first, release build, the bare sim (`sdf` bench):
+
+| Edit | Cost |
+|---|---|
+| carve r = 1.5 m (a dig) | 0.12 ms |
+| carve r = 3 m (a rocket) | 0.46 ms |
+| carve r = 8 m (a Nova) | 4.2 ms |
+| smooth add r = 0.8 m (a tractor lump) | 0.11 ms |
+
+and in the viewer (`--bench`, CPU edit + texture upload): r = 3 m 0.7 + 1.5 ms,
+r = 8 m 8.8 + 2.2 ms (the Nova craters overlap there, 9 m apart). Only the Nova
+is a visible hitch: one frame per eight-second reload.
+
+I tried the obvious fix, taking each chunk out of the grid once and editing it in
+place instead of a bounds-checked lookup per voxel: 5-8% faster, so it was
+reverted. The cost is the per-voxel distance maths (a square root each), not the
+lookups. The idea that would pay is skipping chunks that lie entirely inside a
+carve sphere, which become air without evaluating a voxel (about a third of a
+Nova's chunks); not done, because one hitch per Nova does not justify it yet.
+
 ## What did not help (so nobody repeats it)
 
 | Experiment | Result |
@@ -261,6 +286,7 @@ background CPU load and the Windows power mode before suspecting the code.
 | Widen the stored distance band from 4 to 8 voxels (so a step can be up to 2 m, not 1 m) | no rendering gain within noise (e.g. open hills 18.8 -> 21.1 ms, ground 28.8 -> 26.1 ms); CPU edit cost **doubled** (0.98 -> 2.35 ms). Reverted. |
 | Shadow rays capped at 48 steps | thin light slivers in long shadows; saving unmeasurable. 128 kept. |
 | A per-capsule bounding-sphere early-out inside the per-pixel loop | 9.8 -> 8.0 ms worm cost: the loop itself was the cost (section 8). Kept, it is cheap, but the tile masks are what fixed it. |
+| Rewrite `Grid::apply` to own each chunk once instead of a lookup per voxel (M3) | 4.2 -> 4.0 ms for r = 8 m, 0.46 -> 0.43 ms for r = 3 m. Reverted: the per-voxel maths is the cost (section 10). |
 | Treat the benchmark's single averages as precise | the machine's clock varied 2x between identical runs, so the bench now reports the best of three batches. |
 
 ## Where the time still goes, and what is next
@@ -286,6 +312,7 @@ Remaining ideas, with my estimate of the gain (not yet tried unless noted):
    frame, at the cost of softer or shimmering shadow edges.
 3. **Low-resolution pre-pass for the ray start** (cone/beam marching). Helps
    views looking down; does little for grazing rays.
-4. **Faster `Grid::apply`** (per-chunk row access, early reject): the CPU edit
-   (1.0-1.7 ms) is the one cost on the future sim thread.
+4. **Faster `Grid::apply` for big craters** (skip chunks wholly inside the
+   shape): the Nova costs 4 ms in the sim and ~9 ms in the viewer (section 10).
+   Small edits are already cheap (0.1-0.5 ms).
 5. Not worth it so far: widening the distance band (tried, above).

@@ -9,11 +9,14 @@ It is also a learning project: the code is commented to explain *why*, names the
 patterns from *Game Programming Patterns* where they are used, and will explain
 the networking concepts where they appear.
 
-**Where it is:** milestone M2 of seven. You play a worm in a cave-and-hills
-world: walk, jump, dig tunnels with the mouse and swing on a ninja rope, at 60
-fps on an integrated laptop GPU, with a rope that flings you around. The rules run in a pure `sim` crate, with
-headless tests. There are no weapons or multiplayer yet (M3-M6, see
-[PLAN.md](PLAN.md)). The M1 fly camera and brush are still there (press F).
+**Where it is:** milestone M3 of seven. You play a worm in a cave-and-hills
+world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
+integrated laptop GPU, and now fight: eleven weapons (rockets, a railgun, bombs,
+homing swarms, a teleport gun, a Nova that clears a cavern, and two that *build*
+rock). Explosions carve the terrain, rock is cover, and a dead worm comes back
+after three seconds. The rules run in a pure `sim` crate, with headless tests.
+There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
+an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
 
 | | |
 |---|---|
@@ -38,7 +41,9 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 |---|---|
 | W A S D, mouse | walk, look and aim |
 | Space | jump: hold for a high jump, tap for a hop; holding it hops on every landing |
-| left mouse (hold) | dig: a 1.5 m hole where you look (up to 4 m away), five a second |
+| left mouse (hold) | fire the current weapon |
+| 1 2 3 4 5 6 7 8 9 0 -, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor |
+| Left Shift (hold) | dig: a 1.5 m hole where you look (up to 4 m away), five a second |
 | right mouse | shoot the ninja rope at what you look at; press again to let go |
 | E / Q | reel the rope in / out. Reeling in *pulls* you (up to 20 m/s), so you can launch yourself out of a hole |
 | Space on the rope | let go with an upward kick |
@@ -47,19 +52,21 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 | *fly mode:* W A S D, Space / Ctrl, Shift | fly, up / down, fast |
 | *fly mode:* left / right mouse (hold) | carve / build with the brush (build blends in like clay) |
 | *fly mode:* mouse wheel | brush radius |
-| 1 / 2 / 3 | fixed render resolution 100% / 75% / 50% |
+| F1 / F2 / F3 | fixed render resolution 100% / 75% / 50% |
 | T | automatic resolution (default): scales the resolution to hold ~60 fps |
 | G / H / O / V | shadows / ambient occlusion / ink outlines / vsync |
 | R | regenerate the map (about half a second) |
 
-The window title shows fps, GPU milliseconds per pass, the sim, edit and upload
-cost, the brush size and the render scale.
+The window title is the HUD until M6: health, the weapon with its magazine (or
+"reloading"), kills and deaths, then fps, GPU milliseconds per pass, the sim, edit
+and upload cost, the brush size and the render scale.
 
 Headless modes (no window needed):
 
 ```
 cargo run -p viewer --release -- --shot out.png --edits --cam 62,36,54,180,-12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12
+cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50
 cargo run -p viewer --release -- --bench --size 1920x1080
 cargo test -p sdf -p sim -p viewer
 ```
@@ -84,16 +91,20 @@ over the network.
   `World::step(&[Input])` is the only way state changes. A worm is a capsule
   tested as three spheres against the distance field: push out along the
   gradient, walk along slopes, step up small ledges, jump, dig, and a rope that
-  is a hard distance limit (so swinging is a pendulum). Read `world.rs`; its
-  tests are the specification.
+  is a hard distance limit (so swinging is a pendulum). Weapons are rows of a
+  table (`weapons.rs`); `combat.rs` is the few rules that read it: projectiles
+  that step through the distance field, explosions that carve it, damage with
+  rock as cover, respawning. Read `world.rs` and `combat.rs`; their tests are
+  the specification.
 * **[`viewer/`](viewer/)** copies the grid into a 3D
   texture and **raymarches it on the GPU** (sphere tracing), shades it with a
   three-band toon ramp, and draws ink outlines from a depth/normal buffer.
   After an edit only the changed chunks are re-uploaded. Worms are analytic
   capsules found by a closed-form ray test inside the same shader, so they get
-  shadows, AO and outlines for free. It runs the sim at a fixed 60 Hz and
+  shadows, AO and outlines for free; so are projectiles and the fireballs the
+  sim's events start. It runs the sim at a fixed 60 Hz and
   draws between ticks. Read it in this order: `main.rs` (window, input, game
-  loop), `worms.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),
+  loop), `worms.rs`, `effects.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),
   `shaders.rs` (the WGSL), `world.rs` (the demo map), `camera.rs`.
 
 Why raymarch instead of meshing the terrain? The first plan used Surface Nets
@@ -113,7 +124,7 @@ The full log is in **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)**: every
 bottleneck found (too many texture fetches per pixel, shadow rays, per-chunk
 uploads, an outline pass that ignored the render scale, a 19.5 s map generator,
 high-DPI scaling), each optimisation with before/after numbers, what did not
-help, how noisy the measurements are on a throttling laptop, and what to try
+help, how noisy the measurements are on this laptop, and what to try
 next.
 
 ## Roadmap
@@ -124,8 +135,8 @@ Milestones (full detail and decisions in [PLAN.md](PLAN.md)):
 |---|---|
 | M0 | `sdf` crate and terrain spike: **done** |
 | M1 | Raymarched viewer with brush editing: **done** |
-| M2 | A worm in the sim: capsule against the SDF, jump, dig, rope, aim: **built, awaiting review** |
-| M3 | Weapons as data rows: explosions carve, build adds, tractor beam |
+| M2 | A worm in the sim: capsule against the SDF, jump, dig, rope, aim: **done** |
+| M3 | Weapons as data rows: explosions carve, build adds, tractor beam: **built, awaiting review** |
 | M4 | Host + loopback + replica: offline play through the same pipeline as online |
 | M5 | Online: relay server, late join, edit events, checksums |
 | M6 | Polish: synthesized audio, bots, procedural maps, HUD |
@@ -135,7 +146,7 @@ Milestones (full detail and decisions in [PLAN.md](PLAN.md)):
 | Path | What |
 |---|---|
 | `sdf/`, `sim/`, `viewer/` | the 3D code (in the workspace) |
-| `sim/old2d/` | the 2D game's weapons, bots and world, kept to be ported at M3 |
+| `sim/old2d/` | the 2D game's bots, kept to be ported at M6 (its weapons and world were ported at M3 and deleted; they stay in git history) |
 | `protocol/`, `host/`, `server/`, `game/src/{share,local,join,net,socket}.rs` | the 2D game's networking and relay, kept to be ported at M4-M5; they do not compile yet |
 | [`PLAN.md`](PLAN.md), [`CLAUDE.md`](CLAUDE.md) | the plan and decisions; the working rules for the code |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | performance log |

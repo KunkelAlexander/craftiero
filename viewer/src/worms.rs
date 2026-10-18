@@ -21,6 +21,9 @@ const ROPE: Vec3 = Vec3::new(0.92, 0.86, 0.70);
 pub fn capsules(worms: &[Worm], positions: &[Vec3]) -> Vec<DrawCapsule> {
     let mut out = Vec::new();
     for (i, (worm, &pos)) in worms.iter().zip(positions).enumerate() {
+        if !worm.alive {
+            continue; // (the death flash is an effect, see `effects.rs`)
+        }
         let caps = |a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool| DrawCapsule { a, b, radius, colour, shadow };
         let aim = worm.aim_dir();
         let (sy, cy) = worm.yaw.sin_cos();

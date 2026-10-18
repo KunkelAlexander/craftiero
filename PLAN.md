@@ -5,10 +5,10 @@ Goal: a 3D, Liero-style worm shooter with fully destructible/formable terrain ba
 Decisions from the user: **native first, web later**; **full 3D volume, small arena** (caves/tunnels, ~128x64x128 m at ~0.25 m voxels); **raymarch the SDF, do not mesh it** (decided at M1, see Status).
 
 ## Status (read this first)
-- **Done:** fork + prune of the 2D repo (history kept), `CLAUDE.md` rewritten for 3D, **M0** the `sdf` crate, **M1** the `viewer` tech demo (committed), **M2** a worm in the `sim` crate with a third-person mode in the viewer. **M2 is built and tested, and waits for the owner's review** (feel above all: see "M2" below).
-- **Workspace:** `sdf`, `sim` and `viewer` are `members`. `sim/old2d/` holds the 2D weapons, bots and world for M3. `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are 2D code kept for porting and do not compile yet. Re-add each at its milestone.
-- **Not committed:** the M2 work (new `sim`, `viewer/src/worms.rs`, shader and renderer changes, the docs). M1 is committed.
-- **Tests:** `cargo test -p sdf -p sim -p viewer` (10 + 24 + 11 headless tests, all pass).
+- **Done:** fork + prune of the 2D repo (history kept), `CLAUDE.md` rewritten for 3D, **M0** the `sdf` crate, **M1** the `viewer` tech demo (committed), **M2** a worm in the `sim` crate with a third-person mode in the viewer (committed), **M3** weapons: eleven weapons as table rows, projectiles, explosions that carve, damage and respawning, effects in the viewer. **M3 is built and tested, and waits for the owner's review** (feel and balance above all: see "M3" below).
+- **Workspace:** `sdf`, `sim` and `viewer` are `members`. `sim/old2d/` holds the 2D bots for M6 (its weapons and world were ported at M3 and deleted). `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are 2D code kept for porting and do not compile yet. Re-add each at its milestone.
+- **Not committed:** the M3 work (`sim/src/{weapons,combat}.rs`, `viewer/src/effects.rs`, input and bench changes, the docs). M0 to M2 are committed.
+- **Tests:** `cargo test -p sdf -p sim -p viewer` (10 + 48 + 11 headless tests, all pass).
 
 ### M2: the worm (built)
 What exists: `sim::World` (grid + worms, `step(&[Input])` at a fixed 60 Hz, events drained by consumers), `sim::Worm` (capsule of three spheres, walk, jump, dig, rope), a 3D `Input` (move, absolute yaw and pitch, jump, dig, rope, reel; sanitised against NaN and huge values), a third-person camera that is pulled in by rock, worms drawn as capsules in the raymarcher, fixed-timestep loop with drawing between ticks. The 2D `sim` files moved to `sim/old2d/`; only `input.rs` and `rng.rs` survive in `sim/src`.
@@ -24,6 +24,33 @@ Design decisions, each with its reason in the code comments:
 
 How to look at it without a window: `-- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12` (add `--rope` for a swinging worm; `--worm 64,22,180 --rope --cam 76,28,26,270,-0.05` shows one hanging on a mountain).
 
+### M3: weapons (built)
+What exists: `sim::weapons` (the `WeaponDef` table: 11 weapons plus the cluster's bomblet, ported from the 2D game and converted to metres), `sim::combat` (firing, projectiles, explosions, damage, respawn, as methods of `World`), `Input` gained `fire` and `weapon` (an id, sent every tick like the aim), worms have health, a magazine per weapon, kills and deaths, `World::new(grid, spawns, seed)` (the seed starts the world's own random numbers; the spawn points are also where a dead worm comes back). In the viewer: `effects.rs` (projectiles as capsules, a fireball per explosion, a line per beam, all started by the sim's events), the number row and the mouse wheel pick the weapon, Left Shift digs, the window title is the HUD until M6.
+
+The arsenal (an id is also its slot): Blaster (10 damage, 20 rounds), Rocket (3 m blast, 2.5 m crater), Railgun (a beam that pierces worms and stops at rock), Bouncer (ricochets, mirrored in the distance field's gradient), Bomb (dropped at your feet, falls and comes to rest, goes off after 1.2 s or when an enemy touches it), Cluster (a lobbed shell that flies through worms and bursts into 7 bomblets), Swarm (6 missiles that curl in on the nearest enemy), Teleport (an orb that moves you to where it lands, or swaps you with the worm it hits), Nova (8 m blast, 7 m crater, 8 s reload), Block ("build = add": a 1.4 m lump of rock where you aim, never inside a worm or on a spawn point), Tractor (the forming tool: a stream of 0.8 m lumps, 16 a second, to draw a bridge or a wall by sweeping the aim).
+
+Design decisions, each with its reason in the code comments:
+- **Explosions are terrain edits.** A blast hurts worms first and carves the crater after, so the rock a blast removes still shields you from that very blast (test). Damage falls off linearly and needs line of sight: a ray from the blast to the nearest point of the body (test: the same bomb hurts in the open and not behind a 2 m slab).
+- **Knockback pushes away and a little up** (35% lift). Standing worms cancel the speed into the ground, and ground friction would eat a sideways push within a few ticks; with the lift a rocket at your feet launches you (test: rises more than 6 m, and costs between a fifth and a third of your health, half of what the same blast does to anyone else).
+- **Projectiles are points with a 12 cm radius** stepped in 25 cm pieces through the distance field (a ridge of rock is a few voxels thick, a bolt moves a metre a tick). A ricochet mirrors the velocity in the gradient, so it works on any terrain shape. Bombs are the same code with gravity and a low bounce, and creep to rest.
+- **Found by a test:** a bomb at rest is always touching the ground, and the ricochet branch ended with `continue`, which skipped the worm test, so no mine could ever trigger. Fixed by falling through.
+- **The tractor extrudes rock towards you.** Each lump is placed on the rock the last one made, so at one lump per tick the pile reached the worm in under a second. It now fires every fourth tick (about 8 m/s) and stops short of your face (the "never touch a worm" rule); a test checks it.
+- **The 2D rules were kept** where they still made sense: self damage is half but knockback is full, spawn protection ends when you shoot, a beam has slack so a joiner's lag does not make the host's shots land more often, a cluster shell flies through worms.
+- **Determinism:** the same fight (clusters, swarms, rockets, bouncers, 400 ticks) plays out identically twice (test). The homing turn uses a quaternion (sin/cos), the same caveat as the walk direction.
+
+Numbers (release build, this laptop):
+| Measure | Result |
+|---|---|
+| `Grid::apply` alone: r = 1.5 / 3 / 8 m carve | 0.12 / 0.46 / 4.2 ms (the Nova is the only one that is more than a fraction of a frame) |
+| tractor lump (r = 0.8 m, smooth) | 0.11 ms |
+| in the viewer: r = 3 m crater, CPU edit + upload | 0.7 + 1.5 ms |
+| in the viewer: r = 8 m crater, CPU edit + upload | 8.8 + 2.2 ms (one frame hitch per Nova, once per 8 s reload) |
+| rewriting `Grid::apply` to own each chunk once | 5-8% faster, **not kept** (the time is the distance maths per voxel, not the lookups) |
+
+This settles the M0 follow-up: the faster `Grid::apply` that M3 was expected to need is not needed. If the Nova hitch matters, the next idea is to skip chunks that lie entirely inside a carve sphere (set them to air without evaluating a voxel); about a third of a Nova's chunks are like that.
+
+How to look at it without a window: `-- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50` fires weapon 1 (the rocket) and takes the picture 50 ticks later (`--fire id[,ticks]`).
+
 ### Run it
 ```
 cargo run -p viewer --release
@@ -34,7 +61,9 @@ Click the window to capture the mouse, Esc releases it (again to quit).
 |---|---|
 | W A S D, mouse | walk, look and aim |
 | Space | jump |
-| left mouse (hold) | dig, five holes a second |
+| left mouse (hold) | fire the current weapon |
+| 1 2 3 4 5 6 7 8 9 0 -, wheel | pick a weapon (Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor) |
+| Left Shift (hold) | dig, five holes a second |
 | right mouse | shoot the rope / let go |
 | E / Q | reel the rope in / out |
 | F | fly camera with the M1 brush (below) |
@@ -42,7 +71,7 @@ Click the window to capture the mouse, Esc releases it (again to quit).
 | *fly:* left mouse (hold) | carve a sphere at the crosshair, repeats at 20 Hz |
 | *fly:* right mouse (hold) | build: a sphere pushed out along the wall, blended in like clay |
 | *fly:* wheel | brush radius (0.5 to 8 m) |
-| 1 / 2 / 3 | fixed render resolution 100% / 75% / 50% |
+| F1 / F2 / F3 | fixed render resolution 100% / 75% / 50% |
 | T | automatic resolution (default): holds ~60 fps by scaling it |
 | G / H / O / V | shadows / ambient occlusion / ink outlines / vsync |
 | R | regenerate the map (about 0.6 s) |
@@ -84,7 +113,7 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 - Edit: CPU `Grid::apply` for an r = 3 m crater **1.0 to 1.7 ms** (this is the M0 concern, now the only sim-thread cost); upload 2 to 4 ms of main-thread time.
 - In the window: **60 fps at 65-70% render scale** with everything on (automatic mode), on this GPU. A discrete GPU should hold 100%.
 - Shadows cost 35-40% of the frame, AO about 1 ms, the ink and upscale passes 2.5 ms. The full story of every bottleneck and optimisation, with numbers, is in `docs/PERFORMANCE.md`.
-- **Noise warning:** the laptop throttles (Intel's thermal framework runs). Identical runs differ by up to 2x and a run can be 2x slow for a minute. Trust differences of 30% or more, not 10%. The bench takes the best of three batches for that reason.
+- **Noise warning:** timings on this laptop drift (background CPU load and the power mode were found to matter; thermal throttling was suspected and never measured). Identical runs differ by up to 2x and a run can be 2x slow for a minute. Trust differences of 30% or more, not 10%. The bench takes the best of three batches for that reason.
 
 ### Known issues and limits
 - **Vulkan crashes inside `request_device`** on this Intel driver (31.0.101.2135, access violation, even with layers disabled). DX12 works, so Windows defaults to DX12 (`WGPU_BACKEND=vulkan` overrides). Cause not investigated (old driver?).
@@ -94,13 +123,16 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 - The map generator only claims "never over-estimates the distance", enforced by a test (`distance_is_never_overestimated`). Mountain flanks gave a slope-corrected estimate that broke it deep underground; the fix is documented in `world::ground`.
 - The empty-space map is per chunk (4 m). Rays that hug the ground spend most of their steps inside the one-chunk shell around the surface.
 - The M1 brush edits the grid directly and bypasses the sim (fly mode only, a developer tool); worm digging goes through `World::step`.
-- Worms cannot die, take damage or fire anything yet (M3). The second worm is an idle dummy to dig around.
+- There are no match rules yet (score limit, winner, loadout choice: every worm carries all 11 weapons) and no sound or HUD beyond the title bar. The second worm is an idle dummy that dies and respawns; it never shoots back.
+- Weapon values are first guesses and unbalanced: 3D is harder to hit than 2D and the 2D damage numbers were kept, so the Blaster is probably weak. They are table rows in `sim/src/weapons.rs`.
+- A dead worm is simply not drawn (plus a flash); the camera stays where the body fell. Capsules cap at 32 on screen (`MAX_CAPSULES`): worms first, then projectiles, then effects, so a busy fight drops the newest fireballs first.
 - The arena has an invisible ceiling at 64 m (outside the grid counts as rock), and the camera is held under it.
 - A worm has no ragdoll or tilt: the capsule always stands upright.
-- The M1 edit cost finding is still open: large brushes (r = 3 to 8 m) cost 7-37 ms of CPU per edit in a logged session, against 0.6-2.7 ms for the r = 3 m benchmark crater. Fly mode only; worm digging uses a 1.2 m hole.
+- The M1 edit cost finding, large brushes (r = 3 to 8 m) costing 7-37 ms of CPU per edit in a logged session, is explained by the r = 8 m number above (about 9 ms in the viewer, 4 ms in the bare sim) plus background load. A Nova costs one such hitch.
 
 ### What I could not verify
 - **M2 feel.** I could not play it. The numbers (walk 8 m/s, jump 2.4 m, gravity 25, dig 5 per second, camera 5 m behind) are first guesses written down as constants at the top of `sim/src/world.rs`; the tests prove they are consistent (a worm stands, climbs, jumps 2 m, digs a tunnel it can walk through, swings), not that they are fun. The window was smoke-run for 8 s (no panic or GPU validation error), and screenshots show the worm, eyes, gun, shadow and a rope swing. Nobody has steered it with a mouse. Whether third-person aiming feels right (the crosshair marks the camera's ray; the dig ring marks where the worm's eye ray lands, slightly different) is the main open question.
+- **M3 feel and balance.** I could not play it. The sim tests prove the mechanics (damage, falloff, cover, ricochet, homing, teleport, building, respawn, determinism), and screenshots (`--fire`) show a rocket in flight, a fireball over a fresh crater and a Nova. Not verified: how the weapons feel and balance, how aiming a rocket at a moving worm in 3D plays, the mouse-wheel and number-key weapon switching (the code compiles and the window starts, nobody pressed them), how the tractor feels in the hand, and the frame cost of a big fireball covering much of the screen with many capsules (the worm benchmark ran with 17 capsules, not 32 and not with a screen-filling one).
 - **Interactive input was never exercised by a person here.** Mouse capture and look, hold-to-dig, the 20 Hz repeat, window resize, the G/H/O/V/T/R keys: the code paths exist and the window was launched four times (it runs, reaches 60 fps, title updates), but nobody clicked. Rendering and edits are covered by headless screenshots (`--shot --edits`) and the bench's 100-crater loop.
 - The art style was judged from screenshots only (`screenshots/M1_overview.png`, `M1_cavern.png`, `M1_craters.png`). Colours and outline weight are a first guess for the owner to react to.
 - Other GPUs, drivers, Linux and macOS were not tried. The shaders use no extensions, but timestamp queries are optional (the title then shows no GPU ms and automatic resolution stays at 100%).
@@ -108,10 +140,16 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 ### Next decisions (owner)
 1. **Review M1.** Run it, dig, fly through the cavern. Is the art direction right (palette, number of toon bands, hard vs soft shadows, outline weight and wobble, strata on the rock)? I will tune from a list.
 2. **Speed.** If 60 fps at ~65% is not enough on your target hardware, the next options in order of expected gain: finer empty-space bricks (8 voxels instead of 16, perhaps 25% less), shadows at half resolution, a low-resolution pre-pass for the ray start (helps views down at the ground, not grazing ones).
-3. **M0 follow-up:** speed up `Grid::apply` (per-chunk row access instead of per-voxel lookups). Recommendation: when M3 needs it (a tractor beam applies an edit every tick), not now.
+3. **M0 follow-up (settled at M3):** a faster `Grid::apply` was tried and is not needed (see "M3" numbers).
 4. **Commit** (and whether to keep `screenshots/` in the repo).
 5. **Review M2.** Play it: walk, jump, dig a tunnel, swing from the ceiling of the cavern. Tell me what feels wrong (speeds, camera distance and height, dig size and rate, rope length and reel speed); they are single constants. Also: is the worm's look (capsule, eyes, gun) the direction you want?
-6. **Next milestone, M3 (weapons):** port `WeaponDef`, projectiles, explosions = carve, build = add, tractor beam. It will need the faster `Grid::apply` (item 3).
+6. **Review M3.** Play it: pick weapons with 1 to 0 and `-`, shoot the dummy worm and watch it respawn, rocket-jump (aim a rocket at your feet), hide behind rock from a Nova, build a bridge with the tractor, dig with Left Shift. Tell me what feels wrong; every number is a row in `sim/src/weapons.rs`. Answered: a match gets a score limit and a winner, and all 11 weapons stay (see the decisions below). Still open: should a dead worm's camera do something (spectate, slow zoom)?
+7. **Next milestone, M4 (host, loopback, replica):** offline play through the same pipeline as online.
+
+### Owner decisions after reviewing M3 (to implement another time)
+- **A match has a score limit and a winner.** Port the 2D rule: first to N kills wins (the 2D default was 15, `SCORE_LIMIT`), `World::winner`, an `Event::MatchWon`, and the world freezes once someone has won (`step` returns early). Killing yourself costs a point, as in 2D (already implemented: `kills` goes down). The limit is a rule of the match, set by whoever creates the world. Not started: `combat.rs` has the kills and deaths but no winner yet.
+- **For now every worm carries all 11 weapons** (the current behaviour: one slot per `ARSENAL` entry, `Input::weapon` is an id). The loadout of five picked on a menu is dropped for now; it can come back with the menus (M6) if wanted.
+- **The ported 2D files are deleted:** `sim/old2d/weapons.rs` and `world.rs` (done). `sim/old2d/bots.rs` stays for M6.
 
 ### M0 results (Surface Nets meshing, 2D-to-3D go/no-go), kept for reference
 `cargo run -p sdf --release --example bench`, single thread, 128 x 64 x 128 m world. The viewer does not remesh any more, so only the edit rows still matter.
@@ -178,13 +216,13 @@ Tractor beam / "forming": a moving SDF shape applied each tick as add (smooth-mi
 2. SDF validity after repeated min/max edits (distances become approximate; raymarching overshoots if a stored value over-estimates) - mitigate: narrow band + occasional local redistancing; the generator has a Lipschitz test, edits do not yet. Hard creases are sawtoothed at 0.25 m, so smooth operations are preferred.
 3. Ink-outline art tuning - isolated, can iterate indefinitely.
 4. Terrain desync online - checksums + chunk resync.
-5. wgpu boilerplate/learning curve and WebGPU browser support later - acceptable; web is explicitly deferred. New at M1: driver bugs (Vulkan crash on the dev laptop) and a throttling iGPU that makes benchmarks noisy.
+5. wgpu boilerplate/learning curve and WebGPU browser support later - acceptable; web is explicitly deferred. New at M1: driver bugs (Vulkan crash on the dev laptop) and an iGPU whose timings drift (background load, power mode) so benchmarks are noisy.
 
 ## Milestones (each ends runnable, owner reviews before next)
 - **M0 Terrain spike (go/no-go): DONE.** `sdf` crate + tests + timing harness. The edit cost (1.0-1.7 ms) is the open item.
 - **M1 Viewer: DONE (committed).** wgpu window, fly camera, click-to-carve/build, raymarched toon shading, ink outlines, automatic resolution. Gate: art style approved.
-- **M2 Worm in sim: BUILT, awaiting review.** Capsule-vs-SDF movement, jump, dig, rope, `Input` with aim, headless tests (including determinism), third-person viewer mode.
-- **M3 Weapons:** port `WeaponDef` table, projectile raycast, explosions = carve, build = add, tractor beam.
+- **M2 Worm in sim: DONE (committed).** Capsule-vs-SDF movement, jump, dig, rope, `Input` with aim, headless tests (including determinism), third-person viewer mode.
+- **M3 Weapons: BUILT, awaiting review.** `WeaponDef` table (11 weapons), projectiles through the distance field, explosions = carve, build = add, tractor = a rapid stream of small adds, damage, cover, respawn, effects in the viewer.
 - **M4 Host + loopback + Replica (Vec3):** offline play via the same pipeline as the 2D game.
 - **M5 Online:** relay (reused), late join, edit events, checksums.
 - **M6 Polish:** synthesized audio, bots, procedural maps (SDF primitives + noise caves), HUD.
@@ -219,4 +257,4 @@ Recommendations, ordered by value. Crate versions and APIs are from memory/searc
 | Bots | hand-written steering | keep; later navigation in SDF space is custom anyway | Keep |
 
 ## Next step
-Owner review of M2 (Status, "Next decisions"). Then M3 (weapons) or, if the feel needs work, a tuning round first. Stop and report before M3.
+Owner review of M3 (Status, "Next decisions"): play it, then either a tuning round (weapon numbers, camera, aiming) or M4. Stop and report before M4.

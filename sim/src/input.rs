@@ -38,4 +38,11 @@ pub struct Input {
     pub rope: bool,
     /// Reel the rope: +1 shorter, -1 longer.
     pub reel: f32,
+    /// Trigger held: fires the current weapon whenever it is ready.
+    pub fire: bool,
+    /// The weapon wanted, as an id (see `weapons`). Sent every tick like the
+    /// aim, not as "next weapon" events, for the same reason: a lost packet
+    /// cannot leave the client and the host holding different guns. An id the
+    /// sim does not know is ignored.
+    pub weapon: u8,
 }

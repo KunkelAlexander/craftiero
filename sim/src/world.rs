@@ -1,5 +1,5 @@
 // The world and the worm: movement against the signed distance field, jumping,
-// digging and the ninja rope.
+// digging and the ninja rope. Weapons, projectiles and damage are in `combat.rs`.
 //
 // Everything here is a plain struct and a plain function. `World::step` is the
 // only way the state changes, and it takes nothing but `Input`s, so a test can
@@ -11,7 +11,10 @@
 // host runs the sim and clients draw its snapshots. If a client ever predicts
 // its own worm, swap `sin_cos` for a table or an approximation written here.
 
+use crate::combat::{Projectile, MAX_HP};
 use crate::input::Input;
+use crate::rng::Rng;
+use crate::weapons::{WeaponState, ARSENAL};
 use glam::{Vec2, Vec3};
 use sdf::{Grid, Op, Shape};
 
@@ -154,6 +157,19 @@ pub struct Worm {
     coyote: u8,
     /// Ticks left in which an early jump press is remembered.
     jump_buffer: u8,
+    // --- fighting (see `combat.rs`) ---
+    pub hp: f32,
+    pub alive: bool,
+    /// Seconds until a dead worm comes back.
+    pub respawn_timer: f32,
+    /// Seconds of spawn protection left.
+    pub invuln: f32,
+    /// One entry per weapon in `ARSENAL`, in the same order.
+    pub weapons: Vec<WeaponState>,
+    /// Index into `weapons`.
+    pub current: usize,
+    pub kills: i32,
+    pub deaths: i32,
 }
 
 impl Worm {
@@ -172,7 +188,33 @@ impl Worm {
             jumping: false,
             coyote: 0,
             jump_buffer: 0,
+            hp: MAX_HP,
+            alive: true,
+            respawn_timer: 0.0,
+            invuln: 0.0,
+            weapons: ARSENAL.iter().map(|&id| WeaponState::full(id)).collect(),
+            current: 0,
+            kills: 0,
+            deaths: 0,
         }
+    }
+
+    /// Stand up again at `pos` with every movement state cleared (a respawn, or
+    /// a teleport: the rope and the speed belong to the old place).
+    pub(crate) fn reset_motion(&mut self, pos: Vec3) {
+        *self = Worm {
+            hp: self.hp,
+            alive: self.alive,
+            respawn_timer: self.respawn_timer,
+            invuln: self.invuln,
+            weapons: std::mem::take(&mut self.weapons),
+            current: self.current,
+            kills: self.kills,
+            deaths: self.deaths,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            ..Worm::new(pos)
+        };
     }
 
     /// Unit vector the worm looks along (the same maths as the viewer camera).
@@ -189,6 +231,23 @@ impl Worm {
     pub fn hand(&self) -> Vec3 {
         self.pos + Vec3::Y * HAND_HEIGHT
     }
+
+    /// The two ends of the body's axis: the centres of the foot and head
+    /// spheres. Everything that asks "is this point near the worm?" (a bolt, a
+    /// blast) measures the distance to this segment and subtracts the radius.
+    pub fn axis(&self) -> (Vec3, Vec3) {
+        body_axis(self.pos)
+    }
+}
+
+/// `Worm::axis` for a worm standing with its feet at `feet`.
+pub(crate) fn body_axis(feet: Vec3) -> (Vec3, Vec3) {
+    (feet + Vec3::Y * WORM_RADIUS, feet + Vec3::Y * (WORM_HEIGHT - WORM_RADIUS))
+}
+
+/// Does a standing worm with its feet at `feet` fit without touching rock?
+pub(crate) fn body_fits(grid: &Grid, feet: Vec3) -> bool {
+    BODY_SPHERES.iter().all(|&h| grid.sample(feet + Vec3::Y * h) >= WORM_RADIUS * 0.99)
 }
 
 /// Something that happened this tick, for the renderer, the audio and (later)
@@ -198,29 +257,57 @@ pub enum Event {
     /// The terrain was edited. This (a shape and an operation, a few bytes) is
     /// also what the host will send to clients instead of the changed voxels.
     Edit { shape: Shape, op: Op },
+    /// `worm` pulled the trigger of `weapon` (an id); `pos` is the muzzle.
+    Shot { worm: u8, weapon: u8, pos: Vec3 },
+    /// A beam weapon's line, for drawing.
+    Beam { from: Vec3, to: Vec3 },
+    Explosion { pos: Vec3, radius: f32 },
+    Hit { victim: u8, pos: Vec3, damage: f32 },
+    Died { victim: u8, killer: u8, pos: Vec3 },
+    /// `worm` jumped from `from` to `to` (the Teleport gun).
+    Teleported { worm: u8, from: Vec3, to: Vec3 },
+    Respawned { worm: u8 },
 }
 
 pub struct World {
     /// The terrain. The renderer reads its dirty chunks after each step.
     pub grid: Grid,
     pub worms: Vec<Worm>,
+    pub projectiles: Vec<Projectile>,
+    /// Where worms start, and come back after dying.
+    pub spawns: Vec<Vec3>,
+    /// Ticks simulated so far. Online, this is the shared clock that snapshots
+    /// and inputs are labelled with ("tick 1234").
     pub tick: u32,
-    events: Vec<Event>,
+    pub(crate) events: Vec<Event>,
+    pub(crate) rng: Rng,
 }
 
 impl World {
     /// One worm per spawn column `(x, z)`, dropped from the top of the world
-    /// onto whatever ground is highest there. (The top must be open air.)
-    pub fn new(grid: Grid, spawns: &[(f32, f32)]) -> World {
+    /// onto whatever ground is highest there. (The top must be open air.) The
+    /// same spots are where a worm comes back after dying. `seed` starts the
+    /// world's own random numbers (weapon spread and so on): the same seed and
+    /// the same inputs always play out the same way.
+    pub fn new(grid: Grid, spawns: &[(f32, f32)], seed: u32) -> World {
         let top = grid.size_metres().y - 0.5;
-        let worms = spawns
+        let spawns: Vec<Vec3> = spawns
             .iter()
             .map(|&(x, z)| {
                 let y = grid.raycast(Vec3::new(x, top, z), -Vec3::Y, top).map_or(0.0, |t| top - t);
-                Worm::new(Vec3::new(x, y + 0.05, z))
+                Vec3::new(x, y + 0.05, z)
             })
             .collect();
-        World { grid, worms, tick: 0, events: Vec::new() }
+        let worms = spawns.iter().map(|&p| Worm::new(p)).collect();
+        World {
+            grid,
+            worms,
+            projectiles: Vec::with_capacity(64),
+            spawns,
+            tick: 0,
+            events: Vec::new(),
+            rng: Rng::new(seed),
+        }
     }
 
     pub fn drain_events(&mut self) -> Vec<Event> {
@@ -230,10 +317,16 @@ impl World {
     /// Advance the game by one tick (`DT`). `inputs[i]` drives worm `i`; a
     /// worm without an input stands still.
     pub fn step(&mut self, inputs: &[Input]) {
-        for (i, worm) in self.worms.iter_mut().enumerate() {
+        for i in 0..self.worms.len() {
             let input = clean(&inputs.get(i).copied().unwrap_or_default());
-            step_worm(&mut self.grid, worm, &input, &mut self.events);
+            if self.worms[i].alive {
+                step_worm(&mut self.grid, &mut self.worms[i], &input, &mut self.events);
+                self.step_weapons(i, &input);
+            } else {
+                self.step_dead(i);
+            }
         }
+        self.step_projectiles();
         self.tick += 1;
     }
 }
@@ -611,7 +704,7 @@ mod tests {
     }
 
     fn world(f: fn(Vec3) -> f32, spawn: (f32, f32)) -> World {
-        World::new(Grid::from_fn(SIZE, f), &[spawn])
+        World::new(Grid::from_fn(SIZE, f), &[spawn], 1)
     }
 
     fn run(w: &mut World, ticks: usize, input: Input) {
