@@ -1,0 +1,416 @@
+// Shaders as source strings (no asset files). Two passes:
+//
+//   1. MARCH: sphere-trace the terrain SDF per pixel, shade it with a toon
+//      ramp, and write colour plus (normal, distance) into a G-buffer.
+//   2. POST:  find ink outlines in the G-buffer and composite to the screen.
+//
+// The world constants are pasted in from the `sdf` crate, so the shader can
+// never disagree with the CPU about voxel size or world extent.
+
+use glam::IVec3;
+
+fn f(x: f32) -> String {
+    format!("{x:?}") // {:?} keeps the ".0" that WGSL needs on float literals
+}
+
+pub fn march(world_chunks: IVec3) -> String {
+    let dims = (world_chunks * sdf::CHUNK).as_vec3();
+    let metres = dims * sdf::VOX;
+    format!("{COMMON_UNIFORMS}{MARCH}")
+        .replace("$VOX", &f(sdf::VOX))
+        .replace("$BAND", &f(sdf::BAND))
+        .replace("$CHUNK_M", &f(sdf::CHUNK as f32 * sdf::VOX))
+        .replace("$DIMS", &format!("{}, {}, {}", f(dims.x), f(dims.y), f(dims.z)))
+        .replace("$WORLD_M", &format!("{}, {}, {}", f(metres.x), f(metres.y), f(metres.z)))
+        .replace("$CHUNKS", &format!("{}, {}, {}", world_chunks.x, world_chunks.y, world_chunks.z))
+}
+
+pub fn post() -> String {
+    format!("{COMMON_UNIFORMS}{POST}")
+}
+
+// One uniform block shared by both passes. Everything is vec4 so the Rust side
+// needs no padding thought (WGSL aligns vec3 to 16 bytes, which bites).
+const COMMON_UNIFORMS: &str = r#"
+struct U {
+    cam_pos: vec4<f32>,
+    cam_right: vec4<f32>,   // right * tan(fov/2) * aspect
+    cam_up: vec4<f32>,      // up * tan(fov/2)
+    cam_fwd: vec4<f32>,
+    sun: vec4<f32>,         // xyz: unit vector towards the sun
+    brush: vec4<f32>,       // xyz: centre, w: radius (0 = no brush)
+    flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
+    size: vec4<f32>,        // xy: G-buffer size, zw: screen size
+}
+@group(0) @binding(0) var<uniform> u: U;
+
+fn hash31(p: vec3<f32>) -> f32 {
+    var q = fract(p * 0.1031);
+    q += dot(q, q.zyx + 31.32);
+    return fract((q.x + q.y) * q.z);
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+    var q = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+fn vnoise2(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let fr = fract(p);
+    let w = fr * fr * (3.0 - 2.0 * fr);
+    return mix(
+        mix(hash21(i), hash21(i + vec2<f32>(1.0, 0.0)), w.x),
+        mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), w.x),
+        w.y);
+}
+
+fn vnoise3(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let fr = fract(p);
+    let w = fr * fr * (3.0 - 2.0 * fr);
+    let a = mix(mix(hash31(i), hash31(i + vec3<f32>(1.0, 0.0, 0.0)), w.x),
+                mix(hash31(i + vec3<f32>(0.0, 1.0, 0.0)), hash31(i + vec3<f32>(1.0, 1.0, 0.0)), w.x), w.y);
+    let b = mix(mix(hash31(i + vec3<f32>(0.0, 0.0, 1.0)), hash31(i + vec3<f32>(1.0, 0.0, 1.0)), w.x),
+                mix(hash31(i + vec3<f32>(0.0, 1.0, 1.0)), hash31(i + vec3<f32>(1.0, 1.0, 1.0)), w.x), w.y);
+    return mix(a, b, w.z);
+}
+"#;
+
+const MARCH: &str = r#"
+const VOX: f32 = $VOX;
+const BAND: f32 = $BAND;
+const CHUNK_M: f32 = $CHUNK_M;
+const DIMS: vec3<f32> = vec3<f32>($DIMS);
+const WORLD_M: vec3<f32> = vec3<f32>($WORLD_M);
+const CHUNKS: vec3<i32> = vec3<i32>($CHUNKS);
+
+// The terrain: one signed byte per voxel (value / 127 * BAND = metres, + in air).
+// The hardware's trilinear filter does the interpolation Grid::sample does.
+@group(0) @binding(1) var sdf_tex: texture_3d<f32>;
+@group(0) @binding(2) var sdf_smp: sampler;
+// One byte per chunk: how many chunks away (chessboard distance) the nearest
+// chunk that holds a surface is. 0 = holds one. See `coarse_map` in renderer.rs.
+@group(0) @binding(3) var coarse_tex: texture_3d<u32>;
+
+// Distance to the terrain in metres (negative inside rock). A voxel's value
+// sits at its integer coordinate, a texel's centre at +0.5, hence the shift.
+fn map(p: vec3<f32>) -> f32 {
+    let uvw = (p / VOX + 0.5) / DIMS;
+    return textureSampleLevel(sdf_tex, sdf_smp, uvw, 0.0).r * BAND;
+}
+
+// Optimisation: empty-space skipping. Plain sphere tracing through open air
+// advances at most BAND (1 m) per step, so a cave 60 m across costs 60+
+// texture fetches per pixel. The coarse map says "no surface within k chunks",
+// which lets the ray jump (k-1) chunks at once. One VOX is subtracted because
+// the cell between a surface chunk and its neighbour belongs to the neighbour.
+//
+// Optimisation: the hit tolerance is `eps + t * slope`. With `slope` = the
+// world size of half a pixel per metre of distance, a ray stops as soon as it
+// is closer to the surface than the screen can show. Far-away grazing rays,
+// the slowest ones, finish in a fraction of the steps.
+const RELAX: f32 = 1.4;
+
+fn trace(ro: vec3<f32>, rd: vec3<f32>, t_start: f32, t_end: f32, max_steps: i32, eps: f32, slope: f32) -> f32 {
+    var t = t_start;
+    var d = 1.0;
+    for (var i = 0; i < max_steps; i++) {
+        if (t >= t_end) { return -1.0; }
+        let p = ro + rd * t;
+        let c = clamp(vec3<i32>(floor(p / CHUNK_M)), vec3<i32>(0), CHUNKS - vec3<i32>(1));
+        let k = textureLoad(coarse_tex, c, 0).r;
+        if (k >= 2u) {
+            t += (f32(k) - 1.0) * CHUNK_M - VOX;
+            continue;
+        }
+        d = map(p);
+        let tol = eps + t * slope;
+        if (d < tol) {
+            // The last step may have ended slightly inside the rock (negative d).
+            // The field is nearly linear there, so adding d walks back to zero.
+            var tt = t + d;
+            tt += map(ro + rd * tt);
+            return max(tt, t_start);
+        }
+        // The step is the distance the field promises is free, but never less
+        // than the tolerance, so grazing rays cannot crawl.
+        t += max(d * RELAX, tol);
+    }
+    // Out of steps: a ray this close to the surface is a grazing hit.
+    if (d < 0.25) { return t; }
+    return -1.0;
+}
+
+// Angle one pixel of the G-buffer spans (radians, small-angle).
+fn pix_angle() -> f32 {
+    return 2.0 * length(u.cam_up.xyz) / u.size.y;
+}
+
+fn normal_at(p: vec3<f32>) -> vec3<f32> {
+    // Tetrahedron gradient: 4 samples instead of 6. The offset is wider than
+    // a voxel on purpose: a trilinear field has a different gradient in every
+    // cell, and sampling across cells blends those facets away.
+    let e = VOX * 0.9;
+    let k1 = vec3<f32>(1.0, -1.0, -1.0);
+    let k2 = vec3<f32>(-1.0, -1.0, 1.0);
+    let k3 = vec3<f32>(-1.0, 1.0, -1.0);
+    let k4 = vec3<f32>(1.0, 1.0, 1.0);
+    return normalize(k1 * map(p + k1 * e) + k2 * map(p + k2 * e) + k3 * map(p + k3 * e) + k4 * map(p + k4 * e));
+}
+
+// Ray against the world's bounding box: (t_enter, t_exit, exit axis as 0/1/2).
+fn box_hit(ro: vec3<f32>, rd: vec3<f32>) -> vec3<f32> {
+    let safe = select(rd, vec3<f32>(1.0e-6), abs(rd) < vec3<f32>(1.0e-6));
+    let inv = 1.0 / safe;
+    let ta = (vec3<f32>(0.0) - ro) * inv;
+    let tb = (WORLD_M - ro) * inv;
+    let tmn = min(ta, tb);
+    let tmx = max(ta, tb);
+    let t_near = max(max(tmn.x, tmn.y), tmn.z);
+    let t_far = min(min(tmx.x, tmx.y), tmx.z);
+    var axis = 0.0;
+    if (tmx.y <= tmx.x && tmx.y <= tmx.z) { axis = 1.0; }
+    if (tmx.z <= tmx.x && tmx.z <= tmx.y) { axis = 2.0; }
+    return vec3<f32>(t_near, t_far, axis);
+}
+
+// The palette below is written the way you would pick colours in a paint
+// program (sRGB). Shading happens in linear light, so convert on the way in:
+// without this everything looks washed out.
+fn srgb(c: vec3<f32>) -> vec3<f32> {
+    return pow(c, vec3<f32>(2.2));
+}
+
+fn sky(rd: vec3<f32>) -> vec3<f32> {
+    let h = clamp(rd.y, 0.0, 1.0);
+    var c = mix(srgb(vec3<f32>(0.95, 0.88, 0.74)), srgb(vec3<f32>(0.40, 0.60, 0.88)), pow(h, 0.45));
+    let s = max(dot(rd, u.sun.xyz), 0.0);
+    c += vec3<f32>(1.0, 0.85, 0.55) * (pow(s, 800.0) * 2.0 + pow(s, 14.0) * 0.18);
+    return c;
+}
+
+fn albedo(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    // Layered rock: soft strata that wobble with noise, so a fresh crater wall
+    // shows bands like a cutaway. Grass where the ground faces up.
+    let wob = vnoise3(p * vec3<f32>(0.3, 0.6, 0.3));
+    let strata = sin(p.y * 1.3 + wob * 3.5) * 0.5 + 0.5;
+    let rock = mix(srgb(vec3<f32>(0.52, 0.42, 0.36)), srgb(vec3<f32>(0.66, 0.54, 0.43)), strata * 0.6);
+    let speck = vnoise3(p * 3.0);
+    let grass = mix(srgb(vec3<f32>(0.40, 0.60, 0.26)), srgb(vec3<f32>(0.58, 0.72, 0.30)), speck);
+    let up = smoothstep(0.55, 0.78, n.y + (wob - 0.5) * 0.35);
+    return mix(rock, grass, up);
+}
+
+// Three flat bands with a hair of smoothing so the edges do not alias.
+fn toon(x: f32) -> f32 {
+    return smoothstep(0.0, 0.04, x) * 0.55 + smoothstep(0.42, 0.46, x) * 0.45;
+}
+
+struct Out {
+    @location(0) color: vec4<f32>,
+    @location(1) gbuf: vec4<f32>,   // xyz: normal * 0.5 + 0.5, w: distance along the ray
+}
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    // One big triangle covering the screen: no vertex buffer, no seam.
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) frag: vec4<f32>) -> Out {
+    let uv = frag.xy / u.size.xy;
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let ro = u.cam_pos.xyz;
+    let rd = normalize(u.cam_fwd.xyz + ndc.x * u.cam_right.xyz + ndc.y * u.cam_up.xyz);
+
+    var kind = 0;   // 0 sky, 1 terrain, 2 arena wall (the box edge counts as rock)
+    var t = 400.0;
+    var n = vec3<f32>(0.0);
+
+    let bx = box_hit(ro, rd);
+    let t_start = max(bx.x, 0.0);
+    let inside = all(ro >= vec3<f32>(0.0)) && all(ro <= WORLD_M);
+    if (bx.y > t_start) {
+        if (inside && map(ro) < 0.0) {
+            // The camera is buried in rock: paint it solid rather than showing
+            // the far side of some cavity.
+            kind = 2;
+            t = 0.01;
+            n = -rd;
+        } else {
+            let th = trace(ro, rd, t_start, bx.y, 160, 0.003, 0.5 * pix_angle());
+            if (th >= 0.0) {
+                kind = 1;
+                t = th;
+            } else if (!(bx.z == 1.0 && rd.y > 0.0)) {
+                // Left through a side or the floor: that is the closed arena's wall.
+                // (Out through the top is open sky, purely for looks.)
+                kind = 2;
+                t = bx.y;
+                var wn = vec3<f32>(0.0);
+                if (bx.z == 0.0) { wn.x = -sign(rd.x); }
+                if (bx.z == 1.0) { wn.y = -sign(rd.y); }
+                if (bx.z == 2.0) { wn.z = -sign(rd.z); }
+                n = wn;
+            }
+        }
+    }
+
+    var col = sky(rd);
+    let fog_col = srgb(vec3<f32>(0.93, 0.86, 0.72));
+    if (kind == 1) {
+        let p = ro + rd * t;
+        n = normal_at(p);
+        let base = albedo(p, n);
+
+        // Hard shadow ray towards the sun. Pattern: it reuses `trace`, so it
+        // gets the empty-space skipping for free.
+        var lit = max(dot(n, u.sun.xyz), 0.0);
+        if (u.flags.y > 0.5 && lit > 0.0) {
+            let so = p + n * 0.08;
+            if (trace(so, u.sun.xyz, 0.0, 60.0, 128, 0.02, 0.002) >= 0.0) { lit = 0.0; }
+        }
+        var occl = 1.0;
+        if (u.flags.z > 0.5) {
+            // Cheap ambient occlusion: how far below "free space" is the field
+            // a few steps out along the normal?
+            var o = 0.0;
+            var w = 1.0;
+            for (var i = 1; i <= 4; i++) {
+                let h = 0.14 * f32(i);
+                o += (h - map(p + n * h)) * w;
+                w *= 0.6;
+            }
+            occl = clamp(1.0 - 1.6 * o, 0.0, 1.0);
+        }
+
+        let tint = mix(vec3<f32>(0.42, 0.45, 0.70), vec3<f32>(1.10, 1.0, 0.86), toon(lit));
+        col = base * tint * mix(0.55, 1.0, occl);
+
+        // A warm lamp at the camera so caves and shadowed ground stay readable.
+        // It only fills in where the sun does not reach (1 - toon(lit)), and
+        // uses the same banding so it still looks drawn, not rendered.
+        let to_cam = ro - p;
+        let lamp_d = length(to_cam);
+        let lamp = max(dot(n, to_cam / lamp_d), 0.0) * (1.0 - smoothstep(3.0, 26.0, lamp_d));
+        col += base * vec3<f32>(1.0, 0.78, 0.5) * toon(lamp) * 0.5 * (1.0 - toon(lit)) * mix(0.5, 1.0, occl);
+
+        // The brush: tint the terrain it would change and draw its rim.
+        if (u.brush.w > 0.0) {
+            let dist = length(p - u.brush.xyz);
+            let inside_brush = 1.0 - smoothstep(u.brush.w - 0.03, u.brush.w, dist);
+            let ring = 1.0 - smoothstep(0.0, 0.07, abs(dist - u.brush.w));
+            col = mix(col, srgb(vec3<f32>(1.0, 0.55, 0.18)), inside_brush * 0.25 + ring * 0.85);
+        }
+        col = mix(col, fog_col, 1.0 - exp(-t * 0.002));
+    } else if (kind == 2) {
+        col = mix(srgb(vec3<f32>(0.20, 0.22, 0.32)), srgb(vec3<f32>(0.36, 0.38, 0.52)), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+    }
+
+    var out: Out;
+    out.color = vec4<f32>(col, 1.0);
+    out.gbuf = vec4<f32>(n * 0.5 + 0.5, t);
+    return out;
+}
+"#;
+
+// Two fragment entry points share this module:
+//   fs_ink     G-buffer resolution: finds the outlines and draws them over the
+//              colour image into the `ink` texture.
+//   fs_present screen resolution: upscales `ink` with a bilinear filter and adds
+//              the paper grain, vignette and crosshair.
+// Splitting them means the expensive edge detection runs on the (possibly
+// reduced) internal resolution, so the automatic resolution scale cuts its
+// cost too; only the cheap upscale pays for every screen pixel.
+const POST: &str = r#"
+@group(0) @binding(1) var color_tex: texture_2d<f32>;
+@group(0) @binding(2) var gbuf_tex: texture_2d<f32>;
+@group(0) @binding(3) var ink_tex: texture_2d<f32>;
+@group(0) @binding(4) var ink_smp: sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+
+fn load_gb(p: vec2<i32>) -> vec4<f32> {
+    let lim = vec2<i32>(u.size.xy) - vec2<i32>(1);
+    return textureLoad(gbuf_tex, clamp(p, vec2<i32>(0), lim), 0);
+}
+
+// Ink where the picture has an edge, found in the G-buffer, not the colours:
+//  - a depth edge is a silhouette. The second difference is ~0 on any flat
+//    slanted wall, so walls seen at a grazing angle do not light up.
+//  - a normal edge is a crease inside one object.
+// Only the NEARER side of a silhouette draws the line, so lines hug the
+// object instead of bleeding into the sky.
+fn edge(p: vec2<i32>, o: i32) -> f32 {
+    let c = load_gb(p);
+    let d0 = c.w;
+    if (d0 > 300.0) { return 0.0; }
+    let l = load_gb(p + vec2<i32>(-o, 0));
+    let r = load_gb(p + vec2<i32>(o, 0));
+    let t = load_gb(p + vec2<i32>(0, -o));
+    let b = load_gb(p + vec2<i32>(0, o));
+    let nearest = min(min(l.w, r.w), min(t.w, b.w));
+    let near_side = select(0.0, 1.0, d0 <= nearest + 0.03 * d0 + 0.05);
+    let lap = abs(l.w + r.w - 2.0 * d0) + abs(t.w + b.w - 2.0 * d0);
+    let depth_edge = smoothstep(0.6, 1.0, lap / (0.05 * d0 + 0.10)) * near_side;
+
+    let n0 = c.xyz * 2.0 - 1.0;
+    let crease = (1.0 - dot(n0, l.xyz * 2.0 - 1.0)) + (1.0 - dot(n0, r.xyz * 2.0 - 1.0))
+               + (1.0 - dot(n0, t.xyz * 2.0 - 1.0)) + (1.0 - dot(n0, b.xyz * 2.0 - 1.0));
+    // Far away, neighbouring pixels are metres apart and their normals differ
+    // by noise alone, so creases fade out with distance.
+    let normal_edge = smoothstep(0.14, 0.32, crease) * (1.0 - smoothstep(40.0, 110.0, d0));
+    return max(depth_edge, normal_edge);
+}
+
+@fragment
+fn fs_ink(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let home = vec2<i32>(floor(frag.xy));
+    var col = textureLoad(color_tex, home, 0).rgb;
+
+    if (u.flags.w > 0.5) {
+        // Hand-drawn feel: the lines are looked up a pixel or two off, by a
+        // slowly varying amount, so they waver. A second noise decides where
+        // the pen presses harder (a 2 px stroke instead of 1 px).
+        let wob = (vec2<f32>(vnoise2(frag.xy * 0.045), vnoise2(frag.xy * 0.045 + 31.7)) - 0.5) * 2.6;
+        let p = vec2<i32>(floor(frag.xy + wob));
+        let o = max(1, i32(round(u.size.y / 1000.0)));
+        let press = smoothstep(0.35, 0.65, vnoise2(frag.xy * 0.02 + 7.0));
+        var line = edge(p, o);
+        // The wide stroke costs a second round of G-buffer reads, so only pay for
+        // it where the pen presses hard (about a third of the screen).
+        if (press > 0.02) {
+            line = max(line, edge(p, 2 * o) * press * 0.9);
+        }
+        col = mix(col, vec3<f32>(0.05, 0.035, 0.07), clamp(line, 0.0, 1.0) * 0.92);
+    }
+    return vec4<f32>(col, 1.0);
+}
+
+@fragment
+fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = frag.xy / u.size.zw;
+    var col = textureSampleLevel(ink_tex, ink_smp, uv, 0.0).rgb;
+
+    // Paper grain and a soft vignette tie the frame together.
+    col *= 1.0 + (hash21(frag.xy) - 0.5) * 0.035;
+    let c = uv - 0.5;
+    col *= 1.0 - 0.28 * dot(c, c) * 2.0;
+
+    // Crosshair: a ring with a dark edge so it reads on any background.
+    let rr = length(frag.xy - u.size.zw * 0.5);
+    if (rr < 4.2 && rr > 3.0) { col = vec3<f32>(0.05, 0.035, 0.07); }
+    if (rr <= 3.0 && rr > 1.8) { col = vec3<f32>(1.0, 0.97, 0.88); }
+    return vec4<f32>(col, 1.0);
+}
+"#;

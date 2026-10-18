@@ -1,0 +1,9 @@
+[package]
+name = "sdf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = { version = "0.27", features = ["scalar-math", "serde"] }
+# Surface Nets mesher for chunked signed-distance samples (see mesh.rs).
+fast-surface-nets = "0.2"

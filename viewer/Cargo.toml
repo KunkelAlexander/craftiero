@@ -1,0 +1,17 @@
+[package]
+name = "viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sdf = { path = "../sdf" }
+glam = { version = "0.27", features = ["scalar-math"] }
+# Window and GPU. Native first; wgpu also targets WebGPU for the later web build.
+winit = "0.30"
+wgpu = "30"
+# Plain-old-data casts so uniform structs can be handed to the GPU as bytes.
+bytemuck = { version = "1", features = ["derive"] }
+# Blocks on wgpu's async setup calls; the game itself has no async code.
+pollster = "1"
+# Screenshot output for the headless `--shot` mode.
+png = "0.18"

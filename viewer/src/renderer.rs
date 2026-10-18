@@ -1,0 +1,930 @@
+// All the wgpu code: the terrain as a 3D texture, the two passes, and the
+// offscreen target used by `--shot` and `--bench`.
+//
+// How the terrain gets to the GPU (the central idea of this viewer):
+//   * `sdf::Grid` stays the one source of truth on the CPU (collision, edits).
+//   * The GPU holds a COPY in a 3D texture, one signed byte per voxel.
+//   * Pattern: Dirty Flag. After an edit we re-upload only the changed 16^3
+//     chunks (4 KB each). Nothing is ever re-meshed, so an explosion costs the
+//     edit itself plus a handful of tiny texture writes.
+
+use crate::camera::Camera;
+use crate::shaders;
+use glam::{IVec3, Vec3};
+use sdf::{Grid, CHUNK, CHUNK_VOL};
+use std::time::Instant;
+
+const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const GBUF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+// Towards the sun. It shines over the spawn camera's shoulder, so the first
+// view is lit; the far mountains show their shaded side.
+pub const SUN: Vec3 = Vec3::new(0.5, 0.72, -0.45);
+
+pub struct Gpu {
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    /// True if the GPU can timestamp passes (see `GpuTimer`).
+    pub timestamps: bool,
+}
+
+impl Gpu {
+    /// `surface` is None for the headless modes.
+    pub fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface>) -> Gpu {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: surface,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .expect("no GPU adapter found");
+        let info = adapter.get_info();
+        println!("GPU: {} ({:?})", info.name, info.backend);
+        // Optional: timestamp queries let us read how long each pass took on the
+        // GPU. Without them the viewer still works, it just cannot show GPU times.
+        let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("viewer"),
+            required_features: if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
+            // The 3D texture is 512 x 256 x 512, well inside the default limit of 2048.
+            ..Default::default()
+        }))
+        .expect("could not open the GPU");
+        Gpu { adapter, device, queue, timestamps }
+    }
+}
+
+/// Everything that changes per frame. The terrain is not in here: it lives in
+/// the textures and is updated by `Renderer::sync`.
+pub struct FrameParams<'a> {
+    pub camera: &'a Camera,
+    /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
+    pub brush: Option<(Vec3, f32)>,
+    pub time: f32,
+    pub shadows: bool,
+    pub ao: bool,
+    pub outlines: bool,
+}
+
+// Must match `struct U` in shaders.rs: eight vec4s, so no padding questions.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    cam_pos: [f32; 4],
+    cam_right: [f32; 4],
+    cam_up: [f32; 4],
+    cam_fwd: [f32; 4],
+    sun: [f32; 4],
+    brush: [f32; 4],
+    flags: [f32; 4],
+    size: [f32; 4],
+}
+
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    world_chunks: IVec3,
+    sdf_tex: wgpu::Texture,
+    coarse_tex: wgpu::Texture,
+    uniforms: wgpu::Buffer,
+    march_pipeline: wgpu::RenderPipeline,
+    march_bind_group: wgpu::BindGroup,
+    ink_pipeline: wgpu::RenderPipeline,
+    ink_layout: wgpu::BindGroupLayout,
+    present_pipeline: wgpu::RenderPipeline,
+    present_layout: wgpu::BindGroupLayout,
+    upscale_sampler: wgpu::Sampler,
+    targets: Targets,
+    screen: (u32, u32),
+    gbuf: (u32, u32),
+    scale: f32,
+    scratch: Box<[i8; CHUNK_VOL]>,
+    /// Staging area for batched uploads, reused so edits allocate nothing.
+    region: Vec<i8>,
+    /// Which chunks held a surface at the last empty-space map upload.
+    surface_cache: Vec<u8>,
+    timer: Option<GpuTimer>,
+}
+
+impl Renderer {
+    /// Builds the pipelines and uploads the whole terrain once.
+    pub fn new(gpu: &Gpu, target_format: wgpu::TextureFormat, screen: (u32, u32), scale: f32, grid: &mut Grid) -> Renderer {
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
+        let world_chunks = grid.size_chunks();
+        let dims = world_chunks * CHUNK;
+
+        let sdf_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("terrain sdf"),
+            size: wgpu::Extent3d { width: dims.x as u32, height: dims.y as u32, depth_or_array_layers: dims.z as u32 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            // Snorm: the byte -127..127 is read back as -1..1, and the sampler
+            // may interpolate it (trilinear), which is what makes the surface smooth.
+            format: wgpu::TextureFormat::R8Snorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let coarse_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("empty-space map"),
+            size: wgpu::Extent3d {
+                width: world_chunks.x as u32,
+                height: world_chunks.y as u32,
+                depth_or_array_layers: world_chunks.z as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("terrain sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default() // clamp to edge
+        });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // --- pass 1: march ---------------------------------------------------
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty,
+            count: None,
+        };
+        let uniform_ty = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let tex3d = |sample_type| wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D3,
+            multisampled: false,
+        };
+        let march_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("march layout"),
+            entries: &[
+                entry(0, uniform_ty),
+                entry(1, tex3d(wgpu::TextureSampleType::Float { filterable: true })),
+                entry(2, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(3, tex3d(wgpu::TextureSampleType::Uint)),
+            ],
+        });
+        let sdf_view = sdf_tex.create_view(&Default::default());
+        let coarse_view = coarse_tex.create_view(&Default::default());
+        let march_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("march bind group"),
+            layout: &march_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sdf_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&coarse_view) },
+            ],
+        });
+        let march_pipeline = fullscreen_pipeline(
+            &device,
+            "march",
+            &shaders::march(world_chunks),
+            "fs",
+            &march_layout,
+            &[COLOR_FORMAT, GBUF_FORMAT],
+        );
+
+        // --- pass 2: ink outlines, at G-buffer resolution -----------------------
+        let tex2d = |filterable| wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        // The G-buffer (depth, normals) is read texel by texel: you cannot
+        // average a depth edge.
+        let ink_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ink layout"),
+            entries: &[entry(0, uniform_ty), entry(1, tex2d(false)), entry(2, tex2d(false))],
+        });
+        let post_wgsl = shaders::post();
+        let ink_pipeline = fullscreen_pipeline(&device, "ink", &post_wgsl, "fs_ink", &ink_layout, &[COLOR_FORMAT]);
+
+        // --- pass 3: upscale to the screen --------------------------------------
+        // The ink image is sampled with a bilinear filter, so rendering below
+        // native resolution looks soft instead of blocky.
+        let present_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("present layout"),
+            entries: &[
+                entry(0, uniform_ty),
+                entry(3, tex2d(true)),
+                entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let present_pipeline =
+            fullscreen_pipeline(&device, "present", &post_wgsl, "fs_present", &present_layout, &[target_format]);
+        let upscale_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("upscale sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let gbuf = scaled(screen, scale);
+        let targets = make_targets(&device, gbuf, &ink_layout, &present_layout, &uniforms, &upscale_sampler);
+
+        let mut r = Renderer {
+            device,
+            queue,
+            world_chunks,
+            sdf_tex,
+            coarse_tex,
+            uniforms,
+            march_pipeline,
+            march_bind_group,
+            ink_pipeline,
+            ink_layout,
+            present_pipeline,
+            present_layout,
+            upscale_sampler,
+            targets,
+            screen,
+            gbuf,
+            scale,
+            scratch: Box::new([0; CHUNK_VOL]),
+            region: Vec::new(),
+            surface_cache: Vec::new(),
+            timer: if gpu.timestamps { Some(GpuTimer::new(&gpu.device, gpu.queue.get_timestamp_period())) } else { None },
+        };
+        r.upload_all(grid);
+        r
+    }
+
+    pub fn resize(&mut self, screen: (u32, u32)) {
+        self.screen = screen;
+        self.rebuild_gbuffers();
+    }
+
+    /// Render-resolution scale (1.0 = native). The march pass is the expensive
+    /// one and its cost is per pixel, so this is the quickest speed knob.
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = scale;
+        self.rebuild_gbuffers();
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    fn rebuild_gbuffers(&mut self) {
+        self.gbuf = scaled(self.screen, self.scale);
+        self.targets = make_targets(
+            &self.device,
+            self.gbuf,
+            &self.ink_layout,
+            &self.present_layout,
+            &self.uniforms,
+            &self.upscale_sampler,
+        );
+    }
+
+    /// Whole terrain, one z-layer of chunks at a time so the staging memory
+    /// stays at a few MB instead of the full 67 MB.
+    fn upload_all(&mut self, grid: &mut Grid) {
+        let t = Instant::now();
+        let n = self.world_chunks;
+        for cz in 0..n.z {
+            self.upload_region(grid, IVec3::new(0, 0, cz), IVec3::new(n.x - 1, n.y - 1, cz));
+        }
+        grid.take_dirty(); // everything is on the GPU now
+        self.upload_coarse(grid);
+        let dims = n * CHUNK;
+        println!(
+            "terrain uploaded: {} MB in {:.0} ms",
+            dims.x as i64 * dims.y as i64 * dims.z as i64 / (1 << 20),
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// Copy the box of chunks `lo..=hi` to the texture in ONE write.
+    ///
+    /// Why a box and not one write per chunk: a crater dirties ~20 chunks, and
+    /// 20 separate `write_texture` calls cost ~1 ms each in the driver (measured:
+    /// 23 ms per crater), far more than the bytes themselves. One call over the
+    /// bounding box moves a few more bytes and costs about one call.
+    fn upload_region(&mut self, grid: &Grid, lo: IVec3, hi: IVec3) {
+        let n = hi - lo + IVec3::ONE;
+        let vox = n * CHUNK;
+        self.region.resize((vox.x * vox.y * vox.z) as usize, 0);
+        for cz in 0..n.z {
+            for cy in 0..n.y {
+                for cx in 0..n.x {
+                    grid.copy_chunk(lo + IVec3::new(cx, cy, cz), &mut self.scratch);
+                    // Scatter the chunk's 16 x 16 rows of 16 voxels into the region.
+                    for lz in 0..CHUNK {
+                        for ly in 0..CHUNK {
+                            let src = ((lz * CHUNK + ly) * CHUNK) as usize;
+                            let dst = (((cz * CHUNK + lz) * vox.y + cy * CHUNK + ly) * vox.x + cx * CHUNK) as usize;
+                            self.region[dst..dst + CHUNK as usize]
+                                .copy_from_slice(&self.scratch[src..src + CHUNK as usize]);
+                        }
+                    }
+                }
+            }
+        }
+        let o = lo * CHUNK;
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.sdf_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: o.x as u32, y: o.y as u32, z: o.z as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&self.region),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(vox.x as u32),
+                rows_per_image: Some(vox.y as u32),
+            },
+            wgpu::Extent3d { width: vox.x as u32, height: vox.y as u32, depth_or_array_layers: vox.z as u32 },
+        );
+    }
+
+    /// Push the chunks edited since the last call to the GPU. Returns how many.
+    pub fn sync(&mut self, grid: &mut Grid) -> usize {
+        let dirty = grid.take_dirty();
+        if dirty.is_empty() {
+            return 0;
+        }
+        let lo = dirty.iter().fold(IVec3::MAX, |a, c| a.min(*c));
+        let hi = dirty.iter().fold(IVec3::MIN, |a, c| a.max(*c));
+        let size = hi - lo + IVec3::ONE;
+        // One box if the edits sit together (a crater, a beam sweep). If they are
+        // scattered (two players digging far apart) a box would drag in the whole
+        // world between them, so fall back to one write per chunk.
+        if size.x * size.y * size.z <= 4 * dirty.len() as i32 + 8 {
+            self.upload_region(grid, lo, hi);
+        } else {
+            for c in &dirty {
+                self.upload_region(grid, *c, *c);
+            }
+        }
+        // An edit can turn an empty chunk into a surface chunk, so the skipping
+        // map has to follow. It is only 16 KB.
+        self.upload_coarse(grid);
+        dirty.len()
+    }
+
+    fn upload_coarse(&mut self, grid: &Grid) {
+        // Digging inside chunks that already hold surface changes nothing here,
+        // and that is most edits after the first: skip the rebuild and upload.
+        let flags = surface_flags(grid);
+        if flags == self.surface_cache {
+            return;
+        }
+        let n = self.world_chunks;
+        let map = chessboard_distance(&flags, n);
+        self.surface_cache = flags;
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.coarse_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &map,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n.x as u32), rows_per_image: Some(n.y as u32) },
+            wgpu::Extent3d { width: n.x as u32, height: n.y as u32, depth_or_array_layers: n.z as u32 },
+        );
+    }
+
+    /// Record both passes. `target` must have the format given to `new`.
+    pub fn render(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, f: &FrameParams) {
+        let cam = f.camera;
+        let (right, up) = cam.right_up();
+        let half = (cam.fov_y * 0.5).tan();
+        let aspect = self.screen.0 as f32 / self.screen.1 as f32;
+        let (brush_pos, brush_r) = f.brush.unwrap_or((Vec3::ZERO, 0.0));
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        let u = Uniforms {
+            cam_pos: cam.pos.extend(0.0).to_array(),
+            cam_right: (right * half * aspect).extend(0.0).to_array(),
+            cam_up: (up * half).extend(0.0).to_array(),
+            cam_fwd: cam.forward().extend(0.0).to_array(),
+            sun: SUN.normalize().extend(0.0).to_array(),
+            brush: brush_pos.extend(brush_r).to_array(),
+            flags: [f.time, flag(f.shadows), flag(f.ao), flag(f.outlines)],
+            size: [self.gbuf.0 as f32, self.gbuf.1 as f32, self.screen.0 as f32, self.screen.1 as f32],
+        };
+        self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+
+        let slot = self.timer.as_mut().and_then(|t| t.begin(&self.device));
+        let timer = self.timer.as_ref();
+        // Slots 0 and 1 bracket the march pass; slot 2 is written as the ink pass
+        // starts and slot 3 as the present pass ends, so "post" covers both.
+        let stamps = |begin: Option<u32>, end: Option<u32>| {
+            timer.zip(slot).map(|(t, _)| wgpu::RenderPassTimestampWrites {
+                query_set: &t.queries,
+                beginning_of_pass_write_index: begin,
+                end_of_pass_write_index: end,
+            })
+        };
+        {
+            let attach = |view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("march"),
+                color_attachments: &[attach(&self.targets.color), attach(&self.targets.gbuf)],
+                depth_stencil_attachment: None,
+                timestamp_writes: stamps(Some(0), Some(1)),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.march_pipeline);
+            pass.set_bind_group(0, &self.march_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ink"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.ink,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: stamps(Some(2), None),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.ink_pipeline);
+            pass.set_bind_group(0, &self.targets.ink_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("present"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: stamps(None, Some(3)),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.present_pipeline);
+            pass.set_bind_group(0, &self.targets.present_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if let (Some(t), Some(slot)) = (self.timer.as_ref(), slot) {
+            t.resolve(encoder, slot);
+        }
+    }
+
+    /// Call right after `queue.submit` for the frame just rendered.
+    pub fn end_frame(&mut self) {
+        if let Some(t) = self.timer.as_mut() {
+            t.request_readback();
+        }
+    }
+
+    /// Latest GPU time of (march pass, post pass) in ms, if the GPU supports
+    /// timestamps. Results arrive a frame or two late, because the GPU has to
+    /// finish the frame before the numbers can be copied back.
+    pub fn gpu_ms(&mut self) -> Option<(f32, f32)> {
+        self.timer.as_mut().and_then(|t| t.latest(&self.device))
+    }
+}
+
+/// How long each pass took on the GPU, measured by the GPU itself.
+///
+/// Wall-clock timing from the CPU cannot tell GPU time from vsync waits and
+/// driver queueing, and on an integrated GPU it is very noisy. Timestamp
+/// queries record the GPU's own clock at the start and end of each pass. The
+/// result lives in GPU memory, so it is copied into a buffer the CPU can map,
+/// which only completes after the frame has finished. A few buffers rotate so
+/// the next frame never waits for the previous frame's readback.
+struct GpuTimer {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    slots: Vec<TimerSlot>,
+    next: usize,
+    /// Slot recorded this frame whose readback has not been requested yet.
+    recorded: Option<usize>,
+    period_ns: f32,
+    last: Option<(f32, f32)>,
+}
+
+struct TimerSlot {
+    buffer: wgpu::Buffer,
+    /// 0 idle, 1 copy recorded, 2 mapping requested, 3 mapped and ready to read.
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl GpuTimer {
+    const SLOTS: usize = 3;
+    const BYTES: u64 = 4 * 8; // four u64 timestamps
+
+    fn new(device: &wgpu::Device, period_ns: f32) -> GpuTimer {
+        let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("pass timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 4,
+        });
+        let buffer = |label, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: Self::BYTES,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        GpuTimer {
+            queries,
+            resolve: buffer("timestamp resolve", wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
+            slots: (0..Self::SLOTS)
+                .map(|_| TimerSlot {
+                    buffer: buffer("timestamp readback", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+                    state: Default::default(),
+                })
+                .collect(),
+            next: 0,
+            recorded: None,
+            period_ns,
+            last: None,
+        }
+    }
+
+    /// Pick a free readback slot for this frame, or None if all are still busy
+    /// (then this frame simply goes unmeasured).
+    fn begin(&mut self, device: &wgpu::Device) -> Option<usize> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        self.collect(device);
+        let slot = (0..Self::SLOTS).map(|i| (self.next + i) % Self::SLOTS).find(|&i| self.slots[i].state.load(Acquire) == 0)?;
+        self.slots[slot].state.store(1, Release);
+        self.next = (slot + 1) % Self::SLOTS;
+        self.recorded = Some(slot);
+        Some(slot)
+    }
+
+    fn resolve(&self, encoder: &mut wgpu::CommandEncoder, slot: usize) {
+        encoder.resolve_query_set(&self.queries, 0..4, &self.resolve, 0);
+        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.slots[slot].buffer, 0, Self::BYTES);
+    }
+
+    fn request_readback(&mut self) {
+        use std::sync::atomic::Ordering::Release;
+        if let Some(slot) = self.recorded.take() {
+            let state = self.slots[slot].state.clone();
+            state.store(2, Release);
+            self.slots[slot].buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                state.store(if r.is_ok() { 3 } else { 0 }, Release);
+            });
+        }
+    }
+
+    /// Read every slot whose mapping has completed, oldest first.
+    fn collect(&mut self, device: &wgpu::Device) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let _ = device.poll(wgpu::PollType::Poll); // lets finished map callbacks run
+        for i in 0..Self::SLOTS {
+            let slot = (self.next + i) % Self::SLOTS;
+            if self.slots[slot].state.load(Acquire) != 3 {
+                continue;
+            }
+            {
+                let view = self.slots[slot].buffer.slice(..).get_mapped_range().expect("timestamp range");
+                let t: &[u64] = bytemuck::cast_slice(&view);
+                let ms = |a: u64, b: u64| b.saturating_sub(a) as f32 * self.period_ns / 1.0e6;
+                self.last = Some((ms(t[0], t[1]), ms(t[2], t[3])));
+            }
+            self.slots[slot].buffer.unmap();
+            self.slots[slot].state.store(0, Release);
+        }
+    }
+
+    fn latest(&mut self, device: &wgpu::Device) -> Option<(f32, f32)> {
+        self.collect(device);
+        self.last
+    }
+}
+
+fn scaled(screen: (u32, u32), scale: f32) -> (u32, u32) {
+    (((screen.0 as f32 * scale).round() as u32).max(1), ((screen.1 as f32 * scale).round() as u32).max(1))
+}
+
+/// The images the passes hand to each other, all at the internal resolution:
+/// colour and G-buffer (written by the march), then the inked picture. They are
+/// recreated whenever the window or the render scale changes.
+struct Targets {
+    color: wgpu::TextureView,
+    gbuf: wgpu::TextureView,
+    ink: wgpu::TextureView,
+    ink_bind_group: wgpu::BindGroup,
+    present_bind_group: wgpu::BindGroup,
+}
+
+fn make_targets(
+    device: &wgpu::Device,
+    (w, h): (u32, u32),
+    ink_layout: &wgpu::BindGroupLayout,
+    present_layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+) -> Targets {
+    let make = |label, format| {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    };
+    // Colour is stored sRGB-encoded in 8 bits (a toon image has no use for
+    // more); normal + distance need float precision, hence 16-bit floats.
+    let color = make("g colour", COLOR_FORMAT);
+    let gbuf = make("g normal+depth", GBUF_FORMAT);
+    let ink = make("inked picture", COLOR_FORMAT);
+    let uniform = || wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() };
+    let ink_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ink bind group"),
+        layout: ink_layout,
+        entries: &[
+            uniform(),
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&color) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gbuf) },
+        ],
+    });
+    let present_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("present bind group"),
+        layout: present_layout,
+        entries: &[
+            uniform(),
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ink) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    });
+    Targets { color, gbuf, ink, ink_bind_group, present_bind_group }
+}
+
+/// Every pass is "draw one triangle that covers the screen".
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    wgsl: &str,
+    fs_entry: &str,
+    bind_layout: &wgpu::BindGroupLayout,
+    formats: &[wgpu::TextureFormat],
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(bind_layout)],
+        immediate_size: 0,
+    });
+    let targets: Vec<Option<wgpu::ColorTargetState>> = formats
+        .iter()
+        .map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }))
+        .collect();
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some(fs_entry),
+            compilation_options: Default::default(),
+            targets: &targets,
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// The empty-space map: for every chunk, the chessboard distance (in chunks)
+/// to the nearest chunk that holds a surface. 0 = holds one, 255 = none at all.
+///
+/// Pattern: Spatial Partition, used as an acceleration structure. A ray in a
+/// chunk with value k knows nothing solid is nearer than (k-1) chunks, so it
+/// can leap that far without sampling the terrain.
+///
+/// Two sweeps with a 3x3x3 neighbourhood give the exact chessboard distance:
+/// forward over the 13 neighbours that come earlier in sweep order, then
+/// backward over the other 13. The array has a one-chunk border of "infinity"
+/// so no neighbour lookup ever needs a bounds check. This runs after every
+/// edit, so it has to stay well under a millisecond.
+pub fn coarse_map(grid: &Grid) -> Vec<u8> {
+    chessboard_distance(&surface_flags(grid), grid.size_chunks())
+}
+
+/// 0 for every chunk that holds a surface, 255 for the rest.
+fn surface_flags(grid: &Grid) -> Vec<u8> {
+    let n = grid.size_chunks();
+    let mut flags = Vec::with_capacity((n.x * n.y * n.z) as usize);
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                flags.push(if grid.chunk_has_surface(IVec3::new(x, y, z)) { 0 } else { 255 });
+            }
+        }
+    }
+    flags
+}
+
+fn chessboard_distance(flags: &[u8], n: IVec3) -> Vec<u8> {
+    let (sx, sy, sz) = (n.x + 2, n.y + 2, n.z + 2);
+    let at = |x: i32, y: i32, z: i32| (((z + 1) * sy + (y + 1)) * sx + (x + 1)) as usize;
+    let mut d = vec![255u8; (sx * sy * sz) as usize];
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                d[at(x, y, z)] = flags[((z * n.y + y) * n.x + x) as usize];
+            }
+        }
+    }
+    // Index offsets of the neighbours visited before / after a cell.
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    for dz in -1..=1i32 {
+        for dy in -1..=1i32 {
+            for dx in -1..=1i32 {
+                let offset = ((dz * sy + dy) * sx + dx) as isize;
+                if dz < 0 || (dz == 0 && (dy < 0 || (dy == 0 && dx < 0))) {
+                    before.push(offset);
+                } else if (dz, dy, dx) != (0, 0, 0) {
+                    after.push(offset);
+                }
+            }
+        }
+    }
+    let relax = |d: &mut [u8], i: usize, neighbours: &[isize]| {
+        let mut best = d[i];
+        for &o in neighbours {
+            best = best.min(d[(i as isize + o) as usize].saturating_add(1));
+        }
+        d[i] = best;
+    };
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                relax(&mut d, at(x, y, z), &before);
+            }
+        }
+    }
+    for z in (0..n.z).rev() {
+        for y in (0..n.y).rev() {
+            for x in (0..n.x).rev() {
+                relax(&mut d, at(x, y, z), &after);
+            }
+        }
+    }
+    // Copy out the interior, without the border.
+    let mut out = Vec::with_capacity((n.x * n.y * n.z) as usize);
+    for z in 0..n.z {
+        for y in 0..n.y {
+            let row = at(0, y, z);
+            out.extend_from_slice(&d[row..row + n.x as usize]);
+        }
+    }
+    out
+}
+
+/// A render target we can read back: for `--shot` (save a PNG) and `--bench`.
+pub struct Offscreen {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    size: (u32, u32),
+}
+
+impl Offscreen {
+    pub const FORMAT: wgpu::TextureFormat = COLOR_FORMAT;
+
+    pub fn new(device: &wgpu::Device, size: (u32, u32)) -> Offscreen {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        Offscreen { texture, view, size }
+    }
+
+    /// RGBA8 pixels, rows tightly packed (sRGB-encoded, ready for a PNG).
+    pub fn read(&self, gpu: &Gpu) -> Vec<u8> {
+        let (w, h) = self.size;
+        // Buffer rows must be a multiple of 256 bytes.
+        let padded = (w * 4).div_ceil(256) * 256;
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            self.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll failed");
+        let data = slice.get_mapped_range().expect("readback range");
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            out.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdf::{Op, Shape};
+
+    #[test]
+    fn coarse_map_counts_chunks_to_the_nearest_surface() {
+        // 8x1x8 chunks of rock, a small crater in chunk (1,0,1): only that
+        // chunk (and any it spills into) holds a surface.
+        let mut g = Grid::new(IVec3::new(8, 1, 8));
+        let chunk_m = CHUNK as f32 * sdf::VOX;
+        g.apply(Shape::Sphere { center: Vec3::new(1.5, 0.5, 1.5) * chunk_m, radius: 0.5 }, Op::Carve);
+        let map = coarse_map(&g);
+        let at = |x: i32, z: i32| map[(z * 8 + x) as usize];
+        assert_eq!(at(1, 1), 0);
+        assert_eq!(at(2, 1), 1);
+        assert_eq!(at(3, 3), 2, "chessboard distance, so diagonals count as one step per chunk");
+        assert_eq!(at(7, 1), 6);
+    }
+
+    #[test]
+    fn coarse_map_is_conservative_everywhere() {
+        // The ray leaps (k-1) chunks of clear space. Verify against brute force
+        // that no chunk claims more clearance than really exists.
+        let mut g = Grid::new(IVec3::new(6, 3, 6));
+        let chunk_m = CHUNK as f32 * sdf::VOX;
+        g.apply(Shape::Sphere { center: Vec3::new(1.0, 1.0, 1.0) * chunk_m, radius: 0.9 }, Op::Carve);
+        g.apply(Shape::Sphere { center: Vec3::new(4.5, 2.0, 4.0) * chunk_m, radius: 1.3 }, Op::Carve);
+        let map = coarse_map(&g);
+        let n = g.size_chunks();
+        for z in 0..n.z {
+            for y in 0..n.y {
+                for x in 0..n.x {
+                    let k = map[((z * n.y + y) * n.x + x) as usize] as i32;
+                    for sz in 0..n.z {
+                        for sy in 0..n.y {
+                            for sx in 0..n.x {
+                                if g.chunk_has_surface(IVec3::new(sx, sy, sz)) {
+                                    let cheb = (sx - x).abs().max((sy - y).abs()).max((sz - z).abs());
+                                    assert!(k <= cheb, "chunk ({x},{y},{z}) claims {k} but a surface is {cheb} away");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

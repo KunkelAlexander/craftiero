@@ -61,30 +61,24 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 ---
 
-# Project: Neon Bomber-Liero
+# Project: 3D SDF Liero (working title)
 
-Top-down, real-time arena shooter ("Bomberman meets Liero") in a neon style. Rust + macroquad, runs in the browser (WASM, GitHub Pages) and natively. The owner mostly directs and wants to **learn** how online multiplayer is built, so the code should teach.
+Fork of the 2D "Neon Bomber-Liero" (see git history before the "Fork for 3D" commit for the 2D code). Real-time 3D worm shooter with fully destructible/formable terrain stored as a signed distance field. Rust, native first (wgpu + winit), web later. Cel shading with Okami-like ink outlines. Smooth, fast gameplay beats graphics. The owner wants to **learn**, so the code should teach. The full plan and milestones (M0-M6) are in `PLAN.md`.
 
-## Code style (project-specific)
-- **Keep the code simple.** Plain structs, enums and functions. No generics, traits or macros unless there is a clear payoff. No ECS.
-- **Comment the *why*** of design decisions next to the code that implements them, not what each line does.
-- **Name the pattern.** When a pattern from *Game Programming Patterns* is used, say so in a comment (e.g. `// Pattern: Type Object`) and why it fits here. Planned uses: Game Loop (fixed timestep), Command (the `Input` struct), Type Object (`WeaponDef` table), Flyweight, State, Object Pool, Event Queue, Double Buffer (snapshots), Dirty Flag (tile diffs), Spatial Partition (tile grid).
-- **Explain networking concepts where they appear** (tick, authority, snapshot, interpolation, latency, reliable vs. unreliable), so reading the code teaches online multiplayer. Build netcode in small steps and stop after each one so the owner can run it.
-- **No external assets.** Graphics are procedural shapes plus a glow shader; sounds are synthesized in code. Shaders are GLSL 100 strings in the source so they run on both WebGL and native.
+## Code style
+- Keep the code simple: plain structs, enums, functions. No generics, traits or macros without a clear payoff. No ECS.
+- Comment the *why* next to the code. Name Game Programming Patterns where used (`// Pattern: Dirty Flag`...), and explain networking concepts where they appear.
+- No external assets: procedural shapes, synthesized sound, GLSL/WGSL in source strings.
 
-## Architecture rules
-- All game logic lives in the `sim` **crate** (no macroquad, no I/O, no clock) and is driven only by per-player `Input` structs ("inputs in, state out"). Rendering, audio and networking only *read* state and events; the sim never calls into them. This is what makes bots, local play, online play and unit tests share one code path. If a change would make `sim` depend on the window, GPU, sound or sockets, stop and redesign.
-- **Central-server-ready (owner requirement).** "Host" is a role, not a place: whoever calls `World::step` is the authority. Today that will be a player's browser; it must stay possible to move that role into a dedicated server binary that links `sim`, with clients unchanged. So: the host logic (collect inputs by player id, step, build snapshots) is the `Host` struct in the `host` crate: it takes and returns already-decoded messages and never touches rendering or the transport. Message types and the client's `Replica` live in the shared `protocol` crate. Clients never call `World::step`; they draw a `Replica` built from snapshots, even in offline play (the game runs host and client over an in-memory loopback).
-- The sim runs at a fixed 60 Hz. Rendering runs at the display rate.
-- Weapons are data rows (`WeaponDef`), not types.
-- Online is host-authoritative: one player's browser runs the sim, a small relay server (`server` crate, rooms by code, forwards opaque bytes, never decodes game messages) only creates rooms and forwards messages. The game's own WebSocket wrapper is `game/src/socket.rs` + `web/net.js` (quad-net was rejected: it panics on connect failure and cannot report a closed socket). No client-side prediction in v1. Joiners interpolate: the `Replica` plays snapshots back ~100 ms late (`protocol/src/replica.rs`); the host's own player uses delay 0. The host session (`game/src/share.rs`) is the only code that knows both relay peers and match slots; `host::Throttle` sets the snapshot rate per link (30/s to friends).
+## Architecture rules (inherited from the 2D game)
+- All game logic lives in `sim` (no window, GPU, I/O or clock), driven only by per-player `Input` structs. Rendering, audio and networking read state and events.
+- Terrain lives in the pure `sdf` crate: a chunked distance grid. Collision samples it directly (no collision mesh). The renderer keeps a GPU copy of the grid (a 3D texture) and raymarches it, no meshes; only dirty chunks are re-uploaded. Edits (`Carve`/`Add` shapes) are the network event format, like `TileChanged` in 2D.
+- "Host" is a role: whoever calls `World::step` is the authority; it must stay movable into a dedicated server. Clients draw a `Replica` built from snapshots, even offline (in-memory loopback).
+- Fixed 60 Hz sim; render at display rate. Weapons are data rows (`WeaponDef`).
+
+## Workspace state
+`sdf` (M0) and `viewer` (M1 tech demo: wgpu raymarcher, becomes `game` later) are in the workspace. `sim`, `protocol`, `host`, `server`, `game/src/{share,local,join,net,socket}.rs` are the 2D code kept for porting; they do not compile yet (sim lost `tilemap.rs`). Re-add each to `members` at its milestone.
 
 ## Commands
-- Native: `cargo run -p game --release`
-- Web build: `cargo build -p game --release --target wasm32-unknown-unknown`, then serve `web/` (see `web/README` once it exists, or `python -m http.server` in `web/`).
-- Relay server: `cargo run -p server --release` (port 9001, or $PORT). The game connects to `ws://127.0.0.1:9001/ws` unless built with `RELAY_URL=wss://...`.
-- Deploy: see `docs/DEPLOY.md` (relay on Render/Fly via `server/Dockerfile`, game on GitHub Pages; `RELAY_URL` is a build-time setting). How the netcode works: `docs/NETWORKING.md`.
-- Tests: `cargo test` (sim, protocol and host tests are headless: no window or GPU needed)
-
-## Plan
-The full approved plan (decisions, weapon list, milestones M0–M5) is in `PLAN.md`.
+- `cargo test -p sdf -p viewer`, `cargo run -p sdf --release --example bench`
+- `cargo run -p viewer --release` (interactive), `-- --shot out.png [--edits --cam x,y,z,yaw,pitch]` (headless screenshot), `-- --bench` (GPU ms per pass). Windows defaults to DX12; `WGPU_BACKEND=vulkan` overrides.
