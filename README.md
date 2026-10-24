@@ -14,7 +14,9 @@ world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
 integrated laptop GPU, and now fight: eleven weapons (rockets, a railgun, bombs,
 homing swarms, a teleport gun, a Nova that clears a cavern, and two that *build*
 rock). Explosions carve the terrain, rock is cover, and a dead worm comes back
-after three seconds. The rules run in a pure `sim` crate, with headless tests.
+after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
+arc to the point it will land on, and rockets leave smoke in the air. The rules
+run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
 
@@ -76,7 +78,8 @@ cargo test -p sdf -p sim -p viewer
 `--fire id[,ticks]` fires that weapon and takes the picture `ticks` later (so
 projectiles and blasts are in the air); `--weapon id` just holds it, with no
 shot, which is the way to look at a gun. `--no-brush` hides the orange dig
-ring that otherwise sits on the terrain behind the character.
+ring that otherwise sits on the terrain behind the character, and `--no-aim`
+hides the dotted trajectory that a lobbed weapon draws.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.

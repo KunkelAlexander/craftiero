@@ -489,6 +489,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     }
 
     var col = sky(rd);
+    var inkless = false;
     let fog_col = srgb(vec3<f32>(0.93, 0.86, 0.72));
     if (kind == 1 || kind == 3) {
         let p = ro + rd * t;
@@ -527,10 +528,11 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         }
 
         let tint = mix(vec3<f32>(0.42, 0.45, 0.70), vec3<f32>(1.10, 1.0, 0.86), toon(lit));
-        // A self-lit primitive (a muzzle, a coil, a hot core) ignores the sun:
-        // flat and bright is what sells it as a light source instead of painted
-        // plastic. `c.w` carries the flag (see `pack` in renderer.rs).
-        let self_lit = kind == 3 && u.caps[ci].c.w > 0.5;
+        // Draw flags ride in `c.w` (see `pack` in renderer.rs): bit 0 self-lit,
+        // bit 1 no ink outline.
+        let cap_flags = select(0, i32(u.caps[max(ci, 0)].c.w + 0.5), kind == 3);
+        let self_lit = (cap_flags & 1) != 0;
+        inkless = (cap_flags & 2) != 0;
         let to_cam = ro - p;
         let lamp_d = length(to_cam);
         if (self_lit) {
@@ -571,7 +573,13 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
 
     var out: Out;
     out.color = vec4<f32>(col, 1.0);
-    out.gbuf = vec4<f32>(n * 0.5 + 0.5, t);
+    // An inkless primitive writes a sentinel normal instead of a real one:
+    // `fs_ink` reads it as "draw no outline here" (and draws none around it).
+    var gbuf_n = n * 0.5 + 0.5;
+    if (inkless) {
+        gbuf_n = vec3<f32>(-1.0);
+    }
+    out.gbuf = vec4<f32>(gbuf_n, t);
     return out;
 }
 "#;
@@ -610,12 +618,20 @@ fn load_gb(p: vec2<i32>) -> vec4<f32> {
 // object instead of bleeding into the sky.
 fn edge(p: vec2<i32>, o: i32) -> f32 {
     let c = load_gb(p);
+    // Inkless primitives mark their G-buffer normal with -1: no outline on
+    // them, and none drawn onto the rock behind them either.
+    if (c.x < 0.0 || c.w > 300.0) { return 0.0; }
     let d0 = c.w;
-    if (d0 > 300.0) { return 0.0; }
-    let l = load_gb(p + vec2<i32>(-o, 0));
-    let r = load_gb(p + vec2<i32>(o, 0));
-    let t = load_gb(p + vec2<i32>(0, -o));
-    let b = load_gb(p + vec2<i32>(0, o));
+    let l0 = load_gb(p + vec2<i32>(-o, 0));
+    let r0 = load_gb(p + vec2<i32>(o, 0));
+    let t0 = load_gb(p + vec2<i32>(0, -o));
+    let b0 = load_gb(p + vec2<i32>(0, o));
+    // A neighbour that is inkless contributes the centre's own depth and
+    // normal, so it neither makes a silhouette nor a crease.
+    let l = select(l0, c, l0.x < 0.0);
+    let r = select(r0, c, r0.x < 0.0);
+    let t = select(t0, c, t0.x < 0.0);
+    let b = select(b0, c, b0.x < 0.0);
     let nearest = min(min(l.w, r.w), min(t.w, b.w));
     let near_side = select(0.0, 1.0, d0 <= nearest + 0.03 * d0 + 0.05);
     let lap = abs(l.w + r.w - 2.0 * d0) + abs(t.w + b.w - 2.0 * d0);

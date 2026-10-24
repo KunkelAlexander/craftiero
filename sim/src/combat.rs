@@ -65,6 +65,16 @@ pub struct Projectile {
     pub life: f32,
 }
 
+/// Where a lobbed shot will go, for the aim aid on screen. `points` is the
+/// flight path (a point every few ticks) and `hit` is where it will land, with
+/// the rock's `normal` there so the marker can lie on the slope.
+#[derive(Clone, Debug, Default)]
+pub struct AimPath {
+    pub points: Vec<Vec3>,
+    pub hit: Option<Vec3>,
+    pub normal: Vec3,
+}
+
 impl World {
     /// Weapon timers, the weapon choice and the trigger of worm `i` (alive).
     pub(crate) fn step_weapons(&mut self, i: usize, input: &Input) {
@@ -98,6 +108,95 @@ impl World {
         }
     }
 
+    /// Where worm `i`'s next shot leaves the gun, and which way it goes.
+    ///
+    /// The camera sits over the shoulder, so a shot aimed along the eye ray
+    /// would stay a shoulder-width off the reticle. The gun therefore starts
+    /// out at the hand and fires *at* the point under the crosshair, with the
+    /// correction faded out at point-blank range.
+    ///
+    /// Shared with `aim_path`, so the trajectory the player sees is the path
+    /// the shot will really take.
+    fn shot_plan(&self, i: usize) -> (Vec3, Vec3) {
+        let worm = &self.worms[i];
+        let aim = worm.aim_dir();
+        let eye = worm.eye();
+        // How far the eye ray reaches before it hits rock. With nothing in
+        // reach, the crosshair is far enough away that the correction is nil.
+        let range = self.grid.raycast(eye, aim, 100.0).unwrap_or(100.0);
+        let crosshair = eye + aim * range;
+        // Aiming almost straight down at your own feet is the one case where
+        // starting at the hand is wrong: the blast lands level with your foot and
+        // beside you, so it shoves you sideways instead of up and a rocket jump
+        // stops working. Fall back to the body's axis for that shot.
+        let steep = -aim.y > 0.9 && range < 3.0;
+        let hand = if steep { worm.hand() } else { worm.muzzle() };
+        let muzzle = hand + aim * MUZZLE;
+        let want = (crosshair - muzzle).normalize_or_zero();
+        // Under 3 m the points are too close for convergence to make sense (a
+        // rocket at your own feet would leave sideways), so fade it out.
+        let blend = ((range - 1.0) / 2.0).clamp(0.0, 1.0);
+        let shot = aim.lerp(want, blend).normalize_or_zero();
+        let shot = if shot.length_squared() > 0.5 { shot } else { aim };
+        (muzzle, shot)
+    }
+
+    /// The arc a lobbed shot will follow, and where it will land.
+    ///
+    /// Only weapons that are actually thrown in an arc report one: a blaster
+    /// bolt or a rocket flies flat, and in R&C those get no trajectory either.
+    /// The flight is stepped exactly as `step_projectiles` does it (minus the
+    /// random spread), so the landing mark lands on the rock the shot will hit.
+    pub fn aim_path(&self, i: usize) -> Option<AimPath> {
+        let worm = self.worms.get(i)?;
+        if !worm.alive {
+            return None;
+        }
+        let id = worm.weapons[worm.current].id;
+        let def = &WEAPONS[id as usize];
+        // A lobbed shell, not a flat shot and not a bouncer: the arc is only
+        // honest for a weapon that lands where it stops. (R&C draws this for
+        // the lobbed weapons, and leaves the straight ones to the crosshair.)
+        let lobbed = def.gravity > 0.0 && def.speed > 0.0 && def.speed <= 30.0;
+        if def.kind != Kind::Projectile || !lobbed {
+            return None;
+        }
+        let (muzzle, shot) = self.shot_plan(i);
+        let mut pos = muzzle;
+        let mut vel = shot * def.speed;
+        let mut points = Vec::new();
+        let mut hit = None;
+        let ticks = (def.lifetime / DT).ceil() as usize;
+        'flight: for _ in 0..ticks {
+            vel.y -= def.gravity * DT;
+            // The same sub-stepping the real projectile uses, so a fast shell
+            // cannot tunnel through a thin wall in the preview but not in play.
+            let n = ((vel.length() * DT) / PROJECTILE_STEP).ceil().max(1.0) as i32;
+            let step = vel * DT / n as f32;
+            for _ in 0..n {
+                pos += step;
+                if self.grid.sample(pos) < PROJECTILE_RADIUS {
+                    hit = Some(pos);
+                    break 'flight;
+                }
+            }
+            // One point per tick: the viewer thins them to a fixed handful, so
+            // a short lob still gets enough dots to read as a curve.
+            points.push(pos);
+        }
+        let normal = match hit {
+            Some(p) => {
+                // The dots have to reach the mark, or the last one (up to three
+                // ticks back) leaves a visible gap before the ring.
+                points.push(p);
+                let n = self.grid.gradient(p);
+                if n.length_squared() > 1.0e-6 { n.normalize() } else { Vec3::Y }
+            }
+            None => Vec3::Y,
+        };
+        Some(AimPath { points, hit, normal })
+    }
+
     fn try_fire(&mut self, i: usize) {
         let worm = &self.worms[i];
         let w = &worm.weapons[worm.current];
@@ -106,17 +205,7 @@ impl World {
         }
         let id = w.id;
         let def = &WEAPONS[id as usize];
-        let (aim, eye, gun) = (worm.aim_dir(), worm.eye(), worm.muzzle());
-        // Where the crosshair is: how far the eye ray reaches before it hits
-        // rock (with nothing in reach, far enough that the correction is nil).
-        let range = self.grid.raycast(eye, aim, 100.0).unwrap_or(100.0);
-        let crosshair = eye + aim * range;
-        // Aiming almost straight down at your own feet is the one case where
-        // starting at the hand is wrong: the blast lands level with your foot and
-        // beside you, so it shoves you sideways instead of up and a rocket jump
-        // stops working. Fall back to the body's axis for that shot.
-        let steep = -aim.y > 0.9 && range < 3.0;
-        let hand = if steep { worm.hand() } else { gun };
+        let (barrel, shot) = self.shot_plan(i);
         // Find the build spot before spending a charge: aiming at a wall too
         // close, or at a worm, should not cost you a lump.
         let build_at = match def.kind {
@@ -144,21 +233,8 @@ impl World {
         let muzzle = match build_at {
             Some(at) => at,
             None if def.kind == Kind::Projectile && def.speed == 0.0 => feet + Vec3::Y * 0.5,
-            None => hand + aim * MUZZLE,
+            None => barrel,
         };
-        // The direction the shot travels: from the barrel *to* the crosshair, so
-        // it converges instead of flying parallel and staying a hand's width off
-        // for its whole flight. (The old code used `aim` from a point beside the
-        // body, which is why bolts looked like they came out of the chest.)
-        //
-        // Very close in, the crosshair point is barely a metre away and
-        // converging would swing the gun round (a rocket aimed at your own feet
-        // would leave sideways). Fade the correction out under 3 m, exactly as
-        // the viewer's `crosshair_aim` does.
-        let want = (crosshair - muzzle).normalize_or_zero();
-        let blend = ((range - 1.0) / 2.0).clamp(0.0, 1.0);
-        let shot = aim.lerp(want, blend).normalize_or_zero();
-        let shot = if shot.length_squared() > 0.5 { shot } else { aim };
         self.events.push(Event::Shot { worm: i as u8, weapon: id, pos: muzzle + shot * FLASH_AHEAD });
 
         match def.kind {
@@ -623,6 +699,57 @@ mod tests {
         shoot_at(&mut w, BLASTER, 1.0, LEVEL); // aimed well to the side
         run(&mut w, 30);
         assert_eq!(w.worms[1].hp, MAX_HP);
+    }
+
+    #[test]
+    fn a_cluster_shows_its_arc_and_where_it_will_land() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        // Aim slightly down, so the shell arcs into the ground in front of the
+        // worm rather than flying over the arena wall.
+        w.worms[0].pitch = -0.18;
+        w.worms[0].current = CLUSTER as usize;
+        let path = w.aim_path(0).expect("a lobbed weapon has a path");
+        assert!(path.points.len() >= 4, "an arc, not two dots: {}", path.points.len());
+        let hit = path.hit.expect("aiming at the ground: it lands");
+        assert!((hit.y - 4.0).abs() < 0.3, "the mark is on the ground: {hit:?}");
+        let last = *path.points.last().unwrap();
+        assert!((last - hit).length() < 0.15, "the dots lead to the mark: {last:?} {hit:?}");
+        assert!(path.normal.y > 0.5, "flat ground points up: {:?}", path.normal);
+
+        // The mark is where the shell really bursts (the cluster backs off a
+        // little so its children do not start inside the rock).
+        let mut burst = None;
+        for _ in 0..90 {
+            w.step(&[Input { fire: burst.is_none(), weapon: CLUSTER, pitch: -0.18, ..Input::default() }]);
+            w.drain_events();
+            if let Some(b) = w.projectiles.iter().find(|p| p.weapon == BOMBLET) {
+                burst = Some(b.pos);
+                break;
+            }
+        }
+        let burst = burst.expect("the shell bursts");
+        assert!((burst - hit).length() < 2.5, "the preview lands where the shot does: {burst:?} {hit:?}");
+    }
+
+    #[test]
+    fn a_lob_aimed_at_a_wall_marks_the_wall() {
+        let mut w = arena(walled, &[(16.0, 16.0)]);
+        w.worms[0].current = CLUSTER as usize;
+        let path = w.aim_path(0).expect("a lobbed weapon has a path");
+        let hit = path.hit.expect("the wall is in the way");
+        assert!(hit.z > 23.0, "the mark is on the wall: {hit:?}");
+        assert!(path.normal.z < -0.5, "the ring faces back at the worm: {:?}", path.normal);
+    }
+
+    #[test]
+    fn flat_shots_get_no_trajectory() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        for id in [BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, SWARM] {
+            w.worms[0].current = id as usize;
+            assert!(w.aim_path(0).is_none(), "weapon {id} flies flat or is dropped");
+        }
+        w.worms[0].current = CLUSTER as usize;
+        assert!(w.aim_path(0).is_some(), "but a lobbed one has an arc");
     }
 
     #[test]

@@ -10,19 +10,25 @@
 use crate::renderer::DrawPrim;
 use glam::Vec3;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT};
-use sim::{Event, Projectile, DT};
+use sim::{AimPath, Event, Projectile, DT};
 use std::f32::consts::TAU;
 
-/// The renderer holds 64 capsules in total, and worms/projectiles are drawn
-/// before effects. Keep the cosmetic lists small so a busy fight drops dust
-/// instead of rockets.
+/// The renderer holds `MAX_CAPSULES` (256) primitives in total, and worms,
+/// projectiles and the aim aid are drawn before effects. Keep the cosmetic
+/// lists small so a busy fight drops dust instead of rockets.
 const MAX_BURSTS: usize = 24;
 const MAX_DUST: usize = 20;
+/// Air traces. They are the first thing to drop when a fight is busy, because
+/// they are the least important: the shot itself still has to be drawn.
+const MAX_TRAILS: usize = 24;
 
 const DUST: Vec3 = Vec3::new(0.60, 0.55, 0.46);
 const SMOKE: Vec3 = Vec3::new(0.38, 0.36, 0.34);
 const SPARK: Vec3 = Vec3::new(1.0, 0.72, 0.28);
 const HOT: Vec3 = Vec3::new(1.0, 0.90, 0.60);
+/// The aim aid: a warm gold, bright enough to read over rock and sky and
+/// clearly not part of the world.
+const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
 
 // Colours shared with the weapons in `worms.rs`, so a shot matches its gun.
 const CYAN: Vec3 = Vec3::new(0.35, 0.92, 1.0);
@@ -134,6 +140,87 @@ pub fn projectiles(list: &[Projectile], alpha: f32) -> Vec<DrawPrim> {
     out
 }
 
+/// The air trace a projectile leaves: a small puff of smoke (or frost, or hot
+/// metal) every tick or two, which hangs for half a second after the shot has
+/// gone past. Returns the colour, size, ticks between puffs, and whether it is
+/// self-lit.
+fn trail(weapon: u8) -> Option<(Vec3, f32, u32, bool)> {
+    match weapon {
+        // A rocket leaves the classic grey plume.
+        ROCKET => Some((Vec3::new(0.62, 0.60, 0.57), 0.180, 1, false)),
+        CLUSTER => Some((Vec3::new(0.62, 0.56, 0.45), 0.140, 1, false)),
+        NOVA => Some((Vec3::new(0.76, 0.86, 0.95), 0.100, 1, false)),
+        // A bomblet is a hot ember: a short, bright wake.
+        BOMBLET => Some((EMBER, 0.070, 1, true)),
+        _ => None,
+    }
+}
+
+/// The aim aid for a lobbed weapon: a dotted arc and a ring where it lands.
+/// `AimPath` comes from the sim, so the ring sits on the rock the shot will
+/// really hit. R&C only shows this for thrown weapons; `World::aim_path`
+/// decides which those are.
+pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
+    let mut out = Vec::with_capacity(24);
+    let n = path.points.len();
+    if n > 0 {
+        // At most 14 dots: enough to read the curve, cheap enough that the aid
+        // never pushes real effects out of the renderer's budget.
+        let stride = n.div_ceil(14);
+        for (k, p) in path.points.iter().enumerate().step_by(stride) {
+            let t = k as f32 / n as f32;
+            // Big enough that the ink outline cannot swallow the bright middle:
+            // a 5 cm dot 20 m away is all outline and reads as a stone.
+            let radius = 0.150 - 0.045 * t;
+            // A tiny stub makes a sphere: the raymarcher has no point primitive.
+            out.push(
+                DrawPrim::capsule(*p, *p + Vec3::Y * 0.004, radius, HINT, false)
+                    .glowing()
+                    .inkless(),
+            );
+        }
+    }
+    if let Some(hit) = path.hit {
+        // A ring lying on the surface, because that is what says "it lands
+        // here". Built from short capsules (there is no torus), aligned to the
+        // rock's normal so it follows a slope instead of floating flat.
+        let normal = if path.normal.length_squared() > 0.5 {
+            path.normal.normalize_or_zero()
+        } else {
+            Vec3::Y
+        };
+        let mut side = normal.cross(Vec3::Y);
+        if side.length_squared() < 1.0e-4 {
+            side = Vec3::X;
+        }
+        let side = side.normalize();
+        let up = side.cross(normal).normalize_or_zero();
+        let radius = 0.70;
+        let segments = 12;
+        for k in 0..segments {
+            let a0 = k as f32 * TAU / segments as f32;
+            let a1 = (k + 1) as f32 * TAU / segments as f32;
+            let p0 = hit + (side * a0.cos() + up * a0.sin()) * radius;
+            let p1 = hit + (side * a1.cos() + up * a1.sin()) * radius;
+            // A thin continuous ring: inkless, so it stays a circle instead of
+            // turning into a row of dark pebbles at a distance.
+            out.push(
+                DrawPrim::capsule(p0, p1, 0.050, HINT, false)
+                    .glowing()
+                    .inkless(),
+            );
+        }
+        // A big dot in the middle, so the mark still reads where the ring is
+        // edge-on to the camera.
+        out.push(
+            DrawPrim::capsule(hit, hit + normal * 0.01, 0.160, HINT, false)
+                .glowing()
+                .inkless(),
+        );
+    }
+    out
+}
+
 enum Shape {
     /// A round burst (fireball, flash), or a puff of dust.
     Ball { at: Vec3, radius: f32 },
@@ -158,11 +245,25 @@ struct Effect {
     /// Self-lit: flashes, fireballs and beams are their own light source, so the
     /// shader draws them flat and bright. Dust and smoke are lit normally.
     hot: bool,
+    /// Skip the ink outline (soft smoke, the aim aid). Without this a small
+    /// primitive far away is all outline and reads as a dark pebble.
+    inkless: bool,
 }
 
 impl Effect {
     fn burst(shape: Shape, colour: Vec3, life: f32) -> Effect {
-        Effect { shape, colour, vel: Vec3::ZERO, gravity: 0.0, age: 0.0, life, burst: true, width: 0.12, hot: false }
+        Effect {
+            shape,
+            colour,
+            vel: Vec3::ZERO,
+            gravity: 0.0,
+            age: 0.0,
+            life,
+            burst: true,
+            width: 0.12,
+            hot: false,
+            inkless: false,
+        }
     }
 
     /// Draw it self-lit (flat and bright). Only for things small enough that a
@@ -184,8 +285,15 @@ impl Effect {
             burst: false,
             width: 0.0,
             hot: false,
+            inkless: false,
         }
     }
+}
+
+/// Apply an effect's draw flags to a primitive: self-lit, and/or no ink.
+fn styled(prim: DrawPrim, e: &Effect) -> DrawPrim {
+    let prim = if e.hot { prim.glowing() } else { prim };
+    if e.inkless { prim.inkless() } else { prim }
 }
 
 #[derive(Default)]
@@ -195,6 +303,11 @@ pub struct Effects {
     list: Vec<Effect>,
     /// Dust and footstep puffs. Cheap and frequent, dropped first.
     dust: Vec<Effect>,
+    /// Air traces left by rockets and other fast projectiles.
+    trails: Vec<Effect>,
+    /// Counts sim ticks, so a trail's spacing follows the fight rather than the
+    /// display's frame rate.
+    trail_tick: u32,
 }
 
 impl Effects {
@@ -359,8 +472,50 @@ impl Effects {
         ));
     }
 
+    /// Leave an air trace behind the projectiles that should have one. Call
+    /// this once per sim tick, not per frame: the trail is a record of where
+    /// the shot has been, so it must not depend on the frame rate.
+    pub fn trails(&mut self, list: &[Projectile]) {
+        self.trail_tick = self.trail_tick.wrapping_add(1);
+        for p in list {
+            let Some((colour, radius, stride, hot)) = trail(p.weapon) else { continue };
+            if self.trail_tick % stride != 0 {
+                continue;
+            }
+            // A bomb at rest has no direction and is not going anywhere.
+            if p.vel.length_squared() < 1.0 {
+                continue;
+            }
+            // Start behind the projectile, so the trail grows out of its tail.
+            let dir = p.vel.normalize_or_zero();
+            let at = p.pos - dir * 0.30;
+            // Deterministic wobble and size jitter (no RNG, like every effect
+            // here): without it the puffs line up like beads on a string
+            // instead of reading as smoke.
+            let seed = at.x * 1.7 + at.y * 0.9 + at.z * 1.3;
+            let off = Vec3::new(seed.sin(), (seed * 0.7).sin() * 0.35, (seed * 1.7).cos()) * 0.09;
+            let scale = 0.80 + 0.45 * (seed * 2.3).sin().abs();
+            // A short capsule rather than a ball: consecutive ones overlap into
+            // one ragged plume, where a row of spheres reads as a string of
+            // pearls. Its length follows the distance flown this tick (with a
+            // little overlap), so a slow Nova gets short puffs and a fast
+            // rocket a long streak instead of both becoming one solid rod.
+            let length = (p.vel.length() * DT * stride as f32 * 1.25).max(0.20);
+            let mut e = Effect::burst(
+                Shape::Line { from: at + off, to: at + off - dir * length },
+                colour,
+                0.60,
+            );
+            e.width = radius * scale;
+            e.hot = hot;
+            // Smoke should be soft: an ink rim turns a tiny puff into a stone.
+            e.inkless = true;
+            self.push_trail(e);
+        }
+    }
+
     pub fn update(&mut self, dt: f32) {
-        for e in self.list.iter_mut().chain(self.dust.iter_mut()) {
+        for e in self.list.iter_mut().chain(self.dust.iter_mut()).chain(self.trails.iter_mut()) {
             e.age += dt;
             if let Shape::Ball { at, .. } = &mut e.shape {
                 *at += e.vel * dt;
@@ -371,12 +526,14 @@ impl Effects {
         }
         self.list.retain(|e| e.age < e.life);
         self.dust.retain(|e| e.age < e.life);
+        self.trails.retain(|e| e.age < e.life);
     }
 
     pub fn capsules(&self) -> Vec<DrawPrim> {
         self.list
             .iter()
             .chain(self.dust.iter())
+            .chain(self.trails.iter())
             .map(|e| {
                 let u = (e.age / e.life).clamp(0.0, 1.0);
                 match e.shape {
@@ -390,11 +547,11 @@ impl Effects {
                         };
                         // A capsule needs a direction: a stub makes a sphere.
                         let ball = DrawPrim::capsule(at, at + Vec3::Y * 0.01, radius * size, e.colour, false);
-                        if e.hot { ball.glowing() } else { ball }
+                        styled(ball, e)
                     }
                     Shape::Line { from, to } => {
                         let line = DrawPrim::capsule(from, to, e.width * (1.0 - u), e.colour, false);
-                        if e.hot { line.glowing() } else { line }
+                        styled(line, e)
                     }
                 }
             })
@@ -413,6 +570,13 @@ impl Effects {
             self.dust.remove(0);
         }
         self.dust.push(e);
+    }
+
+    fn push_trail(&mut self, e: Effect) {
+        if self.trails.len() >= MAX_TRAILS {
+            self.trails.remove(0);
+        }
+        self.trails.push(e);
     }
 }
 
@@ -492,7 +656,58 @@ mod tests {
             e.footstep(Vec3::ZERO, Vec3::X);
         }
         assert!(e.dust.len() <= MAX_DUST, "dust is bounded: {}", e.dust.len());
-        assert!(count(&e) <= MAX_BURSTS + MAX_DUST);
+        assert!(count(&e) <= MAX_BURSTS + MAX_DUST + MAX_TRAILS);
+    }
+
+    #[test]
+    fn a_rocket_leaves_a_trail_that_hangs_then_fades() {
+        let rocket = Projectile { pos: Vec3::new(0.0, 8.0, 0.0), vel: Vec3::Z * 35.0, weapon: ROCKET, owner: 0, life: 1.0 };
+        let mut e = Effects::default();
+        e.trails(std::slice::from_ref(&rocket));
+        assert_eq!(count(&e), 1, "one puff behind the rocket");
+        e.trails(std::slice::from_ref(&rocket));
+        assert_eq!(count(&e), 2, "the next tick leaves the next puff");
+        e.update(0.2);
+        assert_eq!(count(&e), 2, "the trail hangs in the air");
+        e.update(0.5);
+        assert_eq!(count(&e), 0, "and then it is gone");
+    }
+
+    #[test]
+    fn fast_flat_shots_leave_no_trail() {
+        let bolt = Projectile { pos: Vec3::ZERO, vel: Vec3::Z * 60.0, weapon: BLASTER, owner: 0, life: 1.0 };
+        let mut e = Effects::default();
+        e.trails(std::slice::from_ref(&bolt));
+        assert_eq!(count(&e), 0);
+    }
+
+    #[test]
+    fn trails_are_capped() {
+        let rocket = Projectile { pos: Vec3::ZERO, vel: Vec3::Z * 35.0, weapon: ROCKET, owner: 0, life: 1.0 };
+        let mut e = Effects::default();
+        for _ in 0..100 {
+            e.trails(std::slice::from_ref(&rocket));
+        }
+        assert!(e.trails.len() <= MAX_TRAILS, "trails are bounded: {}", e.trails.len());
+    }
+
+    #[test]
+    fn the_aim_aid_draws_dots_and_a_landing_ring() {
+        let path = AimPath {
+            points: (0..10).map(|k| Vec3::new(0.0, 2.0 - k as f32 * 0.2, k as f32 * 1.5)).collect(),
+            hit: Some(Vec3::new(0.0, 0.0, 13.5)),
+            normal: Vec3::Y,
+        };
+        let prims = trajectory(&path);
+        assert!(prims.len() >= 12, "dots plus a ring: {}", prims.len());
+        for p in &prims {
+            match *p {
+                DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
+                    assert!(a.is_finite() && b.is_finite() && radius > 0.0);
+                }
+                DrawPrim::Cuboid { centre, half, .. } => assert!(centre.is_finite() && half.max_element() > 0.0),
+            }
+        }
     }
 
     #[test]

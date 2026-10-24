@@ -73,6 +73,8 @@ struct Config {
     /// screenshot shows the gun itself instead of a muzzle flash.
     weapon: Option<u8>,
     brush: bool,
+    /// `--no-aim`: hide the lobbed-weapon trajectory aid in a screenshot.
+    aim: bool,
     shadows: bool,
     ao: bool,
     outlines: bool,
@@ -92,6 +94,7 @@ fn parse_args() -> Config {
         fire: None,
         weapon: None,
         brush: true,
+        aim: true,
         shadows: true,
         ao: true,
         outlines: true,
@@ -129,6 +132,7 @@ fn parse_args() -> Config {
             }
             "--weapon" => c.weapon = Some(value("--weapon").parse().expect("--weapon weapon_id")),
             "--no-brush" => c.brush = false,
+            "--no-aim" => c.aim = false,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
             "--no-outlines" => c.outlines = false,
@@ -317,6 +321,7 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
             world.drain_events();
             for t in 0..=ticks {
                 world.step(&[Input { fire: t == 0, weapon, pitch: 0.05, ..look }]);
+                effects.trails(&world.projectiles);
                 for e in world.drain_events() {
                     effects.add(&e);
                 }
@@ -341,8 +346,24 @@ fn run_shot(cfg: &Config, path: &str) {
     let cam = camera_from(cfg);
     let target = Offscreen::new(&gpu.device, cfg.size);
     let positions: Vec<Vec3> = world.worms.iter().map(|w| w.pos).collect();
-    let anims: Vec<worms::Anim> = world.worms.iter().map(|_| worms::Anim::default()).collect();
+    let mut anims: Vec<worms::Anim> = world.worms.iter().map(|_| worms::Anim::default()).collect();
+    // A screenshot taken a few ticks after a shot should show the recoil at the
+    // same point in its spring as the game would, not a worm frozen at rest.
+    if let Some((_, ticks)) = cfg.fire {
+        if let (Some(anim), Some(worm)) = (anims.first_mut(), world.worms.first()) {
+            anim.fired();
+            for _ in 0..ticks {
+                anim.update(worm, DT);
+            }
+        }
+    }
     let mut capsules = worms::capsules(&world.worms, &positions, &anims);
+    // The aim aid for a lobbed weapon, if worm 0 is holding one.
+    if cfg.aim {
+        if let Some(path) = world.aim_path(0) {
+            capsules.extend(effects::trajectory(&path));
+        }
+    }
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
     capsules.extend(effects.capsules());
     let params = FrameParams {
@@ -866,6 +887,9 @@ impl Viewer {
             input.seq = self.seq;
             self.seq = self.seq.wrapping_add(1);
             self.world.step(&[input]);
+            // A trail is history: it has to be emitted per sim tick, not per
+            // frame, or it would grow with the frame rate.
+            self.effects.trails(&self.world.projectiles);
             self.landings();
             self.acc -= DT;
             ticks += 1;
@@ -1069,6 +1093,13 @@ impl Viewer {
         }
 
         let mut capsules = worms::capsules(&self.world.worms, &draw_pos, &self.anims);
+        // The aim aid comes before the effects so a busy fight trims smoke and
+        // sparks, not the marker the player is looking at.
+        if !self.fly {
+            if let Some(path) = self.world.aim_path(0) {
+                capsules.extend(effects::trajectory(&path));
+            }
+        }
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
         capsules.extend(self.effects.capsules());
         // Show where a dig would land (or, flying, where the brush would).

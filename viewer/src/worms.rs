@@ -127,7 +127,7 @@ struct Gun {
 }
 
 impl Gun {
-    fn new(hand: Vec3, fwd: Vec3, recoil: f32, scale: f32) -> Gun {
+    fn new(hand: Vec3, fwd: Vec3, back: f32, rise: f32, scale: f32) -> Gun {
         // A zero aim would collapse every offset, so fall back to straight ahead.
         let fwd = if fwd.length_squared() > 1.0e-8 { fwd.normalize() } else { Vec3::Z };
         let mut side = fwd.cross(Vec3::Y);
@@ -136,7 +136,12 @@ impl Gun {
         }
         let side = side.normalize();
         let up = side.cross(fwd).normalize();
-        Gun { hand, fwd, side, up, s: scale, back: -fwd * recoil }
+        // Muzzle rise: the whole gun pivots about the hand, so the barrel tips
+        // up while the stock comes back. Without it the gun only slides, which
+        // reads as a prop on rails.
+        let (s, c) = rise.sin_cos();
+        let (fwd, up) = (fwd * c + up * s, up * c - fwd * s);
+        Gun { hand, fwd, side, up, s: scale, back: -fwd * back }
     }
 
     fn at(&self, t: f32, x: f32, y: f32) -> Vec3 {
@@ -210,21 +215,52 @@ impl Gun {
     }
 }
 
-/// The gun each weapon becomes: an oversized, distinct silhouette assembled from
-/// the same three analytic primitives, so a piece costs one cheap closed-form
-/// raycast and no new shader code is needed.
-///
-/// Weapons are pure eye-candy: none casts a shadow (`false` everywhere below) and
-/// none exists in the sim (the projectile leaves the sim's hand, not these
-/// shapes), so the only cost is drawing them.
-///
-/// The layout is written in a local frame: `t` along the barrel from the hand,
-/// `x` sideways, `y` up, in metres. One scale multiplies every length, so the
-/// whole arsenal stays in proportion as the worm grows.
-fn weapon(id: u8, hand: Vec3, fwd: Vec3, recoil: f32, rs: f32, colour: Vec3, out: &mut Vec<DrawPrim>) {
+/// How hard each weapon kicks: metres of travel back through the hand and
+/// radians of muzzle climb at the instant of the shot. Heavy weapons kick slow
+/// and far; the blaster barely moves, which is what makes the big ones feel big.
+fn recoil_style(id: u8) -> (f32, f32) {
+    match id {
+        NOVA => (0.20, 0.20),
+        ROCKET => (0.16, 0.16),
+        RAILGUN => (0.14, 0.11),
+        CLUSTER => (0.11, 0.09),
+        SWARM => (0.09, 0.06),
+        BOUNCER => (0.07, 0.06),
+        TELEPORT => (0.07, 0.06),
+        BLASTER => (0.06, 0.05),
+        BOMB => (0.05, 0.04),
+        BUILD | TRACTOR => (0.035, 0.02),
+        _ => (0.05, 0.04),
+    }
+}
+
+/// The recoil envelope: 1 at the shot, then a damped bounce back through rest
+/// and gone in half a second. A plain linear decay reads as the gun being
+/// pulled away; a spring reads as a kick.
+fn recoil_curve(age: f32) -> f32 {
+    if age >= 0.50 {
+        return 0.0;
+    }
+    (-age * 9.0).exp() * (age * 20.0).cos()
+}
+
+/// One weapon: an oversized, distinct silhouette made of the same primitives
+/// as the body. `kick_back` and `kick_rise` are the current recoil (metres and
+/// radians); they do not affect where the sim starts the shot, only how the
+/// gun is drawn at this instant.
+fn weapon(
+    id: u8,
+    hand: Vec3,
+    fwd: Vec3,
+    kick_back: f32,
+    kick_rise: f32,
+    rs: f32,
+    colour: Vec3,
+    out: &mut Vec<DrawPrim>,
+) {
     // A touch larger than the worm's scale. R&C guns are chunky; a weapon that
     // is small next to the character reads as a toy.
-    let g = Gun::new(hand, fwd, recoil * 1.5, rs * 1.25);
+    let g = Gun::new(hand, fwd, kick_back, kick_rise, rs * 1.25);
     // The worm's own colour survives as a small stripe, so you can still tell
     // whose gun is whose.
     let trim = colour;
@@ -417,6 +453,12 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         let tumble = action == Action::Tumble;
         let dig = worm.digging;
 
+        // Recoil: how hard this gun kicks, and how far into the kick we are.
+        // The clock lives in `Anim`, so it is the same curve the face uses.
+        let gun_id = worm.weapons[worm.current].id;
+        let (kick_back, kick_rise) = recoil_style(gun_id);
+        let kick = recoil_curve(anim.fire);
+
         let mut pose = Pose::default();
         pose.lean = match action {
             Action::Climb => 0.45,
@@ -465,6 +507,10 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         } else if rope {
             pose.roll = (anim.clock * 1.8).sin() * 0.10;
         }
+        // A shot rocks the whole body back from the waist. It is small next to
+        // the gun's own kick, but it is what stops the arm looking like a stick
+        // waving a prop about.
+        pose.lean -= kick_rise * 0.28 * kick;
 
         let rig = Rig::new(pos, worm.face_yaw, &pose, rs);
 
@@ -489,8 +535,8 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         // make the segmentation read even on the flat toon bands. A narrow body
         // and a big head is the Dr Nefarious silhouette: it makes the gun beside
         // it look enormous.
-        let body_y = [0.34, 0.80, 1.17, 1.50];
-        let body_r = [0.36, 0.32, 0.27, 0.22];
+        let body_y = [0.28, 0.76, 1.15, 1.50];
+        let body_r = [0.30, 0.26, 0.23, 0.20];
         let mut prev = rig.at(sway(0.0), body_y[0] + lift, surge(0.0));
         for k in 1..body_y.len() {
             let t = k as f32 / (body_y.len() - 1) as f32;
@@ -636,10 +682,13 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         } else {
             let swing = anim.phase.sin() * 0.15 * run;
             (
-                Vec3::new(-0.50, 1.02, 0.10 + swing),
-                Vec3::new(0.60, 1.15 + 0.03 * run, 0.26),
+                Vec3::new(-0.56, 1.02, 0.10 + swing),
+                Vec3::new(0.72, 1.15 + 0.03 * run, 0.26),
             )
         };
+        // The kick travels through the arm: the hand snaps back and up, and the
+        // spring brings it forward past rest a moment later.
+        let hand_r = hand_r - look * (kick_back * 0.55 * kick) + Vec3::Y * (kick_rise * 0.10 * kick);
         let shoulder_l = Vec3::new(-0.30, 1.18, 0.02);
         let shoulder_r = Vec3::new(0.30, 1.18, 0.02);
         let arm = darken(colour, 0.84);
@@ -667,9 +716,20 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         // closed-form raycast per piece. `fwd` is the aim in the rig's rotated
         // frame, so the gun flips with the body on a double jump.
         let hand_r_world = rig.at(hand_r.x, hand_r.y, hand_r.z);
-        let recoil = ((0.12 - anim.fire) / 0.12).clamp(0.0, 1.0) * 0.10;
         let fwd = (rig.right * look.x + rig.up * look.y + rig.face * look.z).normalize_or_zero();
-        weapon(worm.weapons[worm.current].id, hand_r_world, fwd, recoil, rs, colour, &mut out);
+        // The gun itself travels the rest of the kick, and the muzzle climbs as
+        // it does. The hand above took the first half, so the arm compresses
+        // instead of the gun sliding through the glove.
+        weapon(
+            gun_id,
+            hand_r_world,
+            fwd,
+            kick_back * 0.45 * kick,
+            kick_rise * kick,
+            rs,
+            colour,
+            &mut out,
+        );
 
         // Tail: two tapering segments behind the body, wagging out of phase.
         // It is the clearest cue for which way the body faces.
@@ -926,6 +986,38 @@ mod tests {
         let anims: Vec<Anim> = worms.iter().map(|_| Anim::default()).collect();
         let caps = capsules(&worms, &positions, &anims);
         assert!(caps.len() <= crate::renderer::MAX_CAPSULES, "{} capsules", caps.len());
+    }
+
+    #[test]
+    fn recoil_kicks_then_settles() {
+        assert!((recoil_curve(0.0) - 1.0).abs() < 1.0e-6, "the shot starts at full kick");
+        assert!(recoil_curve(0.10) < 0.4, "it comes back quickly");
+        assert!(recoil_curve(0.20) < 0.0, "then overshoots forward, like a spring");
+        assert_eq!(recoil_curve(0.50), 0.0);
+        assert_eq!(recoil_curve(2.0), 0.0);
+    }
+
+    #[test]
+    fn the_big_guns_kick_harder_than_the_blaster() {
+        assert!(recoil_style(NOVA).0 > recoil_style(ROCKET).0);
+        assert!(recoil_style(ROCKET).0 > recoil_style(BLASTER).0);
+        assert!(recoil_style(BLASTER).0 > 0.0);
+    }
+
+    #[test]
+    fn a_recoiling_gun_is_still_finite() {
+        let mut w = worm(Action::Idle, true);
+        w.current = ROCKET as usize;
+        let pos = w.pos;
+        let mut anim = Anim::default();
+        anim.fired();
+        for age in [0.0, 0.02, 0.1, 0.2, 0.4] {
+            anim.fire = age;
+            let caps = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
+            for c in &caps {
+                assert!(sane(c), "recoil at {age} s");
+            }
+        }
     }
 
     #[test]

@@ -36,7 +36,7 @@ const HAND_HEIGHT: f32 = 1.15;
 /// How far out to the body's right and forward the gun hand sits. These are the
 /// viewer's standing arm pose, repeated here because the sim decides where a
 /// shot starts (and that has to be the barrel, not the chest).
-const HAND_RIGHT: f32 = 0.60;
+const HAND_RIGHT: f32 = 0.72;
 const HAND_FORWARD: f32 = 0.26;
 /// Pattern: Spatial approximation. The collision shape is a capsule, tested as
 /// three spheres up its axis (feet, middle, head). A sphere against a distance

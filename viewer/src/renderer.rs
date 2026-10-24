@@ -81,22 +81,22 @@ pub const MAX_CAPSULES: usize = 256;
 #[derive(Clone, Copy)]
 pub enum DrawPrim {
     /// A line segment swept by a sphere (rounded ends).
-    Capsule { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool },
+    Capsule { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool, inkless: bool },
     /// A line segment swept by a disc (flat ends), for a crisp gun barrel.
-    Cylinder { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool },
+    Cylinder { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool, inkless: bool },
     /// A hard-edged box, long axis along `forward`, its "up" taken from world up.
-    Cuboid { centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool, glow: bool },
+    Cuboid { centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool, glow: bool, inkless: bool },
 }
 
 impl DrawPrim {
     pub fn capsule(a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool) -> DrawPrim {
-        DrawPrim::Capsule { a, b, radius, colour, shadow, glow: false }
+        DrawPrim::Capsule { a, b, radius, colour, shadow, glow: false, inkless: false }
     }
     pub fn cylinder(a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool) -> DrawPrim {
-        DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: false }
+        DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: false, inkless: false }
     }
     pub fn cuboid(centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool) -> DrawPrim {
-        DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: false }
+        DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: false, inkless: false }
     }
 
     /// Make it self-lit: the shader skips shading and draws the colour flat and
@@ -104,14 +104,31 @@ impl DrawPrim {
     /// painted plastic.
     pub fn glowing(self) -> DrawPrim {
         match self {
-            DrawPrim::Capsule { a, b, radius, colour, shadow, .. } => {
-                DrawPrim::Capsule { a, b, radius, colour, shadow, glow: true }
+            DrawPrim::Capsule { a, b, radius, colour, shadow, inkless, .. } => {
+                DrawPrim::Capsule { a, b, radius, colour, shadow, glow: true, inkless }
             }
-            DrawPrim::Cylinder { a, b, radius, colour, shadow, .. } => {
-                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: true }
+            DrawPrim::Cylinder { a, b, radius, colour, shadow, inkless, .. } => {
+                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: true, inkless }
             }
-            DrawPrim::Cuboid { centre, half, forward, colour, shadow, .. } => {
-                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: true }
+            DrawPrim::Cuboid { centre, half, forward, colour, shadow, inkless, .. } => {
+                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: true, inkless }
+            }
+        }
+    }
+
+    /// Draw it without an ink outline. Screen-space aids and soft smoke should
+    /// not get the same black rim as a solid object: at a distance the outline
+    /// is wider than the shape, and a glowing dot turns into a dark pebble.
+    pub fn inkless(self) -> DrawPrim {
+        match self {
+            DrawPrim::Capsule { a, b, radius, colour, shadow, glow, .. } => {
+                DrawPrim::Capsule { a, b, radius, colour, shadow, glow, inkless: true }
+            }
+            DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, .. } => {
+                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, inkless: true }
+            }
+            DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, .. } => {
+                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, inkless: true }
             }
         }
     }
@@ -131,6 +148,14 @@ impl DrawPrim {
             DrawPrim::Capsule { glow, .. }
             | DrawPrim::Cylinder { glow, .. }
             | DrawPrim::Cuboid { glow, .. } => *glow,
+        }
+    }
+
+    fn is_inkless(&self) -> bool {
+        match self {
+            DrawPrim::Capsule { inkless, .. }
+            | DrawPrim::Cylinder { inkless, .. }
+            | DrawPrim::Cuboid { inkless, .. } => *inkless,
         }
     }
 
@@ -245,10 +270,17 @@ fn tile_masks(cam: &Camera, aspect: f32, prims: &[&DrawPrim]) -> [[u32; 4]; TILE
 }
 
 /// Pack a `DrawPrim` into the GPU's uniform layout (see `struct Prim` in
-/// shaders.rs). The kind is stashed in the colour's alpha channel and the
-/// self-lit flag in `c.w` (the only float every kind leaves free).
+/// shaders.rs). The kind is stashed in the colour's alpha channel and the draw
+/// flags in `c.w` (the only float every kind leaves free): bit 0 = self-lit,
+/// bit 1 = no ink outline.
 fn pack(c: &DrawPrim) -> GpuPrim {
-    let glow = if c.glow() { 1.0 } else { 0.0 };
+    let mut flags = 0.0;
+    if c.glow() {
+        flags += 1.0;
+    }
+    if c.is_inkless() {
+        flags += 2.0;
+    }
     let (a, b, radius, colour, kind) = match *c {
         DrawPrim::Capsule { a, b, radius, colour, .. } => (a, b, radius, colour, KIND_CAPSULE),
         DrawPrim::Cylinder { a, b, radius, colour, .. } => (a, b, radius, colour, KIND_CYLINDER),
@@ -256,7 +288,7 @@ fn pack(c: &DrawPrim) -> GpuPrim {
             return GpuPrim {
                 a: centre.extend(0.0).to_array(),
                 b: half.extend(half.length()).to_array(),
-                c: forward.normalize_or_zero().extend(glow).to_array(),
+                c: forward.normalize_or_zero().extend(flags).to_array(),
                 colour: colour.extend(KIND_CUBOID).to_array(),
             };
         }
@@ -264,7 +296,7 @@ fn pack(c: &DrawPrim) -> GpuPrim {
     GpuPrim {
         a: a.extend(radius).to_array(),
         b: b.extend(radius + (b - a).length() * 0.5).to_array(),
-        c: [0.0, 0.0, 0.0, glow],
+        c: [0.0, 0.0, 0.0, flags],
         colour: colour.extend(kind).to_array(),
     }
 }
@@ -1090,6 +1122,18 @@ mod tests {
 
     fn caps(a: Vec3, b: Vec3, radius: f32) -> DrawPrim {
         DrawPrim::capsule(a, b, radius, Vec3::ONE, true)
+    }
+
+    #[test]
+    fn draw_flags_reach_the_shader() {
+        let plain = pack(&caps(Vec3::ZERO, Vec3::Y, 0.2));
+        assert_eq!(plain.c[3], 0.0, "lit, inked");
+        let hot = pack(&caps(Vec3::ZERO, Vec3::Y, 0.2).glowing());
+        assert_eq!(hot.c[3], 1.0, "self-lit");
+        let aid = pack(&caps(Vec3::ZERO, Vec3::Y, 0.2).glowing().inkless());
+        assert_eq!(aid.c[3], 3.0, "self-lit and no outline");
+        let smoke = pack(&caps(Vec3::ZERO, Vec3::Y, 0.2).inkless());
+        assert_eq!(smoke.c[3], 2.0, "no outline");
     }
 
     fn bit_set(masks: &[[u32; 4]], tx: usize, ty: usize, bit: usize) -> bool {
