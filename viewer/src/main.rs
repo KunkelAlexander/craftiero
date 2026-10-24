@@ -17,11 +17,12 @@ mod shaders;
 mod world;
 mod worms;
 
-use camera::Camera;
+use camera::{Camera, CameraFeel, FOLLOW_DIST};
 use effects::Effects;
 use glam::{Vec2, Vec3};
 use renderer::{FrameParams, Gpu, Offscreen, Renderer};
 use sdf::{Grid, Op, Shape};
+use sim::weapons::{NOVA, ROCKET};
 use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, WEAPONS};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -174,10 +175,23 @@ fn in_world(grid: &Grid, p: Vec3) -> bool {
     p.cmpge(Vec3::ZERO).all() && p.cmple(s).all()
 }
 
-/// The third-person camera for a worm with its feet at `feet`. Used for drawing
-/// and for the aim, so the two cannot drift apart.
-fn follow_worm(cam: &mut Camera, feet: Vec3, grid: &Grid) {
-    cam.follow(feet + Vec3::Y * (EYE_HEIGHT + 0.2), 5.0, grid);
+/// The point the third-person camera orbits: just above the worm's eye.
+/// `CameraFeel` smooths this point, so the view lags the body instead of being
+/// welded to it (see `camera.rs`).
+fn camera_target(feet: Vec3) -> Vec3 {
+    feet + Vec3::Y * (EYE_HEIGHT + 0.2)
+}
+
+/// The impact speed of a worm that has just landed, if it fell hard enough to
+/// matter. 4 m/s is about a 0.8 m drop; walking down a bump makes no dust.
+/// Split out of `Viewer::landings` so the threshold is testable without a
+/// window.
+fn landing_impact(was_grounded: bool, on_ground: bool, fall: f32) -> Option<f32> {
+    if was_grounded || !on_ground || fall > -4.0 {
+        None
+    } else {
+        Some(-fall)
+    }
 }
 
 /// The point the crosshair is on, if the camera is inside the world.
@@ -523,6 +537,15 @@ struct Viewer {
     seq: u32,
     /// Fireballs and beams, started by the sim's events.
     effects: Effects,
+    /// The camera's lag, landing dip, shake and shot kick. It moves the clean
+    /// camera and adds its cosmetic offsets only when drawing (see `camera.rs`).
+    feel: CameraFeel,
+    /// Horizontal distance walked since the last footstep puff, per worm.
+    step_dist: Vec<f32>,
+    /// (was grounded, vertical speed) before a tick, per worm. Landing impact
+    /// has to be measured inside the fixed-step loop: after `land` the sim has
+    /// already flattened `vel.y`, so the renderer would only ever see zero.
+    before: Vec<(bool, f32)>,
     /// The weapon worm 0 holds (an id, see `sim::weapons`).
     weapon: u8,
     /// The M1 mode: a free camera and the brush instead of the worm.
@@ -597,6 +620,15 @@ impl Viewer {
         let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
         let anims = vec![worms::Anim::default(); world.worms.len()];
+        let worms = world.worms.len();
+        // An explicit --cam means "look at this spot", which only the free camera can.
+        let fly = cfg.cam.is_some();
+        let mut camera = camera_from(cfg);
+        if !fly {
+            // Start already behind the worm; otherwise the first frame would
+            // ease in from the spawn overview.
+            camera.follow(camera_target(world.worms[0].pos), FOLLOW_DIST, &world.grid);
+        }
         let now = Instant::now();
         Viewer {
             window,
@@ -610,10 +642,12 @@ impl Viewer {
             anims,
             seq: 0,
             effects: Effects::default(),
+            feel: CameraFeel::default(),
+            step_dist: vec![0.0; worms],
+            before: vec![(true, 0.0); worms],
             weapon: 0,
-            // An explicit --cam means "look at this spot", which only the free camera can.
-            fly: cfg.cam.is_some(),
-            camera: camera_from(cfg),
+            fly,
+            camera,
             keys: HashSet::new(),
             lmb: false,
             rmb: false,
@@ -738,12 +772,25 @@ impl Viewer {
                     if self.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
                 self.surface.configure(&self.gpu.device, &self.surface_cfg);
             }
-            KeyCode::KeyF => self.fly = !self.fly,
+            KeyCode::KeyF => {
+                self.fly = !self.fly;
+                if !self.fly {
+                    // Coming back from the fly camera: put the worm camera
+                    // where it belongs instead of sweeping in from the sky.
+                    let target = camera_target(self.world.worms[0].pos);
+                    self.camera.follow(target, FOLLOW_DIST, &self.world.grid);
+                    self.feel.snap(target);
+                }
+            }
             KeyCode::KeyR => {
                 self.world = World::new(world::build(), &world::SPAWNS, SEED);
                 self.effects = Effects::default();
+                self.feel = CameraFeel::default();
+                let n = self.world.worms.len();
+                self.step_dist = vec![0.0; n];
+                self.before = vec![(true, 0.0); n];
                 self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
-                self.anims = vec![worms::Anim::default(); self.world.worms.len()];
+                self.anims = vec![worms::Anim::default(); n];
                 self.renderer = Renderer::new(
                     &self.gpu,
                     self.surface_cfg.format,
@@ -770,12 +817,10 @@ impl Viewer {
         }
         let held = |k| self.keys.contains(&k);
         let axis = |plus, minus| (if held(plus) { 1.0 } else { 0.0 }) - (if held(minus) { 1.0 } else { 0.0 });
-        // Pose the camera from where the worm is now, rather than using last
-        // frame's position, so the aim does not trail the reticle by a frame
-        // while running. The renderer follows the smoothed position, which is
-        // within half a tick of this.
-        let mut aim_cam = self.camera;
-        follow_worm(&mut aim_cam, worm.pos, &self.world.grid);
+        // The camera now lags the worm (see `camera.rs`), so aim from the camera
+        // the player is actually looking through. Re-posing it at the worm's
+        // current position would put the shot where the reticle is not.
+        let aim_cam = self.camera;
         Input {
             seq: 0, // set per tick in `update`
             move_dir: Vec2::new(axis(KeyCode::KeyD, KeyCode::KeyA), axis(KeyCode::KeyW, KeyCode::KeyS)),
@@ -805,9 +850,14 @@ impl Viewer {
         let mut ticks = 0;
         while self.acc >= DT {
             self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
+            // Landing impact must be read before the tick: `movement::land`
+            // clears `vel.y`, so afterwards every landing looks like zero.
+            self.before.clear();
+            self.before.extend(self.world.worms.iter().map(|w| (w.on_ground, w.vel.y)));
             input.seq = self.seq;
             self.seq = self.seq.wrapping_add(1);
             self.world.step(&[input]);
+            self.landings();
             self.acc -= DT;
             ticks += 1;
         }
@@ -819,10 +869,49 @@ impl Viewer {
         // terrain edits: it asks the grid which chunks changed.
         for event in self.world.drain_events() {
             self.effects.add(&event);
+            // Camera dynamics: a blast pushes the view, a shot kicks it back,
+            // a hit twitches it and a death is the biggest thump. All of it is
+            // applied to the drawing copy only (see `camera.rs`), so none of it
+            // can steer the aim.
+            match event {
+                Event::Explosion { pos, radius } => {
+                    let away = (pos - self.camera.pos).length();
+                    let falloff = (1.0 - away / 28.0).clamp(0.0, 1.0);
+                    self.feel.shake((0.012 + radius * 0.008) * falloff * falloff);
+                }
+                Event::Shot { worm, weapon, .. } => {
+                    if worm == 0 {
+                        let kick = match weapon {
+                            ROCKET => 0.045,
+                            NOVA => 0.060,
+                            _ => 0.015,
+                        };
+                        let dir = self.world.worms[0].aim_dir();
+                        self.feel.kick(dir, kick);
+                    }
+                }
+                Event::Hit { victim, pos, .. } => {
+                    let away = (pos - self.camera.pos).length();
+                    let amount = if victim == 0 { 0.030 } else { 0.018 };
+                    self.feel.shake(amount * (1.0 - away / 18.0).clamp(0.0, 1.0));
+                }
+                Event::Died { victim, pos, .. } => {
+                    let away = (pos - self.camera.pos).length();
+                    let amount = if victim == 0 { 0.080 } else { 0.045 };
+                    self.feel.shake(amount * (1.0 - away / 30.0).clamp(0.0, 1.0));
+                }
+                _ => {}
+            }
             // A worm the rules moved (a respawn, a teleport) must not be drawn
-            // sliding there from where it stood.
+            // sliding there from where it stood, and the camera must not fly
+            // across the map after it.
             if let Event::Respawned { worm } | Event::Teleported { worm, .. } = event {
-                self.prev_pos[worm as usize] = self.world.worms[worm as usize].pos;
+                let at = self.world.worms[worm as usize].pos;
+                self.prev_pos[worm as usize] = at;
+                self.feel.snap(camera_target(at));
+                if let Some(d) = self.step_dist.get_mut(worm as usize) {
+                    *d = 0.0;
+                }
                 if let Some(anim) = self.anims.get_mut(worm as usize) {
                     *anim = worms::Anim::default();
                 }
@@ -838,6 +927,23 @@ impl Viewer {
         if n > 0 {
             self.sync_ms = t.elapsed().as_secs_f64() * 1000.0;
             self.synced = n;
+        }
+    }
+
+    /// What the sim cannot tell the viewer afterwards: which worms touched down
+    /// this tick, and how fast. Dust for every worm, a camera dip for the player
+    /// only (the camera follows worm 0).
+    fn landings(&mut self) {
+        for i in 0..self.before.len().min(self.world.worms.len()) {
+            let (was_grounded, fall) = self.before[i];
+            let w = &self.world.worms[i];
+            let Some(impact) = landing_impact(was_grounded, w.on_ground, fall) else {
+                continue;
+            };
+            self.effects.dust(w.pos + Vec3::Y * 0.1, impact);
+            if i == 0 {
+                self.feel.land(impact);
+            }
         }
     }
 
@@ -909,15 +1015,46 @@ impl Viewer {
         let draw_pos: Vec<Vec3> =
             self.world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
         // Speed widens the view: the world streams past faster at the edges,
-        // which is a cheap way to make fast movement FEEL fast.
+        // which is a cheap way to make fast movement FEEL fast. Horizontal
+        // speed only: a straight-up jump must not read as a speed boost (the
+        // sim's jump rule is the same, see `movement.rs`).
         const CALM_SPEED: f32 = 6.0; // no widening up to this speed
-        let speed = if self.fly { 0.0 } else { self.world.worms[0].vel.length() };
+        let speed = if self.fly { 0.0 } else { Vec2::new(self.world.worms[0].vel.x, self.world.worms[0].vel.z).length() };
         let widen = ((speed - CALM_SPEED) / 12.0).clamp(0.0, 1.0);
         let target_fov = (70.0 + 14.0 * widen).to_radians();
         self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
-        if !self.fly {
-            follow_worm(&mut self.camera, draw_pos[0], &self.world.grid);
+        // The camera follows a smoothed point and adds its cosmetic offsets to
+        // a copy. `self.camera` stays the clean camera used for aim.
+        let render_camera = if self.fly {
+            self.camera
+        } else {
+            self.feel.update(dt, &mut self.camera, camera_target(draw_pos[0]), FOLLOW_DIST, &self.world.grid);
+            self.feel.render(self.camera)
+        };
+
+        // Footsteps: a puff every couple of metres, so running reads as
+        // contact with the ground even though the worm has no legs.
+        if self.step_dist.len() != self.world.worms.len() {
+            self.step_dist.resize(self.world.worms.len(), 0.0);
         }
+        if !self.fly {
+            for i in 0..self.world.worms.len() {
+                let w = &self.world.worms[i];
+                let speed = Vec3::new(w.vel.x, 0.0, w.vel.z).length();
+                if !w.alive || !w.on_ground || w.digging || speed < 4.0 {
+                    self.step_dist[i] = 0.0;
+                    continue;
+                }
+                self.step_dist[i] += speed * dt;
+                if self.step_dist[i] >= 2.2 {
+                    self.step_dist[i] = 0.0;
+                    let at = w.pos;
+                    let dir = Vec3::new(w.vel.x, 0.0, w.vel.z) / speed;
+                    self.effects.footstep(at, dir);
+                }
+            }
+        }
+
         let mut capsules = worms::capsules(&self.world.worms, &draw_pos, &self.anims);
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
         capsules.extend(self.effects.capsules());
@@ -944,7 +1081,7 @@ impl Viewer {
         };
         let view = frame.texture.create_view(&Default::default());
         let params = FrameParams {
-            camera: &self.camera,
+            camera: &render_camera,
             capsules: &capsules,
             brush,
             time: (now - self.started).as_secs_f32(),
@@ -1144,5 +1281,13 @@ mod tests {
         let cam = cam(Vec3::new(16.0, 16.0, 23.5)); // 0.5 m from the wall
         let eye = Vec3::new(15.25, 15.65, 14.0);
         assert!(crosshair_aim(&grid, &cam, eye).is_none());
+    }
+
+    #[test]
+    fn only_a_real_fall_counts_as_a_landing() {
+        assert_eq!(landing_impact(false, true, -9.0), Some(9.0));
+        assert_eq!(landing_impact(true, true, -9.0), None, "already on the ground");
+        assert_eq!(landing_impact(false, false, -9.0), None, "still in the air");
+        assert_eq!(landing_impact(false, true, -2.0), None, "a step down, no dust");
     }
 }

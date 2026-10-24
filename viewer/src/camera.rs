@@ -65,12 +65,228 @@ impl Camera {
     }
 }
 
+/// The camera's motion: the part of "feel" that is not aim.
+///
+/// PS2-era third-person games keep the camera a beat behind the character. It
+/// eases after the body, gets pulled in by rock, dips when the worm lands and
+/// shakes a little when something explodes. That lag is what makes the camera
+/// feel like it has weight instead of being welded to the worm.
+///
+/// Only `pos` is animated here. `yaw` and `pitch` stay the player's aim, and
+/// the shake/recoil offsets are added to a *copy* for drawing, so a cosmetic
+/// kick can never feed back into the shot the next tick.
+pub struct CameraFeel {
+    /// Smoothed point the camera orbits (just above the worm's eye).
+    focus: Vec3,
+    /// Distance along the shoulder-offset ray. Rock pulls it in at once;
+    /// clear air eases it back out, so a tunnel does not pop the view.
+    dist: f32,
+    /// Landing dip in metres (negative is down) and its speed.
+    dip: f32,
+    dip_vel: f32,
+    /// Shake amplitude in metres, and a clock for the wobble.
+    shake: f32,
+    clock: f32,
+    /// Cosmetic shot kick and its spring speed.
+    recoil: Vec3,
+    recoil_vel: Vec3,
+    /// The first update snaps instead of easing from nowhere.
+    started: bool,
+}
+
+/// How far behind the worm the camera sits. 5 m is the M2 debug view; much
+/// larger starts to read as a spectator camera rather than Ratchet's.
+pub const FOLLOW_DIST: f32 = 5.0;
+/// 70 ms of lag: enough to see the camera react, not enough to trail the
+/// crosshair. The old code recomputed the camera every frame, which is why
+/// running felt like the view was glued to the worm.
+const FOLLOW_TAU: f32 = 0.07;
+/// Easing back out after a wall is slower than the lag, so a camera pulled
+/// in by a tunnel does not rush out again the moment the wall ends.
+const DIST_OUT_TAU: f32 = 0.18;
+/// A landing dip is a spring, not a slide: it goes down and comes back with
+/// a little overshoot. About 7 cm on a full jump, capped at 12 cm.
+const DIP_PER_SPEED: f32 = 0.006;
+const DIP_MAX: f32 = 0.12;
+const DIP_SPRING: f32 = 90.0;
+const DIP_DAMP: f32 = 16.0;
+/// Shake decays fast; a rocket at your feet is over before the next shot.
+const SHAKE_DECAY: f32 = 6.0;
+const SHAKE_MAX: f32 = 0.12;
+/// The shot kick is a stiff spring so it is gone between blaster rounds.
+const RECOIL_SPRING: f32 = 180.0;
+const RECOIL_DAMP: f32 = 22.0;
+const RECOIL_MAX: f32 = 0.07;
+
+impl Default for CameraFeel {
+    fn default() -> CameraFeel {
+        CameraFeel {
+            focus: Vec3::ZERO,
+            dist: 0.0,
+            dip: 0.0,
+            dip_vel: 0.0,
+            shake: 0.0,
+            clock: 0.0,
+            recoil: Vec3::ZERO,
+            recoil_vel: Vec3::ZERO,
+            started: false,
+        }
+    }
+}
+
+impl CameraFeel {
+    /// Move the camera one frame. `target` is the point to orbit (the worm's
+    /// eye); `dist` is the unobstructed follow distance; `cam.yaw/pitch` are
+    /// already the player's aim.
+    pub fn update(&mut self, dt: f32, cam: &mut Camera, target: Vec3, dist: f32, grid: &Grid) {
+        let dt = dt.clamp(0.0, 0.1);
+        if !self.started {
+            self.focus = target;
+            self.started = true;
+        }
+        // Frame-rate independent exponential smoothing, so 60 and 144 Hz
+        // players get the same lag in seconds.
+        self.focus = smooth(self.focus, target, FOLLOW_TAU, dt);
+        // A lagging focus can cut a corner through a thin wall. Never let the
+        // camera orbit a point inside rock: jump the focus to the worm and let
+        // the distance limit handle the wall. This is rare (the lag is 0.8 m
+        // at full speed) and much better than one frame of flat rock.
+        if grid.sample(self.focus) < 0.2 {
+            self.focus = target;
+        }
+
+        // Where the camera would sit with nothing in the way. `follow` also
+        // does the rock raycast, so the collision test and the desired
+        // position cannot disagree.
+        let mut probe = *cam;
+        probe.follow(self.focus, dist, grid);
+        let offset = probe.pos - self.focus;
+        let free = offset.length();
+        if free > 1.0e-4 {
+            let direction = offset / free;
+            // A wall is an immediate fact: snap in this frame, or the camera
+            // spends a few frames inside the rock. Easing out is safe.
+            self.dist = if free < self.dist || self.dist <= 0.0 {
+                free
+            } else {
+                smooth_scalar(self.dist, free, DIST_OUT_TAU, dt)
+            };
+            cam.pos = self.focus + direction * self.dist;
+        } else {
+            cam.pos = self.focus;
+        }
+
+        // Landing dip: a damped spring. Negative `dip` lowers the eye, then
+        // the camera comes back up and overshoots by a hair.
+        self.dip_vel += (-DIP_SPRING * self.dip - DIP_DAMP * self.dip_vel) * dt;
+        self.dip += self.dip_vel * dt;
+        cam.pos.y += self.dip;
+
+        self.clock += dt;
+        self.shake *= (-SHAKE_DECAY * dt).exp();
+        if self.shake < 1.0e-4 {
+            self.shake = 0.0;
+        }
+        self.recoil_vel += (-RECOIL_SPRING * self.recoil - RECOIL_DAMP * self.recoil_vel) * dt;
+        self.recoil += self.recoil_vel * dt;
+
+        // Keep the view inside the arena, like the fly camera does.
+        cam.pos.y = cam.pos.y.min(63.0);
+    }
+
+    /// The camera to draw with: the clean gameplay camera plus cosmetic shake
+    /// and recoil. Aim keeps using the clean copy, so these never steer a shot.
+    pub fn render(&self, cam: Camera) -> Camera {
+        let t = self.clock;
+        // Three incommensurate sines make a cheap, non-repeating wobble.
+        let wobble = Vec3::new(
+            (t * 37.0).sin() + 0.5 * (t * 61.0).sin(),
+            (t * 29.0 + 1.7).sin() + 0.5 * (t * 53.0 + 0.4).sin(),
+            (t * 41.0 + 3.1).sin(),
+        );
+        let mut out = cam;
+        // Shake in screen space, so the wobble reads the same whichever way
+        // the camera faces. A little depth too, like a hand-held camera.
+        let (right, up) = cam.right_up();
+        let offset = right * wobble.x + up * wobble.y + cam.forward() * (wobble.z * 0.5);
+        out.pos += offset * (self.shake * 0.66) + self.recoil;
+        out
+    }
+
+    /// The worm touched down at `impact` m/s downward. A bigger drop gives a
+    /// deeper dip, but even a jump only moves the view a few centimetres.
+    pub fn land(&mut self, impact: f32) {
+        if impact <= 3.0 {
+            return;
+        }
+        let dip = -((impact - 3.0) * DIP_PER_SPEED).min(DIP_MAX);
+        // A deeper dip already in progress wins; a second landing cannot
+        // cancel it by asking for a shallower one.
+        self.dip = self.dip.min(dip);
+    }
+
+    /// Add a shake, in metres. The strongest recent shake wins, so a blaster
+    /// a frame later cannot drown out the rocket that caused it.
+    pub fn shake(&mut self, metres: f32) {
+        self.shake = self.shake.max(metres.clamp(0.0, SHAKE_MAX));
+    }
+
+    /// A cosmetic kick opposite `dir`: a shot pushes the view back. This is
+    /// applied only when drawing, so holding the trigger cannot walk the aim.
+    pub fn kick(&mut self, dir: Vec3, metres: f32) {
+        self.recoil = (self.recoil - dir.normalize_or_zero() * metres).clamp_length_max(RECOIL_MAX);
+    }
+
+    /// Put the camera straight at `target` (a respawn or a teleport), so it
+    /// does not fly across the map after the worm.
+    pub fn snap(&mut self, target: Vec3) {
+        self.focus = target;
+        self.started = false;
+        self.dist = 0.0;
+        self.dip = 0.0;
+        self.dip_vel = 0.0;
+        self.shake = 0.0;
+        self.recoil = Vec3::ZERO;
+        self.recoil_vel = Vec3::ZERO;
+    }
+}
+
+fn smooth(current: Vec3, target: Vec3, tau: f32, dt: f32) -> Vec3 {
+    if tau <= 0.0 {
+        return target;
+    }
+    current.lerp(target, 1.0 - (-dt / tau).exp())
+}
+
+fn smooth_scalar(current: f32, target: f32, tau: f32, dt: f32) -> f32 {
+    if tau <= 0.0 {
+        return target;
+    }
+    current + (target - current) * (1.0 - (-dt / tau).exp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cam(yaw: f32, pitch: f32) -> Camera {
         Camera { pos: Vec3::ZERO, yaw, pitch, fov_y: 1.0 }
+    }
+
+    /// A spherical cave in a solid block: enough air for a 5 m camera arm.
+    fn cave(chunks: i32, radius: f32) -> (Grid, Vec3) {
+        use glam::IVec3;
+        use sdf::{Op, Shape};
+        let mut grid = Grid::new(IVec3::splat(chunks));
+        let c = Vec3::splat(chunks as f32 * 4.0 * 0.5);
+        grid.apply(Shape::Sphere { center: c, radius }, Op::Carve);
+        (grid, c)
+    }
+
+    fn update_many(feel: &mut CameraFeel, cam: &mut Camera, target: Vec3, grid: &Grid, n: usize) {
+        for _ in 0..n {
+            feel.update(1.0 / 60.0, cam, target, FOLLOW_DIST, grid);
+        }
     }
 
     #[test]
@@ -127,5 +343,93 @@ mod tests {
         // Looking at the far wall from right next to the near one.
         cam.follow(c - Vec3::Z * 3.5, 10.0, &grid);
         assert!(grid.sample(cam.pos) > 0.0, "the camera is in air, not in rock");
+    }
+
+    #[test]
+    fn the_feel_eases_after_the_worm_and_stays_out_of_rock() {
+        let (grid, mut c) = cave(8, 15.0);
+        let mut cam = Camera { pos: c + Vec3::Z * 12.0, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 120);
+        assert!(grid.sample(cam.pos) > 0.01, "the camera is in air");
+        assert!(cam.pos.z < c.z - 2.0, "behind the worm: {:?}", cam.pos - c);
+        assert!((cam.pos - c).length() > 4.0, "at the follow distance: {:?}", cam.pos - c);
+
+        // Move the target a metre sideways: the camera lags, then catches up.
+        let before = cam.pos;
+        c += Vec3::X;
+        feel.update(1.0 / 60.0, &mut cam, c, FOLLOW_DIST, &grid);
+        let moved = (cam.pos - before).length();
+        assert!(moved > 0.0 && moved < 0.5, "one frame of lag, not a snap: {moved}");
+        update_many(&mut feel, &mut cam, c, &grid, 120);
+        let d = (cam.pos - c).length();
+        assert!(d > 4.0 && d < 6.5, "caught up to the follow arm: {d}");
+    }
+
+    #[test]
+    fn rock_pulls_the_camera_in_at_once_and_it_eases_back_out() {
+        let (tight, c) = cave(4, 2.0);
+        let mut cam = Camera { pos: c, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        feel.update(1.0 / 60.0, &mut cam, c, FOLLOW_DIST, &tight);
+        let pulled = (cam.pos - c).length();
+        assert!(pulled < 2.5, "the wall pulls it in at once: {pulled}");
+        assert!(tight.sample(cam.pos) > 0.0, "never inside the rock");
+
+        let (open, _) = cave(4, 7.5);
+        feel.update(1.0 / 60.0, &mut cam, c, FOLLOW_DIST, &open);
+        let after = (cam.pos - c).length();
+        assert!(after > pulled + 0.01, "eases out, not snaps: {pulled} -> {after}");
+        assert!(after < FOLLOW_DIST + 1.0, "still easing: {after}");
+        update_many(&mut feel, &mut cam, c, &open, 120);
+        assert!((cam.pos - c).length() > 4.0, "back out: {:?}", cam.pos - c);
+    }
+
+    #[test]
+    fn a_landing_dips_the_view_and_returns() {
+        let (grid, c) = cave(8, 15.0);
+        let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 60);
+        let level = cam.pos.y;
+
+        feel.land(14.0);
+        feel.update(1.0 / 60.0, &mut cam, c, FOLLOW_DIST, &grid);
+        assert!(cam.pos.y < level - 0.01, "the view dips: {} vs {level}", cam.pos.y);
+        update_many(&mut feel, &mut cam, c, &grid, 120);
+        assert!((cam.pos.y - level).abs() < 0.005, "and comes back: {}", cam.pos.y);
+    }
+
+    #[test]
+    fn shake_and_kick_are_cosmetic_and_decay() {
+        let (grid, c) = cave(8, 15.0);
+        let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 60);
+
+        let clean = cam;
+        assert_eq!(feel.render(clean).pos, clean.pos, "nothing to add at rest");
+        feel.shake(0.08);
+        assert!((feel.render(clean).pos - clean.pos).length() > 1.0e-3);
+        // Let the shake die first, then check the kick on its own.
+        update_many(&mut feel, &mut cam, c, &grid, 120);
+        feel.kick(Vec3::X, 0.05);
+        let kicked = feel.render(clean);
+        assert!((kicked.pos - clean.pos).dot(Vec3::X) < -0.02, "back from the shot");
+        update_many(&mut feel, &mut cam, c, &grid, 180);
+        assert!((feel.render(clean).pos - clean.pos).length() < 1.0e-3, "gone again");
+    }
+
+    #[test]
+    fn a_snap_puts_the_camera_at_the_new_place_without_a_flight() {
+        let (grid, c) = cave(8, 15.0);
+        let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 60);
+
+        let far = c + Vec3::new(8.0, 0.0, 0.0);
+        feel.snap(far);
+        feel.update(1.0 / 60.0, &mut cam, far, FOLLOW_DIST, &grid);
+        assert!((cam.pos - far).length() < FOLLOW_DIST + 1.0, "there in one frame: {:?}", cam.pos - far);
     }
 }
