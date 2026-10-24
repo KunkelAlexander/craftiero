@@ -172,6 +172,12 @@ fn in_world(grid: &Grid, p: Vec3) -> bool {
     p.cmpge(Vec3::ZERO).all() && p.cmple(s).all()
 }
 
+/// The third-person camera for a worm with its feet at `feet`. Used for drawing
+/// and for the aim, so the two cannot drift apart.
+fn follow_worm(cam: &mut Camera, feet: Vec3, grid: &Grid) {
+    cam.follow(feet + Vec3::Y * (EYE_HEIGHT + 0.2), 5.0, grid);
+}
+
 /// The point the crosshair is on, if the camera is inside the world.
 fn aim_point(grid: &Grid, cam: &Camera) -> Option<Vec3> {
     if !in_world(grid, cam.pos) {
@@ -179,6 +185,32 @@ fn aim_point(grid: &Grid, cam: &Camera) -> Option<Vec3> {
     }
     let dir = cam.forward();
     grid.raycast(cam.pos, dir, 100.0).map(|t| cam.pos + dir * t)
+}
+
+/// The direction from the worm's eye to whatever the crosshair is on.
+///
+/// The camera sits over the shoulder, so its centre ray is not the eye ray: a
+/// shot along the raw look angles would land a shoulder-width to one side of
+/// the reticle. Aim at the point under the crosshair instead. With nothing in
+/// reach, the shot goes far along the camera ray.
+///
+/// Very close to the camera (a wall in your face after the camera has been
+/// pulled in by a tunnel) the point under the crosshair is almost beside the
+/// worm, and converging would swing the gun round. Fade the convergence out
+/// over the first few metres instead; at that range the reticle is on the wall
+/// either way.
+fn crosshair_aim(grid: &Grid, cam: &Camera, eye: Vec3) -> Option<Vec3> {
+    const NEAR: f32 = 1.0;
+    const FULL: f32 = 3.0;
+    const FAR: f32 = 100.0;
+    let dir = cam.forward();
+    let hit = aim_point(grid, cam).unwrap_or(cam.pos + dir * FAR);
+    let blend = (((hit - cam.pos).length() - NEAR) / (FULL - NEAR)).clamp(0.0, 1.0);
+    let to = (hit - eye).normalize_or_zero();
+    if blend <= 1.0e-3 || to == Vec3::ZERO {
+        return None;
+    }
+    Some(dir.lerp(to, blend).normalize_or_zero()).filter(|a| *a != Vec3::ZERO)
 }
 
 fn carve(grid: &mut Grid, at: Vec3, radius: f32) {
@@ -736,11 +768,20 @@ impl Viewer {
         }
         let held = |k| self.keys.contains(&k);
         let axis = |plus, minus| (if held(plus) { 1.0 } else { 0.0 }) - (if held(minus) { 1.0 } else { 0.0 });
+        // Pose the camera from where the worm is now, rather than using last
+        // frame's position, so the aim does not trail the reticle by a frame
+        // while running. The renderer follows the smoothed position, which is
+        // within half a tick of this.
+        let mut aim_cam = self.camera;
+        follow_worm(&mut aim_cam, worm.pos, &self.world.grid);
         Input {
             seq: 0, // set per tick in `update`
             move_dir: Vec2::new(axis(KeyCode::KeyD, KeyCode::KeyA), axis(KeyCode::KeyW, KeyCode::KeyS)),
             yaw: self.camera.yaw,
             pitch: self.camera.pitch,
+            // The camera is off the look ray, so tell the sim where the
+            // crosshair actually is (see `crosshair_aim`).
+            aim: crosshair_aim(&self.world.grid, &aim_cam, worm.eye()),
             jump: held(KeyCode::Space),
             dig: self.grabbed && held(KeyCode::ShiftLeft),
             rope: self.grabbed && self.rmb,
@@ -873,7 +914,7 @@ impl Viewer {
         let target_fov = (70.0 + 14.0 * widen).to_radians();
         self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
         if !self.fly {
-            self.camera.follow(draw_pos[0] + Vec3::Y * (EYE_HEIGHT + 0.2), 5.0, &self.world.grid);
+            follow_worm(&mut self.camera, draw_pos[0], &self.world.grid);
         }
         let mut capsules = worms::capsules(&self.world.worms, &draw_pos, &self.anims);
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
@@ -1058,4 +1099,48 @@ fn run_window(cfg: Config) {
     let event_loop = EventLoop::new().expect("cannot create the event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop.run_app(&mut App { cfg, viewer: None }).expect("event loop failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::IVec3;
+
+    /// A 32 m cube of rock with an 8 m cave in the middle: walls 8 m out.
+    fn cave() -> Grid {
+        let mut grid = Grid::new(IVec3::new(8, 8, 8));
+        grid.apply(Shape::Sphere { center: Vec3::splat(16.0), radius: 8.0 }, Op::Carve);
+        grid
+    }
+
+    fn cam(pos: Vec3) -> Camera {
+        Camera { pos, yaw: 0.0, pitch: 0.0, fov_y: 1.2 }
+    }
+
+    #[test]
+    fn the_shot_converges_on_the_crosshair() {
+        let grid = cave();
+        let cam = cam(Vec3::new(16.0, 16.0, 10.0)); // 14 m from the far wall
+        let eye = Vec3::new(15.25, 15.65, 14.0); // a shoulder left, a little below
+        let hit = aim_point(&grid, &cam).expect("the wall ahead");
+        assert!((hit - Vec3::new(16.0, 16.0, 24.0)).length() < 0.2, "crosshair on the wall: {hit:?}");
+
+        let aim = crosshair_aim(&grid, &cam, eye).expect("converges at this range");
+        let t = (hit.z - eye.z) / aim.z;
+        let landed = eye + aim * t;
+        assert!((landed - hit).length() < 0.05, "lands under the reticle: {landed:?} vs {hit:?}");
+        // The old behaviour, shooting along the look angles, misses sideways.
+        let straight = eye + cam.forward() * t;
+        assert!((straight - hit).length() > 0.5, "the shoulder offset is real: {:?}", straight - hit);
+    }
+
+    #[test]
+    fn the_aim_does_not_swing_round_at_point_blank_range() {
+        // The camera has been pulled right up to the wall, so the point under
+        // the crosshair is almost beside the worm: keep the look angles.
+        let grid = cave();
+        let cam = cam(Vec3::new(16.0, 16.0, 23.5)); // 0.5 m from the wall
+        let eye = Vec3::new(15.25, 15.65, 14.0);
+        assert!(crosshair_aim(&grid, &cam, eye).is_none());
+    }
 }

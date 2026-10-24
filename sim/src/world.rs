@@ -136,6 +136,10 @@ pub struct Worm {
     /// aiming somewhere else.
     pub yaw: f32,
     pub pitch: f32,
+    /// The direction the shot leaves along, when it is not `yaw`/`pitch`.
+    /// Zero means "no override: aim where the worm looks". The viewer sets
+    /// this when its camera is off the look ray (see `Input::aim`).
+    pub aim: Vec3,
     /// Way the body faces, in the same convention as `yaw`.
     pub face_yaw: f32,
     /// Horizontal speed along `face_yaw`. The scalar (not a vector) is what
@@ -186,6 +190,7 @@ impl Worm {
             vel: Vec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
+            aim: Vec3::ZERO,
             face_yaw: 0.0,
             forward_vel: 0.0,
             action: Action::Idle,
@@ -242,10 +247,13 @@ impl Worm {
     }
 
     /// Unit vector the worm looks along (the same maths as the viewer camera).
+    /// `Input::aim` overrides it; `Vec3::ZERO` means there is no override.
     pub fn aim_dir(&self) -> Vec3 {
-        let (sy, cy) = self.yaw.sin_cos();
-        let (sp, cp) = self.pitch.sin_cos();
-        Vec3::new(sy * cp, sp, cy * cp)
+        if self.aim == Vec3::ZERO {
+            look_dir(self.yaw, self.pitch)
+        } else {
+            self.aim
+        }
     }
 
     pub fn eye(&self) -> Vec3 {
@@ -267,6 +275,13 @@ impl Worm {
 /// `Worm::axis` for a worm standing with its feet at `feet`.
 pub(crate) fn body_axis(feet: Vec3) -> (Vec3, Vec3) {
     (feet + Vec3::Y * WORM_RADIUS, feet + Vec3::Y * (WORM_HEIGHT - WORM_RADIUS))
+}
+
+/// Unit vector for a look direction, with the same convention as `Input`.
+pub(crate) fn look_dir(yaw: f32, pitch: f32) -> Vec3 {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    Vec3::new(sy * cp, sp, cy * cp)
 }
 
 /// Does a standing worm with its feet at `feet` fit without touching rock?
@@ -363,10 +378,15 @@ fn clean(i: &Input) -> Input {
     let finite = |x: f32| if x.is_finite() { x } else { 0.0 };
     // Clamp each axis first: the length of a 1e30 vector overflows to infinity.
     let m = Vec2::new(finite(i.move_dir.x).clamp(-8.0, 8.0), finite(i.move_dir.y).clamp(-8.0, 8.0));
+    let aim = i.aim.and_then(|a| {
+        let a = Vec3::new(finite(a.x), finite(a.y), finite(a.z));
+        (a.length_squared() > 1.0e-8).then(|| a.normalize())
+    });
     Input {
         move_dir: m.clamp_length_max(1.0),
         yaw: finite(i.yaw),
         pitch: finite(i.pitch).clamp(-PITCH_LIMIT, PITCH_LIMIT),
+        aim,
         reel: finite(i.reel).clamp(-1.0, 1.0),
         ..*i
     }
@@ -1038,6 +1058,32 @@ mod tests {
         assert!(matches!(events[0], Event::Edit { op: Op::Carve, .. }));
         assert!(w.drain_events().is_empty(), "drained");
         assert!(!w.grid.take_dirty().is_empty(), "the renderer is told which chunks changed");
+    }
+
+    #[test]
+    fn a_shot_can_aim_where_the_look_angles_do_not() {
+        // The viewer's camera sits over the shoulder, so it sends the crosshair
+        // direction separately from `yaw` (which stays the movement frame).
+        let mut w = settled(walled, (17.5, 16.0));
+        let eye = w.worms[0].eye();
+        assert!(w.grid.sample(Vec3::new(20.5, eye.y, 16.0)) < 0.0, "rock to the +x side");
+        // Looking along +z, but aiming at the wall along +x.
+        let aim = Input { yaw: 0.0, aim: Some(Vec3::X), dig: true, ..Input::default() };
+        w.step(&[aim]);
+        assert!(w.grid.sample(Vec3::new(20.5, eye.y, 16.0)) > 0.0, "dug where it aimed");
+        assert!(w.worms[0].digging);
+        assert!((w.worms[0].aim_dir() - Vec3::X).length() < 1.0e-6);
+        assert!(w.worms[0].yaw.abs() < 1.0e-6, "the camera frame did not turn");
+
+        // No override: the look angles are in charge again.
+        w.step(&[Input { yaw: FRAC_PI_2, ..Input::default() }]);
+        assert!((w.worms[0].aim_dir() - Vec3::X).length() < 1.0e-6, "yaw pi/2 looks along +x");
+
+        // A zero or non-finite override is a polite client's "no opinion".
+        for bad in [Vec3::ZERO, Vec3::new(f32::NAN, 0.0, 0.0)] {
+            w.step(&[Input { yaw: 0.0, aim: Some(bad), ..Input::default() }]);
+            assert!((w.worms[0].aim_dir() - Vec3::Z).length() < 1.0e-6, "{bad:?} falls back to yaw");
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// Everything a player can ask the game to do during one tick.
@@ -29,6 +29,19 @@ pub struct Input {
     /// an unreliable network).
     pub yaw: f32,
     pub pitch: f32,
+    /// Where the shot goes, as a unit vector, when that is not the same as
+    /// looking along `yaw`/`pitch`. `None` means "aim where the worm looks".
+    ///
+    /// The viewer's camera sits over the worm's shoulder, so its centre ray
+    /// (the crosshair) is not the eye ray: aiming along `yaw`/`pitch` would put
+    /// every shot a shoulder-width to one side of the reticle. The viewer
+    /// instead passes the direction from the eye to the point under the
+    /// crosshair, so shots, rope and digging all follow the reticle while
+    /// movement still uses `yaw` as the camera frame.
+    ///
+    /// Like every other field this comes from outside: the sim normalises it
+    /// and ignores a zero or non-finite one.
+    pub aim: Option<Vec3>,
     /// Jump button. A *press* jumps from the ground, and one press while
     /// airborne is the double jump. On a wall or a rope the same press kicks
     /// off instead.

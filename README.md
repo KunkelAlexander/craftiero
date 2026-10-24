@@ -107,7 +107,10 @@ over the network.
   closed-form ray test inside the same shader, so they get shadows, AO and
   outlines for free; the rig undulates, leans, flips and squashes from the sim's
   action and velocity. Projectiles and the fireballs the sim's events start are
-  capsules too. It runs the sim at a fixed 60 Hz and
+  capsules too. The camera sits over the worm's shoulder, so the worm never
+  covers the crosshair; the sim is told to aim from the eye at the point under
+  the reticle, which keeps shots, rope and digging on target despite the offset.
+  It runs the sim at a fixed 60 Hz and
   draws between ticks. Read it in this order: `main.rs` (window, input, game
   loop), `worms.rs`, `effects.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),
   `shaders.rs` (the WGSL), `world.rs` (the demo map), `camera.rs`.

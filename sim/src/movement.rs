@@ -153,6 +153,13 @@ fn approach(x: f32, target: f32, step: f32) -> f32 {
 pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
     worm.yaw = input.yaw;
     worm.pitch = input.pitch;
+    // The viewer's camera can be off the look ray (over the shoulder), in which
+    // case it supplies the direction to the crosshair. Keep it as an override
+    // only while the input carries one, so look angles stay in charge otherwise.
+    worm.aim = input
+        .aim
+        .filter(|a| a.length_squared() > 1.0e-8)
+        .map_or(Vec3::ZERO, |a| a.normalize());
 
     let jump_pressed = input.jump && !worm.jump_was_down;
     worm.jump_was_down = input.jump;
