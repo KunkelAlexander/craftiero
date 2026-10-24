@@ -17,6 +17,7 @@
 
 pub mod combat;
 pub mod input;
+pub mod movement;
 pub mod rng;
 pub mod weapons;
 pub mod world;
@@ -26,5 +27,6 @@ pub use combat::{Projectile, MAX_HP, RESPAWN_TIME};
 pub use input::Input;
 pub use weapons::{WeaponDef, WeaponState, ARSENAL, WEAPONS};
 pub use world::{
-    dig_target, Event, Rope, World, Worm, DIG_RADIUS, DT, EYE_HEIGHT, WORM_HEIGHT, WORM_RADIUS,
+    dig_target, Action, Event, Rope, World, Worm, DIG_RADIUS, DT, EYE_HEIGHT, WORM_HEIGHT,
+    WORM_RADIUS,
 };

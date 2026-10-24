@@ -151,7 +151,7 @@ pub static WEAPONS: [WeaponDef; 12] = [
         range: 0.0,
         blast_radius: 3.0,
         blast_damage: 60.0,
-        knockback: 24.0,
+        knockback: 26.0,
         terrain: 2.5,
         pellets: 1,
         gravity: 0.0,

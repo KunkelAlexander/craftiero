@@ -39,8 +39,9 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 
 | Input | Does |
 |---|---|
-| W A S D, mouse | walk, look and aim |
-| Space | jump: hold for a high jump, tap for a hop; holding it hops on every landing |
+| W A S D, mouse | run (the body turns; the mouse aims), look |
+| Space | jump: hold for height; press again as you land for a double, then a triple (needs speed) |
+| hold W into a wall | climb it; S climbs down; Space kicks off the wall |
 | left mouse (hold) | fire the current weapon |
 | 1 2 3 4 5 6 7 8 9 0 -, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor |
 | Left Shift (hold) | dig: a 1.5 m hole where you look (up to 4 m away), five a second |
@@ -90,12 +91,14 @@ over the network.
 * **[`sim/`](sim/)** is the game's rules, also pure (no window, GPU or clock).
   `World::step(&[Input])` is the only way state changes. A worm is a capsule
   tested as three spheres against the distance field: push out along the
-  gradient, walk along slopes, step up small ledges, jump, dig, and a rope that
-  is a hard distance limit (so swinging is a pendulum). Weapons are rows of a
-  table (`weapons.rs`); `combat.rs` is the few rules that read it: projectiles
+  gradient, run and turn with momentum (the body faces the run, the mouse
+  aims), chain single/double/triple jumps on landing (a jump adds height, never
+  speed), climb walls, wall-kick, dig, and swing on a rope. Weapons are rows of
+  a table (`weapons.rs`); `combat.rs` is
+  the few rules that read it: projectiles
   that step through the distance field, explosions that carve it, damage with
-  rock as cover, respawning. Read `world.rs` and `combat.rs`; their tests are
-  the specification.
+  rock as cover, respawning. Read `movement.rs`, `world.rs` and `combat.rs`;
+  their tests are the specification.
 * **[`viewer/`](viewer/)** copies the grid into a 3D
   texture and **raymarches it on the GPU** (sphere tracing), shades it with a
   three-band toon ramp, and draws ink outlines from a depth/normal buffer.

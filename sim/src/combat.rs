@@ -249,11 +249,10 @@ impl World {
         }
         let amount = if victim == source { amount * SELF_DAMAGE } else { amount };
         worm.hp -= amount;
-        worm.vel += impulse; // knockback is NOT reduced for self-hits
+        // Knockback is a real impulse; the movement code must not overwrite it
+        // next tick, so `knockback` puts the worm into a tumble.
         if impulse != Vec3::ZERO {
-            // Airborne for the next tick, whatever the ground says: standing worms
-            // cancel the speed into the ground, and the push would be eaten.
-            worm.on_ground = false;
+            worm.knockback(impulse);
         }
         let pos = worm.pos;
         if amount > 0.0 {

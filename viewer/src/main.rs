@@ -36,13 +36,15 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 const HELP: &str = "\
 Controls
   click the window  capture the mouse        Esc  release it (again to quit)
-  W A S D           walk                     Space  jump        mouse  look and aim
+  W A S D           run (the worm turns), mouse  look and aim
+  Space             jump: hold for height; press again as you land for a double,
+                    then a triple (the triple needs speed)
   left mouse        fire (hold)              right mouse  shoot the rope / let go
   1-9 0 -           pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
                     Bomb Cluster Swarm Teleport Nova Block Tractor
+  hold W into a wall  climb it; S climbs down; Space kicks off the wall
   Left Shift        dig (hold); the ring shows where the hole will be
   E / Q             reel the rope in (pulls you, so you can launch yourself) / out
-  Space on the rope let go with an upward kick; steer while swinging to pump it up
   F                 fly camera with the M1 brush: W A S D Space Ctrl Shift fly,
                     left mouse carve, right mouse build, mouse wheel brush size
   F1 F2 F3          fixed render resolution 100% / 75% / 50%
@@ -846,9 +848,9 @@ impl Viewer {
             self.world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
         // Speed widens the view: the world streams past faster at the edges,
         // which is a cheap way to make fast movement FEEL fast.
-        const CALM_SPEED: f32 = 8.0; // walking speed: no widening up to here
+        const CALM_SPEED: f32 = 6.0; // no widening up to this speed
         let speed = if self.fly { 0.0 } else { self.world.worms[0].vel.length() };
-        let widen = ((speed - CALM_SPEED) / 16.0).clamp(0.0, 1.0);
+        let widen = ((speed - CALM_SPEED) / 12.0).clamp(0.0, 1.0);
         let target_fov = (70.0 + 14.0 * widen).to_radians();
         self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
         if !self.fly {
@@ -919,7 +921,15 @@ impl Viewer {
             } else {
                 format!("{}/{}", gun.ammo, def.mag)
             };
-            let hud = format!("hp {:.0} | {} {} | kills {} deaths {}", me.hp, def.name, ammo, me.kills, me.deaths);
+            let hud = format!(
+                "hp {:.0} | {} {} | {} | kills {} deaths {}",
+                me.hp,
+                def.name,
+                ammo,
+                me.action.name(),
+                me.kills,
+                me.deaths
+            );
             self.window.set_title(&format!(
                 "liero3d M3 {} | {hud} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {}",
                 if self.fly { "fly" } else { "worm" },

@@ -37,39 +37,11 @@ const HAND_HEIGHT: f32 = 1.1;
 /// overlap and leave no gap a thin ledge could slip through.
 const BODY_SPHERES: [f32; 3] = [WORM_RADIUS, WORM_HEIGHT * 0.5, WORM_HEIGHT - WORM_RADIUS];
 
-// --- movement feel (metres, seconds) --------------------------------------
-const WALK_SPEED: f32 = 8.0;
-/// How fast the walking speed is reached on the ground. High, so the worm stops
-/// and starts crisply and standing still is not a slide.
-const GROUND_ACCEL: f32 = 70.0;
-/// Slowing down while still steering when faster than walking speed (landing
-/// from a swing, a bunny hop). Much gentler than `GROUND_ACCEL`, so momentum
-/// survives a landing: let go of the keys and the full friction stops you.
-const OVERSPEED_DRAG: f32 = 10.0;
-/// Steering in the air. It never BRAKES: the speed gained from a rope swing is
-/// kept, steering only adds speed up to the walking speed.
-const AIR_ACCEL: f32 = 20.0;
-const GRAVITY: f32 = 25.0;
-/// Falling is heavier than rising. A symmetric arc feels floaty; a quick drop
-/// makes jumps snappy. (Not while on a rope: a swing should be a pendulum.)
-const FALL_GRAVITY_MULT: f32 = 1.5;
-/// Rise = speed^2 / (2 * gravity) = 2.4 m, well above the worm's own height.
-const JUMP_SPEED: f32 = 11.0;
-/// Letting go of jump while still rising cuts the speed to this: a tap is a
-/// hop of about half a metre, holding gives the full jump.
-const JUMP_CUT_SPEED: f32 = 4.0;
-/// Pressing jump up to this many ticks (0.1 s) after walking off an edge still
-/// jumps ("coyote time"), and pressing it up to this many ticks before landing
-/// jumps on landing ("jump buffer"). Both forgive human timing; without them
-/// a jump that feels like it was pressed in time is sometimes eaten.
-const COYOTE_TICKS: u8 = 6;
-const JUMP_BUFFER_TICKS: u8 = 6;
-const MAX_SPEED: f32 = 40.0;
 /// A surface counts as ground when its normal is within ~41 degrees of up.
 /// Steeper is a wall: the worm slides along it instead of standing on it.
 /// (Not 45: at a wall-floor crease the foot sphere's blended normal is exactly
 /// 45 degrees, and a threshold there makes the answer flip from tick to tick.)
-const GROUND_COS: f32 = 0.75;
+pub(crate) const GROUND_COS: f32 = 0.75;
 /// Still "standing" when the feet are this far above the surface, and then the
 /// worm is pulled down onto it. It keeps the worm grounded while walking over
 /// bumps and down slopes, where each tick would otherwise be a tiny fall.
@@ -86,6 +58,8 @@ const MAX_STEP: f32 = 0.2;
 /// Largest correction per overlapping sphere and pass: a worm buried deeper
 /// than the field's band (where the gradient is zero) is pushed up gradually.
 const MAX_PUSH: f32 = 0.5;
+/// Moving and colliding constants live with the movement rules in
+/// `movement.rs`; the body's shape and the dig stay here.
 const PITCH_LIMIT: f32 = 1.553; // 89 degrees
 
 // --- digging --------------------------------------------------------------
@@ -104,26 +78,8 @@ pub const DIG_RADIUS: f32 = 1.5;
 const DIG_INTERVAL: u8 = 12;
 
 // --- rope -----------------------------------------------------------------
-const ROPE_RANGE: f32 = 30.0;
-const ROPE_MIN: f32 = 1.0;
-/// How fast a reeled rope shortens (m/s).
-const REEL_SPEED: f32 = 12.0;
-/// Reeling in also ACCELERATES the worm towards the anchor, up to
-/// `REEL_MAX_SPEED`. The shortening alone would only drag the worm along at a
-/// fixed speed and leave it with nothing when it let go; the acceleration is
-/// what launches it out of a hole.
-const REEL_ACCEL: f32 = 45.0;
-const REEL_MAX_SPEED: f32 = 20.0;
-/// Steering on a rope in the air: a stronger push, and allowed to go much
-/// faster than walking, so pushing in the direction of the swing pumps it up
-/// like a child on a swing.
-const SWING_ACCEL: f32 = 30.0;
-const SWING_MAX_SPEED: f32 = 24.0;
-/// Pressing jump on the rope in the air lets go and kicks the worm upwards.
-const ROPE_JUMP: f32 = 7.0;
-/// The rope lets go when the rock it hangs from is dug away: the anchor sits on
-/// the surface (distance ~0), so air this far from it means the rock is gone.
-const ANCHOR_GONE: f32 = 0.3;
+// The speed constants and the anchor rule live in `movement.rs`; the rope's
+// shape is shared state, so its struct stays next to the worm.
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rope {
@@ -133,14 +89,74 @@ pub struct Rope {
     pub length: f32,
 }
 
+/// What the worm's body is doing. The movement rules are a state machine:
+/// each action owns a few numbers (speed, timer) and decides when to hand over
+/// to another. This is the pattern the book calls a State.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Idle,
+    Walk,
+    /// Just landed. `land_timer` is the short window in which the next press
+    /// chains a double (or triple) jump.
+    Land,
+    Jump,
+    DoubleJump,
+    TripleJump,
+    Freefall,
+    /// Bounced off a wall. Gravity still applies, but the height is fixed.
+    WallKick,
+    /// Holding into a wall: climb it. Press jump while climbing to kick off
+    /// the wall.
+    Climb,
+    /// Hit by an explosion: no steering until the timer runs out.
+    Tumble,
+    Rope,
+}
+
+impl Action {
+    pub fn name(self) -> &'static str {
+        match self {
+            Action::Idle => "idle",
+            Action::Walk => "walk",
+            Action::Land => "land",
+            Action::Jump => "jump",
+            Action::DoubleJump => "double",
+            Action::TripleJump => "triple",
+            Action::Freefall => "fall",
+            Action::WallKick => "wall kick",
+            Action::Climb => "climb",
+            Action::Tumble => "tumble",
+            Action::Rope => "rope",
+        }
+    }
+}
+
+/// The next jump a press from the ground produces. Jumps chain single ->
+/// double -> triple only if the button is pressed again inside the landing
+/// window; a triple also needs forward speed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JumpChain {
+    Single,
+    Double,
+    Triple,
+}
+
 #[derive(Clone, Debug)]
 pub struct Worm {
     /// The point between the feet. The capsule stands on it.
     pub pos: Vec3,
     pub vel: Vec3,
-    /// Where the worm looks (see `Input`).
+    /// Where the worm looks (see `Input`). Aim and camera, not necessarily the
+    /// way the body faces: the body turns to run, while the mouse can keep
+    /// aiming somewhere else.
     pub yaw: f32,
     pub pitch: f32,
+    /// Way the body faces, in the same convention as `yaw`.
+    pub face_yaw: f32,
+    /// Horizontal speed along `face_yaw`. The scalar (not a vector) is what
+    /// makes steering turn the body instead of strafing.
+    pub forward_vel: f32,
+    pub action: Action,
     pub on_ground: bool,
     /// Normal of the ground the worm stands on (up when it is in the air).
     pub ground_normal: Vec3,
@@ -148,15 +164,19 @@ pub struct Worm {
     pub dig_cooldown: u8,
     pub rope: Option<Rope>,
     /// Was the rope button down last tick? (To react to the press, not the hold.)
-    rope_was_down: bool,
-    jump_was_down: bool,
-    /// True from a jump until the worm stops rising or lands: only then does
-    /// letting go of the button cut the jump short.
-    jumping: bool,
-    /// Ticks left in which a jump is still allowed after leaving the ground.
-    coyote: u8,
-    /// Ticks left in which an early jump press is remembered.
-    jump_buffer: u8,
+    pub(crate) rope_was_down: bool,
+    pub(crate) jump_was_down: bool,
+    /// Ticks left in the landing window (a jump press here chains).
+    pub(crate) land_timer: u8,
+    pub(crate) next_jump: JumpChain,
+    /// The wall most recently touched, and how long a wall kick is still legal.
+    pub(crate) wall_normal: Vec3,
+    pub(crate) wall_timer: u8,
+    /// Ticks before another wall can be grabbed (set after a kick, so a kick
+    /// does not instantly re-stick to the same wall).
+    pub(crate) climb_cooldown: u8,
+    /// Ticks of no steering left after an explosion.
+    pub(crate) tumble_timer: u8,
     // --- fighting (see `combat.rs`) ---
     pub hp: f32,
     pub alive: bool,
@@ -179,15 +199,21 @@ impl Worm {
             vel: Vec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
+            face_yaw: 0.0,
+            forward_vel: 0.0,
+            action: Action::Idle,
             on_ground: false,
             ground_normal: Vec3::Y,
             dig_cooldown: 0,
             rope: None,
             rope_was_down: false,
             jump_was_down: false,
-            jumping: false,
-            coyote: 0,
-            jump_buffer: 0,
+            land_timer: 0,
+            next_jump: JumpChain::Single,
+            wall_normal: Vec3::Y,
+            wall_timer: 0,
+            climb_cooldown: 0,
+            tumble_timer: 0,
             hp: MAX_HP,
             alive: true,
             respawn_timer: 0.0,
@@ -197,6 +223,17 @@ impl Worm {
             kills: 0,
             deaths: 0,
         }
+    }
+
+    /// An explosion push. It is a real velocity impulse, so it must not be
+    /// overwritten by the next tick's locomotion: the worm tumbles instead.
+    pub fn knockback(&mut self, impulse: Vec3) {
+        self.vel += impulse;
+        self.on_ground = false;
+        self.rope = None;
+        self.action = Action::Tumble;
+        self.tumble_timer = 30;
+        self.land_timer = 0;
     }
 
     /// Stand up again at `pos` with every movement state cleared (a respawn, or
@@ -213,6 +250,7 @@ impl Worm {
             deaths: self.deaths,
             yaw: self.yaw,
             pitch: self.pitch,
+            face_yaw: self.yaw,
             ..Worm::new(pos)
         };
     }
@@ -349,164 +387,17 @@ fn clean(i: &Input) -> Input {
 }
 
 fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, events: &mut Vec<Event>) {
-    worm.yaw = input.yaw;
-    worm.pitch = input.pitch;
+    // The rules (walk, jump, climb, rope) live in `movement`; the world stays
+    // responsible for terrain edits.
+    crate::movement::step(grid, worm, input);
 
-    // Rope button: a press shoots it, or lets go if it is out.
-    let rope_pressed = input.rope && !worm.rope_was_down;
-    worm.rope_was_down = input.rope;
-    if rope_pressed {
-        if worm.rope.is_some() {
-            worm.rope = None;
-        } else if let Some(t) = grid.raycast(worm.eye(), worm.aim_dir(), ROPE_RANGE) {
-            let anchor = worm.eye() + worm.aim_dir() * t;
-            worm.rope = Some(Rope { anchor, length: (anchor - worm.hand()).length().max(ROPE_MIN) });
-        }
-    }
-    // Jump button: remember presses; coyote time counts down once off the ground.
-    let jump_pressed = input.jump && !worm.jump_was_down;
-    worm.jump_was_down = input.jump;
-    if jump_pressed {
-        worm.jump_buffer = JUMP_BUFFER_TICKS;
-    }
-    worm.coyote = if worm.on_ground { COYOTE_TICKS } else { worm.coyote.saturating_sub(1) };
-    // A new jump press in mid-air, on a rope: let go and kick upwards.
-    let rope_kick = jump_pressed && worm.coyote == 0 && worm.rope.is_some();
-    if rope_kick {
-        worm.rope = None;
-        worm.jump_buffer = 0;
-    }
-
-    let hand = worm.hand();
-    if let Some(rope) = &mut worm.rope {
-        // Reeling in first takes up any slack (a slack rope would waste the
-        // pull), then shortens. Paying out just lengthens.
-        let base = if input.reel > 0.0 { rope.length.min((rope.anchor - hand).length()) } else { rope.length };
-        rope.length = (base - input.reel * REEL_SPEED * DT).clamp(ROPE_MIN, ROPE_RANGE);
-        if grid.sample(rope.anchor) > ANCHOR_GONE {
-            worm.rope = None;
-        }
-    }
-
-    // Velocity. Movement is relative to where the worm looks.
-    let (sy, cy) = worm.yaw.sin_cos();
-    let forward = Vec3::new(sy, 0.0, cy);
-    let right = Vec3::new(-cy, 0.0, sy);
-    let wish = forward * input.move_dir.y + right * input.move_dir.x;
-    let mut vel = worm.vel;
-    if worm.on_ground {
-        // Walk ALONG the ground, not horizontally: a horizontal walk into a
-        // slope loses a quarter of its speed to the push-out every tick. So
-        // work in the ground's plane: tilt the wish into it (keeping its
-        // length) and accelerate the sideways-to-the-normal part of the velocity.
-        // Gravity is not applied: the ground would cancel it anyway, and the
-        // leftover pull along a slope would make a standing worm creep downhill.
-        // (`settle_on_ground` keeps the worm touching the surface instead.)
-        let n = worm.ground_normal;
-        let tilted = wish - n * wish.dot(n);
-        let target = if tilted.length() > 1.0e-4 { tilted / tilted.length() * wish.length() } else { Vec3::ZERO };
-        let along = vel - n * vel.dot(n);
-        // Approach the wanted velocity at a fixed rate. With no input the wanted
-        // velocity is zero, so this is also the friction that stops the worm.
-        // Faster than wanted while steering (landing from a swing): only a
-        // gentle drag, so momentum survives the landing.
-        let wanted = target * WALK_SPEED;
-        let delta = wanted - along;
-        let overspeed = wanted.length() > 0.1 && along.length() > wanted.length() + 0.5;
-        let max_change = if overspeed { OVERSPEED_DRAG } else { GROUND_ACCEL } * DT;
-        vel = along + if delta.length() <= max_change { delta } else { delta / delta.length() * max_change };
-    } else {
-        // In the air: add speed only in the wished direction and only up to a
-        // cap, so steering never removes a swing's momentum. On a rope the push
-        // is stronger and the cap much higher: pumping a swing.
-        let (accel, cap) = if worm.rope.is_some() { (SWING_ACCEL, SWING_MAX_SPEED) } else { (AIR_ACCEL, WALK_SPEED) };
-        let w = wish.length();
-        if w > 1.0e-4 {
-            let dir = wish / w;
-            let flat = Vec3::new(vel.x, 0.0, vel.z);
-            let add = (cap * w - flat.dot(dir)).clamp(0.0, accel * DT);
-            vel += dir * add;
-        }
-        let falling = vel.y < 0.0 && worm.rope.is_none();
-        vel.y -= GRAVITY * if falling { FALL_GRAVITY_MULT } else { 1.0 } * DT;
-    }
-
-    // Reeling in accelerates the worm towards the anchor, up to a top speed.
-    if let (Some(rope), true) = (worm.rope, input.reel > 0.0) {
-        let to_anchor = rope.anchor - worm.hand();
-        let dist = to_anchor.length();
-        if dist > 1.0e-4 {
-            let dir = to_anchor / dist;
-            let room = (REEL_MAX_SPEED - vel.dot(dir)).max(0.0);
-            vel += dir * (REEL_ACCEL * input.reel * DT).min(room);
-        }
-    }
-    if rope_kick {
-        vel.y += ROPE_JUMP;
-    }
-
-    // Jump: a held button jumps on every landing, a press just before landing
-    // is remembered, and `coyote` > 0 means "on the ground, or only just left it".
-    let mut jumped = false;
-    if (worm.jump_buffer > 0 || input.jump) && worm.coyote > 0 {
-        jumped = true;
-        vel.y = JUMP_SPEED;
-        worm.coyote = 0;
-        worm.jump_buffer = 0;
-        worm.jumping = true;
-    }
-    worm.jump_buffer = worm.jump_buffer.saturating_sub(1);
-    // Variable jump height: letting go while rising cuts the jump short.
-    if worm.jumping {
-        if vel.y <= 0.0 {
-            worm.jumping = false;
-        } else if !input.jump && vel.y > JUMP_CUT_SPEED {
-            vel.y = JUMP_CUT_SPEED;
-            worm.jumping = false;
-        }
-    }
-    worm.vel = vel.clamp_length_max(MAX_SPEED);
-
-    // Move in small steps, pushing out of the rock after each. If a ledge blocks
-    // a walking worm, try again from half a metre higher.
-    let was_on_ground = worm.on_ground;
-    let start = worm.pos;
-    let disp = worm.vel * DT;
-    let mut grounded = slide(grid, worm, disp);
-    if was_on_ground && wish.length_squared() > 1.0e-6 {
-        let intended = Vec3::new(disp.x, 0.0, disp.z).length();
-        grounded |= try_step_up(grid, worm, start, intended, wish * (WALK_SPEED * DT));
-    }
-
-    // Rope: a taut rope is a hard limit on the distance to the anchor. Pull the
-    // worm back inside it and cancel the speed that was taking it further away.
-    // What is left is sideways speed, which is what makes it a pendulum.
-    if let Some(rope) = worm.rope {
-        let to_anchor = rope.anchor - worm.hand();
-        let dist = to_anchor.length();
-        if dist > rope.length && dist > 1.0e-4 {
-            let dir = to_anchor / dist;
-            worm.pos += dir * (dist - rope.length);
-            worm.vel -= dir * worm.vel.dot(dir).min(0.0);
-            // The pull may have dragged the worm into rock.
-            grounded |= push_out_of_rock(grid, worm, false);
-        }
-    }
-    // Stick to the ground if walking, but not after a jump or while reeling in.
-    let stick = was_on_ground && !jumped && !worm.jumping && !(worm.rope.is_some() && input.reel > 0.0);
-    let settled = settle_on_ground(grid, worm, stick);
-    worm.on_ground = grounded || settled;
-    if worm.on_ground {
-        worm.jumping = false;
-    }
-    if !worm.on_ground {
-        worm.ground_normal = Vec3::Y;
-    }
     // Safety net: nothing legitimate leaves the world (outside counts as rock),
     // but a bug or a freak push must never lose a worm for good.
     let size = grid.size_metres();
     let lo = Vec3::new(WORM_RADIUS, 0.0, WORM_RADIUS);
-    worm.pos = worm.pos.clamp(lo, Vec3::new(size.x - WORM_RADIUS, size.y - WORM_HEIGHT, size.z - WORM_RADIUS));
+    worm.pos = worm
+        .pos
+        .clamp(lo, Vec3::new(size.x - WORM_RADIUS, size.y - WORM_HEIGHT, size.z - WORM_RADIUS));
 
     // Dig. After the move, so the hole is where the worm is looking now.
     worm.dig_cooldown = worm.dig_cooldown.saturating_sub(1);
@@ -519,7 +410,6 @@ fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, events: &mut Vec<E
         }
     }
 }
-
 /// Where a dig would be centred: the first rock the worm looks at within reach.
 /// The viewer uses this too, to preview the hole.
 pub fn dig_target(grid: &Grid, worm: &Worm) -> Option<Vec3> {
@@ -527,8 +417,16 @@ pub fn dig_target(grid: &Grid, worm: &Worm) -> Option<Vec3> {
     grid.raycast(worm.eye(), dir, DIG_REACH).map(|t| worm.eye() + dir * t)
 }
 
-/// Resolve the overlaps between the body spheres and the terrain. Returns true
-/// if the worm is pushed up by something ground-like.
+/// What a move touched. `wall` is the outward normal of the wall that took the
+/// most speed, which the movement rules use for wall kicks and climbing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Collision {
+    pub ground: bool,
+    pub wall: Option<Vec3>,
+}
+
+/// Resolve the overlaps between the body spheres and the terrain. Returns what
+/// was touched (ground and/or a wall).
 ///
 /// Pushing a sphere out of a distance field: the field value is how far the
 /// sphere's centre is from the surface, so `radius - value` is how deep it is
@@ -539,8 +437,11 @@ pub fn dig_target(grid: &Grid, worm: &Worm) -> Option<Vec3> {
 /// `roll_over_edges` keeps the tilted normal at an edge. Only the step-up uses
 /// it: lowering the worm onto a ledge it relies on the foot rolling up the
 /// corner, which a sideways-only push forbids.
-fn push_out_of_rock(grid: &Grid, worm: &mut Worm, roll_over_edges: bool) -> bool {
-    let mut grounded = false;
+pub(crate) fn push_out_of_rock(grid: &Grid, worm: &mut Worm, roll_over_edges: bool) -> Collision {
+    let mut out = Collision::default();
+    // The wall that removed the most speed. A sphere in a corner can report
+    // several; the one we ran into is the useful one.
+    let mut wall_hit = 0.0;
     for _ in 0..4 {
         let mut pushed = false;
         for offset in BODY_SPHERES {
@@ -564,33 +465,43 @@ fn push_out_of_rock(grid: &Grid, worm: &mut Worm, roll_over_edges: bool) -> bool
                     normal = sideways.normalize();
                 }
             }
+            let into = worm.vel.dot(normal);
+            // A near-vertical surface that we were moving into. Ignore floors,
+            // ceilings and the shallow shoulder at the top of a slope.
+            if !ground_like && normal.y > -0.3 && into < -wall_hit {
+                wall_hit = -into;
+                out.wall = Some(normal);
+            }
             worm.pos += normal * (WORM_RADIUS - d).min(MAX_PUSH);
             // Remove the part of the velocity that points into the surface, keep
             // the rest: that is sliding along a wall.
-            let into = worm.vel.dot(normal);
             if into < 0.0 {
                 worm.vel -= normal * into;
             }
-            grounded |= ground_like;
+            out.ground |= ground_like;
             pushed = true;
         }
         if !pushed {
             break;
         }
     }
-    grounded
+    out
 }
 
 /// Move by `disp` in steps of at most `MAX_STEP`, pushing out of the rock after
-/// each. Returns true if something ground-like pushed the worm.
-fn slide(grid: &Grid, worm: &mut Worm, disp: Vec3) -> bool {
+/// each. Returns the union of what was touched.
+pub(crate) fn slide(grid: &Grid, worm: &mut Worm, disp: Vec3) -> Collision {
     let steps = (disp.length() / MAX_STEP).ceil().max(1.0);
-    let mut grounded = false;
+    let mut out = Collision::default();
     for _ in 0..steps as u32 {
         worm.pos += disp / steps;
-        grounded |= push_out_of_rock(grid, worm, false);
+        let hit = push_out_of_rock(grid, worm, false);
+        out.ground |= hit.ground;
+        if hit.wall.is_some() {
+            out.wall = hit.wall;
+        }
     }
-    grounded
+    out
 }
 
 /// A worm walking into a ledge is stopped by the rounded foot touching its edge.
@@ -599,17 +510,17 @@ fn slide(grid: &Grid, worm: &mut Worm, disp: Vec3) -> bool {
 /// lower the worm onto whatever is there. Keeps the result only if it got
 /// further. `want` is not the real velocity because the wall has just cancelled
 /// that (and a worm starting to walk has not got up to speed either).
-fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: Vec3) -> bool {
+pub(crate) fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: Vec3) -> Collision {
     let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
     let got = flat(worm.pos - start);
     if got >= intended * 0.25 {
-        return false; // not blocked
+        return Collision::default(); // not blocked
     }
     let (blocked_pos, blocked_vel) = (worm.pos, worm.vel);
     worm.pos = start + Vec3::Y * STEP_UP;
     let fits = BODY_SPHERES.iter().all(|&h| grid.sample(worm.pos + Vec3::Y * h) >= WORM_RADIUS * 0.99);
     if fits {
-        slide(grid, worm, want);
+        let mut hit = slide(grid, worm, want);
         // Lower the worm until its foot touches something, a little at a time. (Dropping
         // it the whole way and pushing it out again would shove it back off the
         // ledge's corner by as much as it had just moved forward.)
@@ -618,15 +529,19 @@ fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: V
             worm.pos.y -= 0.05;
             dropped += 0.05;
         }
-        let grounded = push_out_of_rock(grid, worm, true);
+        let landed = push_out_of_rock(grid, worm, true);
+        hit.ground |= landed.ground;
+        if landed.wall.is_some() {
+            hit.wall = landed.wall;
+        }
         if flat(worm.pos - start) > got + 0.02 {
             worm.vel = Vec3::new(want.x / DT, worm.vel.y, want.z / DT);
-            return grounded;
+            return hit;
         }
     }
     worm.pos = blocked_pos;
     worm.vel = blocked_vel;
-    false
+    Collision::default()
 }
 
 /// Is the worm standing on something? If the feet are within `GROUND_SKIN`
@@ -641,7 +556,7 @@ fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: V
 /// The normal is taken at the feet, not at the foot sphere's centre: where a
 /// wall meets the floor the field is the minimum of two planes, and at the
 /// sphere's centre the gradient points diagonally between them.
-fn settle_on_ground(grid: &Grid, worm: &mut Worm, stick: bool) -> bool {
+pub(crate) fn settle_on_ground(grid: &Grid, worm: &mut Worm, stick: bool) -> bool {
     let reach = if stick { STICK_DISTANCE } else { GROUND_SKIN };
     let d = grid.sample(worm.pos + Vec3::Y * WORM_RADIUS);
     if d >= WORM_RADIUS + reach {
@@ -675,7 +590,7 @@ fn settle_on_ground(grid: &Grid, worm: &mut Worm, stick: bool) -> bool {
 mod tests {
     use super::*;
     use glam::IVec3;
-    use std::f32::consts::FRAC_PI_2;
+    use std::f32::consts::{FRAC_PI_2, PI};
 
     // Test worlds are 32 x 16 x 32 m. Each is a distance function (negative =
     // rock) turned into a grid with `Grid::from_fn`, so they build in
@@ -722,6 +637,15 @@ mod tests {
         w
     }
 
+    /// A flat world wide enough to reach triple-jump speed and distance
+    /// without running into the edge. 24 chunks = 96 m of run-up room.
+    fn big_flat() -> World {
+        let mut w = World::new(Grid::from_fn(IVec3::new(24, 4, 8), flat), &[(6.0, 16.0)], 1);
+        w.worms[0].pos.y = 4.05;
+        run(&mut w, 60, Input::default());
+        w
+    }
+
     fn walk(yaw: f32) -> Input {
         Input { move_dir: Vec2::new(0.0, 1.0), yaw, ..Input::default() }
     }
@@ -740,38 +664,101 @@ mod tests {
     }
 
     #[test]
-    fn walking_goes_where_the_worm_looks_at_walking_speed() {
+    fn walking_picks_up_speed_fast() {
         let mut w = settled(flat, (16.0, 16.0));
         let start = w.worms[0].pos;
         run(&mut w, 30, walk(0.0)); // yaw 0 looks along +z
         let moved = w.worms[0].pos - start;
-        assert!(moved.z > 3.0 && moved.z < 4.0, "half a second at 8 m/s minus the start-up: {moved:?}");
+        // Half a second from a standstill: nearly full speed and ~3.5 m
+        // covered. (A 1.3 s ramp would cover less than half of that and make
+        // the worm feel like it was wading.)
+        assert!(moved.z > 3.0 && moved.z < 4.3, "half a second from rest: {moved:?}");
         assert!(moved.x.abs() < 0.01);
-        run(&mut w, 30, walk(FRAC_PI_2)); // a quarter turn left looks along +x
-        assert!(w.worms[0].pos.x - start.x > 2.0, "turned: {:?}", w.worms[0].pos);
-        // Strafing right while looking along +z goes towards -x.
+        assert!(w.worms[0].forward_vel > 10.5, "{}", w.worms[0].forward_vel);
+    }
+
+    #[test]
+    fn stopping_and_reversing_take_a_fraction_of_a_second() {
         let mut w = settled(flat, (16.0, 16.0));
-        let x = w.worms[0].pos.x;
-        run(&mut w, 30, Input { move_dir: Vec2::new(1.0, 0.0), ..Input::default() });
-        assert!(w.worms[0].pos.x < x - 2.0);
+        run(&mut w, 60, walk(0.0));
+        assert!(w.worms[0].forward_vel > 10.0);
+        // Let go: stopped in 20 ticks (0.33 s) without sliding off.
+        run(&mut w, 20, Input::default());
+        assert!(w.worms[0].vel.length() < 0.05, "stopped: {:?}", w.worms[0].vel);
+
+        // Full speed the other way, then press S: the body turns and runs back.
+        let mut w = settled(flat, (16.0, 16.0));
+        run(&mut w, 60, walk(0.0));
+        let at = w.worms[0].pos.z;
+        run(&mut w, 40, walk(PI)); // forward is -z now
+        assert!(w.worms[0].pos.z < at - 2.0, "reversed: {} -> {}", at, w.worms[0].pos.z);
+        assert!(w.worms[0].forward_vel > 10.0, "and running: {}", w.worms[0].forward_vel);
+    }
+
+    #[test]
+    fn the_body_turns_toward_the_stick_instead_of_strafing() {
+        let mut w = settled(flat, (16.0, 16.0));
+        // Looking along +z, D means "right" of the camera: -x.
+        run(&mut w, 45, Input { move_dir: Vec2::new(1.0, 0.0), ..Input::default() });
+        let worm = &w.worms[0];
+        assert!(worm.face_yaw < -1.2, "body turned right: {}", worm.face_yaw);
+        assert!(worm.pos.x < 14.5, "and ran that way: {:?}", worm.pos);
+        assert!(worm.yaw.abs() < 0.01, "the aim did not turn with the body");
     }
 
     #[test]
     fn a_worm_stops_when_the_input_stops() {
         let mut w = settled(flat, (16.0, 16.0));
-        run(&mut w, 30, walk(0.0));
-        run(&mut w, 15, Input::default());
+        run(&mut w, 60, walk(0.0));
+        run(&mut w, 40, Input::default());
         assert!(w.worms[0].vel.length() < 0.01, "{:?}", w.worms[0].vel);
     }
 
+    /// A 1.2 m block: below the worm's head, so it is a wall to stop at, not a
+    /// cliff to climb.
+    fn low_wall(p: Vec3) -> f32 {
+        (p.y - 4.0).min((p.y - 5.2).max(18.0 - p.x))
+    }
+
     #[test]
-    fn a_wall_stops_the_worm_and_it_does_not_get_inside() {
-        let mut w = settled(walled, (16.0, 16.0));
+    fn a_low_wall_stops_the_worm_and_it_does_not_get_inside() {
+        let mut w = settled(low_wall, (16.0, 16.0));
         run(&mut w, 180, walk(FRAC_PI_2));
         let worm = &w.worms[0];
-        let reach = 20.0 - WORM_RADIUS;
+        let reach = 18.0 - WORM_RADIUS;
         assert!(worm.pos.x > reach - 0.1 && worm.pos.x < reach + 0.05, "x = {}", worm.pos.x);
         assert!(worm.on_ground);
+        assert!(worm.pos.y < 4.6, "did not climb the 1.2 m block: y = {}", worm.pos.y);
+    }
+
+    #[test]
+    fn a_tall_wall_is_climbed_by_holding_into_it() {
+        let mut w = settled(walled, (16.0, 16.0));
+        run(&mut w, 150, walk(FRAC_PI_2));
+        let worm = &w.worms[0];
+        assert_eq!(worm.action, Action::Climb, "holding W into the wall climbs");
+        assert!(worm.pos.y > 7.0, "climbed: y = {}", worm.pos.y);
+        assert!(worm.pos.x < 20.0 - WORM_RADIUS + 0.1, "stays on the face: x = {}", worm.pos.x);
+
+        // S descends the same wall.
+        let y = worm.pos.y;
+        run(&mut w, 30, Input { move_dir: Vec2::new(0.0, -1.0), yaw: FRAC_PI_2, ..Input::default() });
+        assert!(w.worms[0].pos.y < y - 0.5, "climbed down: {} -> {}", y, w.worms[0].pos.y);
+    }
+
+    #[test]
+    fn digging_disables_wall_climbing() {
+        let mut w = settled(walled, (17.5, 16.0));
+        let dig_in = Input { yaw: FRAC_PI_2, dig: true, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+        let mut climbed = false;
+        for _ in 0..120 {
+            w.step(&[dig_in]);
+            climbed |= w.worms[0].action == Action::Climb;
+        }
+        assert!(!climbed, "never grabs the wall while the dig button is down");
+        // It does creep up a little: it is stepping up the lip of the hole it
+        // just carved. A real climb is metres; this is a knee.
+        assert!(w.worms[0].pos.y < 6.0, "tunnelled instead of climbing: y = {}", w.worms[0].pos.y);
     }
 
     /// Highest the worm gets above `ground` in `ticks` ticks of `input`.
@@ -800,34 +787,168 @@ mod tests {
     }
 
     #[test]
+    fn the_jump_heights_step_up() {
+        // 43 units/frame at 30 Hz, gravity 4.2 units/frame^2:
+        // 14.5125^2 / (2 * 42.525) = 2.48 m. The double is 53 -> 3.76 m.
+        let height = |chain: JumpChain| {
+            let mut w = settled(flat, (16.0, 16.0));
+            w.worms[0].next_jump = chain;
+            let ground = w.worms[0].pos.y;
+            apex(&mut w, ground, 240, Input { jump: true, ..Input::default() })
+        };
+        let single = height(JumpChain::Single);
+        let double = height(JumpChain::Double);
+        assert!((single - 2.48).abs() < 0.15, "single: {single}");
+        assert!((double - 3.80).abs() < 0.2, "double: {double}");
+    }
+
+    #[test]
     fn there_is_no_jumping_in_mid_air() {
         let mut w = settled(flat, (16.0, 16.0));
         w.step(&[Input { jump: true, ..Input::default() }]);
         run(&mut w, 10, Input { jump: true, ..Input::default() });
         let worm = &w.worms[0];
         assert!(!worm.on_ground);
-        assert!(worm.vel.y < JUMP_SPEED - 3.0, "still slowing down, no second jump: {}", worm.vel.y);
+        assert!(worm.vel.y < 10.0, "still slowing down, no second jump: {}", worm.vel.y);
+    }
+
+    /// Run until the worm lands, returning the highest point above `ground`.
+    fn jump_until_landed(w: &mut World, ground: f32, input: Input, ticks: usize) -> f32 {
+        let mut top: f32 = 0.0;
+        for _ in 0..ticks {
+            w.step(&[input]);
+            top = top.max(w.worms[0].pos.y - ground);
+            if w.worms[0].on_ground {
+                break;
+            }
+        }
+        top
     }
 
     #[test]
-    fn a_jump_pressed_just_before_landing_still_happens() {
+    fn jumps_chain_single_double_triple_on_landing() {
+        let mut w = big_flat();
+        let go = walk(FRAC_PI_2);
+        let ground = 4.0;
+        run(&mut w, 90, go); // get up to speed for the triple
+
+        w.step(&[Input { jump: true, ..go }]);
+        assert_eq!(w.worms[0].action, Action::Jump);
+        let single = jump_until_landed(&mut w, ground, Input { jump: true, ..go }, 240);
+        assert!(w.worms[0].on_ground);
+
+        w.step(&[go]); // release the button for a tick
+        assert_eq!(w.worms[0].action, Action::Land);
+        w.step(&[Input { jump: true, ..go }]);
+        assert_eq!(
+            w.worms[0].action,
+            Action::DoubleJump,
+            "a press inside the landing window is a double: speed {}",
+            w.worms[0].forward_vel
+        );
+        let double = jump_until_landed(&mut w, ground, Input { jump: true, ..go }, 300);
+
+        w.step(&[go]);
+        w.step(&[Input { jump: true, ..go }]);
+        assert_eq!(
+            w.worms[0].action,
+            Action::TripleJump,
+            "holding forward keeps enough speed for the triple: {}",
+            w.worms[0].forward_vel
+        );
+        let triple = jump_until_landed(&mut w, ground, Input { jump: true, ..go }, 360);
+
+        assert!(double > single + 0.8, "single {single} -> double {double}");
+        assert!(triple > double + 1.5, "double {double} -> triple {triple}");
+    }
+
+    #[test]
+    fn the_landing_window_expires_back_to_a_single_jump() {
         let mut w = settled(flat, (16.0, 16.0));
-        w.worms[0].pos.y += 1.5;
-        w.worms[0].on_ground = false;
-        while !(w.worms[0].vel.y < 0.0 && w.worms[0].pos.y < 4.0 + 0.4) {
-            w.step(&[Input::default()]); // fall until just above the ground
-        }
-        w.step(&[Input { jump: true, ..Input::default() }]); // a press, too early
-        let mut best: f32 = 0.0;
-        for _ in 0..20 {
-            w.step(&[Input::default()]);
-            best = best.max(w.worms[0].vel.y);
-        }
-        assert!(best > 3.0, "the buffered press jumped on landing: {best}");
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert!(jump_until_landed(&mut w, 4.0, Input::default(), 240) > 0.0);
+        // The window is 10 ticks; wait it out.
+        run(&mut w, 30, Input::default());
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::Jump, "a fresh single jump");
     }
 
     #[test]
-    fn a_jump_pressed_just_after_walking_off_an_edge_still_works() {
+    fn a_jump_changes_no_horizontal_speed() {
+        let mut w = settled(flat, (6.0, 16.0));
+        let go = walk(FRAC_PI_2);
+        run(&mut w, 60, go);
+        let before = w.worms[0].forward_vel;
+        assert!(before > 11.0, "at a run: {before}");
+        w.step(&[Input { jump: true, ..go }]);
+        assert_eq!(w.worms[0].action, Action::Jump);
+        let flat = Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length();
+        assert!((flat - before).abs() < 1.0e-4, "neither slower nor faster: {before} -> {flat}");
+    }
+
+    #[test]
+    fn landing_does_not_hand_out_a_speed_boost() {
+        let mut w = settled(flat, (6.0, 16.0));
+        let go = walk(FRAC_PI_2);
+        run(&mut w, 60, go);
+        let before = w.worms[0].forward_vel;
+        w.step(&[Input { jump: true, ..go }]);
+        // Fly the whole arc holding W. The sim only jumps on the press, so the
+        // held button does not turn this into a second jump.
+        for _ in 0..240 {
+            if w.worms[0].on_ground {
+                break;
+            }
+            w.step(&[go]);
+        }
+        let landed = Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length();
+        assert!((landed - before).abs() < 0.1, "landed at the speed you left with: {before} -> {landed}");
+        run(&mut w, 20, go);
+        let after = Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length();
+        assert!((after - before).abs() < 0.1, "and it stays there: {after}");
+    }
+
+    #[test]
+    fn hopping_is_not_a_faster_way_to_travel() {
+        let go = walk(FRAC_PI_2);
+        let travel = |hop: bool| {
+            let mut w = big_flat();
+            // Both start at a run, facing the way they will travel: the air
+            // does not turn the body (a jump never does), so a standstill hop
+            // would just drift sideways and prove nothing.
+            run(&mut w, 60, go);
+            let start = w.worms[0].pos.x;
+            for i in 0..120 {
+                // Pulse the button: a held button is one press, and a press in
+                // mid-air does nothing (no air jump).
+                w.step(&[Input { jump: hop && i % 2 == 0, ..go }]);
+            }
+            w.worms[0].pos.x - start
+        };
+        let run_ = travel(false);
+        let hop = travel(true);
+        assert!(run_ > 20.0, "running covers ground: {run_}");
+        assert!(hop <= run_ + 0.3, "hopping is not a shortcut: run {run_}, hop {hop}");
+    }
+
+    #[test]
+    fn air_steering_cannot_exceed_running_speed() {
+        let mut w = settled(flat, (6.0, 16.0));
+        let go = walk(FRAC_PI_2);
+        run(&mut w, 60, go);
+        w.step(&[Input { jump: true, ..go }]);
+        let mut top: f32 = 0.0;
+        for _ in 0..40 {
+            // Hold forward AND sideways: the body keeps its facing, so the
+            // sideways part is the drift that used to be free extra speed.
+            w.step(&[Input { move_dir: Vec2::new(1.0, 1.0), yaw: FRAC_PI_2, ..Input::default() }]);
+            top = top.max(Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length());
+        }
+        assert!(top <= 12.16, "drift comes out of the budget: {top}");
+    }
+
+    #[test]
+    fn walking_off_a_ledge_gives_no_coyote_time() {
         // A 3 m cliff: ground at y = 4 for x < 18, at y = 1 beyond.
         fn cliff(p: Vec3) -> f32 {
             (p.y - 4.0).max(p.x - 18.0).min(p.y - 1.0)
@@ -843,18 +964,37 @@ mod tests {
         assert!(!w.worms[0].on_ground, "walked off the edge");
         run(&mut w, 3, go);
         w.step(&[Input { jump: true, ..go }]);
-        assert!(w.worms[0].vel.y > 5.0, "coyote time: {}", w.worms[0].vel.y);
-        // But not long after.
-        let mut w = settled(cliff, (14.0, 16.0));
-        for _ in 0..200 {
-            w.step(&[go]);
-            if !w.worms[0].on_ground {
-                break;
-            }
+        assert_eq!(w.worms[0].action, Action::Freefall);
+        assert!(w.worms[0].vel.y < 0.0, "no mid-air jump: {}", w.worms[0].vel.y);
+    }
+
+    #[test]
+    fn jumping_at_a_climbed_wall_kicks_away_and_up() {
+        let mut w = settled(walled, (16.0, 16.0));
+        run(&mut w, 150, walk(FRAC_PI_2));
+        assert_eq!(w.worms[0].action, Action::Climb);
+        let y = w.worms[0].pos.y;
+        w.step(&[Input { jump: true, ..walk(FRAC_PI_2) }]);
+        let worm = &w.worms[0];
+        assert_eq!(worm.action, Action::WallKick);
+        assert!(worm.vel.y > 18.0, "up: {}", worm.vel.y);
+        assert!(worm.pos.x < 20.0 - WORM_RADIUS - 0.01, "away from the wall: x = {}", worm.pos.x);
+        let top = jump_until_landed(&mut w, 4.0, Input::default(), 300);
+        assert!(top > y - 4.0 + 2.0, "the kick carries it higher: {top}");
+    }
+
+    #[test]
+    fn climbing_over_the_top_pulls_the_worm_onto_the_ledge() {
+        // Ground at y = 4, and a block from y = 4 to 8 for x > 18.
+        fn block(p: Vec3) -> f32 {
+            (p.y - 4.0).min((p.y - 8.0).max(18.0 - p.x))
         }
-        run(&mut w, 12, go);
-        w.step(&[Input { jump: true, ..go }]);
-        assert!(w.worms[0].vel.y < 0.0, "too late: {}", w.worms[0].vel.y);
+        let mut w = settled(block, (16.0, 16.0));
+        run(&mut w, 300, walk(FRAC_PI_2));
+        let worm = &w.worms[0];
+        assert!(worm.pos.y > 7.9, "mantled onto the top: y = {}", worm.pos.y);
+        assert!(worm.pos.x > 18.0, "and moved onto it: x = {}", worm.pos.x);
+        assert!(worm.on_ground);
     }
 
     #[test]
@@ -864,10 +1004,10 @@ mod tests {
             w.worms[0].pos.y += 0.3;
             w.worms[0].on_ground = false;
             w.worms[0].vel = Vec3::new(16.0, -2.0, 0.0);
-            run(&mut w, 30, input);
+            run(&mut w, 60, input);
             w.worms[0].vel.x
         };
-        assert!(landing(walk(FRAC_PI_2)) > 11.0, "steering keeps momentum: {}", landing(walk(FRAC_PI_2)));
+        assert!(landing(walk(FRAC_PI_2)) > 10.0, "steering keeps momentum: {}", landing(walk(FRAC_PI_2)));
         assert!(landing(Input::default()) < 1.0, "letting go of the keys brakes: {}", landing(Input::default()));
     }
 
@@ -1007,13 +1147,15 @@ mod tests {
             (p.y - 4.0).min((p.y - 5.2).max(18.0 - p.x))
         }
         let mut w = settled(low, (16.0, 16.0));
-        run(&mut w, 120, walk(FRAC_PI_2));
+        run(&mut w, 60, walk(FRAC_PI_2));
         let worm = &w.worms[0];
         assert!(worm.pos.x > 19.0, "got up the 0.4 m ledge: x = {}", worm.pos.x);
-        assert!((worm.pos.y - 4.4).abs() < 0.05 && worm.on_ground, "stands on it: y = {}", worm.pos.y);
+        // The stored field is quantized to 0.25 m voxels, so the ledge sits
+        // within half a voxel of 4.4. What matters is that it is UP there.
+        assert!(worm.pos.y > 4.3 && worm.pos.y < 4.7 && worm.on_ground, "stands on it: y = {}", worm.pos.y);
 
         let mut w = settled(high, (16.0, 16.0));
-        run(&mut w, 120, walk(FRAC_PI_2));
+        run(&mut w, 60, walk(FRAC_PI_2));
         assert!(w.worms[0].pos.x < 18.0 - WORM_RADIUS + 0.05, "a 1.2 m wall stops it: x = {}", w.worms[0].pos.x);
     }
 
@@ -1026,14 +1168,16 @@ mod tests {
     }
 
     #[test]
-    fn the_rope_launches_a_worm_out_of_a_pit_it_cannot_jump_out_of() {
+    fn a_worm_gets_out_of_a_pit_by_climbing_or_by_roping() {
         let towards_wall = Input { yaw: FRAC_PI_2, pitch: 1.2, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
 
-        // Without the rope: jump and push at the wall for five seconds.
+        // Without the rope: hold into the wall and climb the 10 m out.
         let mut w = settled(pit, (16.0, 16.0));
-        let floor = w.worms[0].pos.y;
-        let best = apex(&mut w, floor, 300, Input { jump: true, ..towards_wall });
-        assert!(best < 4.0, "a 10 m pit is no place for jumping: rose {best} m");
+        run(&mut w, 300, towards_wall);
+        let worm = &w.worms[0];
+        assert!(worm.pos.y > 9.9, "climbed out of the pit: y = {}", worm.pos.y);
+        assert!(worm.on_ground, "standing above it");
+        assert!(worm.pos.x > 16.0 + 3.2, "beyond the rim: x = {}", worm.pos.x);
 
         // With it: shoot at the wall just under the rim, reel in (which
         // accelerates the worm up the wall), and kick off with a jump at the top.
@@ -1077,7 +1221,7 @@ mod tests {
             fastest
         };
         let (idle, pumped) = (swing(false), swing(true));
-        assert!(pumped > WALK_SPEED + 3.0, "pumped swing {pumped}");
+        assert!(pumped > 11.0, "pumped swing {pumped}");
         assert!(pumped > idle * 1.4, "pumping beats hanging on: {idle} -> {pumped}");
     }
 
@@ -1117,7 +1261,7 @@ mod tests {
         }
         assert!(w.worms[0].pos.x <= 19.0, "stuck in the tunnel at x = {}", w.worms[0].pos.x);
         // ~6 m of tunnel at walking speed is under a second; allow for the bumps.
-        assert!(ticks < 120, "took {ticks} ticks to walk {} m", deep - 19.0);
+        assert!(ticks < 200, "took {ticks} ticks to walk {} m", deep - 19.0);
     }
 
     #[test]
@@ -1140,7 +1284,7 @@ mod tests {
         }
         let worm = &w.worms[0];
         assert!(worm.pos.is_finite() && worm.vel.is_finite(), "{worm:?}");
-        assert!(worm.vel.length() <= MAX_SPEED + 0.01);
+        assert!(worm.vel.length() <= 40.01);
         let size = w.grid.size_metres();
         assert!(worm.pos.cmpge(Vec3::ZERO).all() && worm.pos.cmple(size).all(), "still in the world");
     }

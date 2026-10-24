@@ -34,6 +34,15 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3]) -> Vec<DrawCapsule> {
         let head = pos + Vec3::Y * (WORM_HEIGHT - WORM_RADIUS);
         out.push(caps(foot, head, WORM_RADIUS, COLOURS[i % COLOURS.len()], true));
 
+        // A short fin along the body's facing shows which way the BODY points.
+        // The body turns to run while the eyes and gun follow the mouse, so
+        // without this the turning is invisible on a round capsule.
+        // It runs front-to-back so it reads from the chase camera too.
+        let face = Vec3::new(worm.face_yaw.sin(), 0.0, worm.face_yaw.cos());
+        let chest = pos + Vec3::Y * (WORM_HEIGHT * 0.5);
+        let tint = (COLOURS[i % COLOURS.len()] * 1.45).clamp(Vec3::ZERO, Vec3::ONE);
+        out.push(caps(chest - face * 0.52, chest + face * 0.52, 0.10, tint, false));
+
         // Eyes show which way the worm faces (the body is round all the way
         // round). Each is a very short capsule, because a capsule needs a direction.
         for side in [-1.0, 1.0] {
