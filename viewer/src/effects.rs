@@ -7,7 +7,7 @@
 // no replay and no syncing: a client that joined a second ago simply shows
 // fewer of them.
 
-use crate::renderer::DrawCapsule;
+use crate::renderer::DrawPrim;
 use glam::Vec3;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT};
 use sim::{Event, Projectile, DT};
@@ -20,43 +20,118 @@ const MAX_BURSTS: usize = 24;
 const MAX_DUST: usize = 20;
 
 const DUST: Vec3 = Vec3::new(0.60, 0.55, 0.46);
+const SMOKE: Vec3 = Vec3::new(0.38, 0.36, 0.34);
 const SPARK: Vec3 = Vec3::new(1.0, 0.72, 0.28);
 const HOT: Vec3 = Vec3::new(1.0, 0.90, 0.60);
 
-/// Colour and size of each weapon's projectile, as picked in a paint program.
-/// (A capsule: the radius, and a streak behind it that grows with the speed.)
-fn look(weapon: u8) -> (Vec3, f32) {
+// Colours shared with the weapons in `worms.rs`, so a shot matches its gun.
+const CYAN: Vec3 = Vec3::new(0.35, 0.92, 1.0);
+const EMBER: Vec3 = Vec3::new(1.0, 0.55, 0.16);
+const LIME: Vec3 = Vec3::new(0.55, 0.95, 0.30);
+const MAGENTA: Vec3 = Vec3::new(0.90, 0.35, 0.85);
+const VIOLET: Vec3 = Vec3::new(0.55, 0.42, 1.0);
+const ICE: Vec3 = Vec3::new(0.80, 0.92, 1.0);
+const BRASS: Vec3 = Vec3::new(0.80, 0.62, 0.26);
+const BEAM: Vec3 = Vec3::new(0.55, 0.92, 1.0);
+const OLIVE: Vec3 = Vec3::new(0.31, 0.37, 0.20);
+const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
+
+/// A frame along the direction of travel: forward, a perpendicular, and up.
+/// Falls back to +Z for a projectile at rest, so a sphere never degenerates into
+/// a zero-length capsule (which the raycast cannot solve).
+fn frame(dir: Vec3) -> (Vec3, Vec3, Vec3) {
+    let fwd = if dir.length_squared() > 1.0e-8 { dir.normalize() } else { Vec3::Z };
+    let mut side = fwd.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-6 {
+        side = Vec3::X;
+    }
+    let side = side.normalize();
+    (fwd, side, side.cross(fwd).normalize())
+}
+
+/// The muzzle flash: a hot ball whose colour and size match the weapon, so a
+/// rocket booms orange and a blaster snaps cyan.
+fn flash(weapon: u8) -> (Vec3, f32) {
     match weapon {
-        BLASTER => (Vec3::new(0.35, 0.92, 1.0), 0.09),
-        ROCKET => (Vec3::new(1.0, 0.55, 0.2), 0.17),
-        BOUNCER => (Vec3::new(0.5, 1.0, 0.45), 0.14),
-        BOMB => (Vec3::new(0.95, 0.25, 0.25), 0.28),
-        CLUSTER => (Vec3::new(1.0, 0.9, 0.3), 0.2),
-        BOMBLET => (Vec3::new(1.0, 0.9, 0.3), 0.11),
-        SWARM => (Vec3::new(1.0, 0.4, 0.85), 0.11),
-        TELEPORT => (Vec3::new(0.7, 0.5, 1.0), 0.2),
-        NOVA => (Vec3::new(0.85, 0.95, 1.0), 0.55),
-        _ => (Vec3::ONE, 0.1),
+        BLASTER => (CYAN, 0.20),
+        ROCKET => (EMBER, 0.34),
+        BOUNCER => (LIME, 0.24),
+        BOMB => (EMBER, 0.26),
+        CLUSTER => (BRASS, 0.28),
+        SWARM => (MAGENTA, 0.18),
+        TELEPORT => (VIOLET, 0.26),
+        NOVA => (ICE, 0.38),
+        _ => (HOT, 0.20),
     }
 }
 
-/// The projectiles as capsules. `alpha` is how far the frame is into the
+/// One projectile, drawn as a small assembly of primitives so the ammunition
+/// reads as a *thing* in flight, not a coloured dash. `at` is the position this
+/// frame; everything is built around it along the direction of travel.
+fn ammo(weapon: u8, at: Vec3, vel: Vec3, out: &mut Vec<DrawPrim>) {
+    let (d, _side, up) = frame(vel);
+    let back = |t: f32| at - d * t;
+    let ball = |p: Vec3, r: f32, col: Vec3| DrawPrim::capsule(p, p + up * 0.004, r, col, false);
+    match weapon {
+        BLASTER => {
+            // A plasma bolt: a hot head with a short tail so its speed reads.
+            out.push(DrawPrim::cylinder(back(0.36), at, 0.035, CYAN, false));
+            out.push(ball(at, 0.11, HOT).glowing());
+        }
+        ROCKET => {
+            // A real rocket: body, nose, and a flame where the exhaust is.
+            out.push(DrawPrim::cylinder(back(0.50), at, 0.085, OLIVE, false));
+            out.push(DrawPrim::cylinder(at, at + d * 0.22, 0.05, EMBER, false));
+            out.push(ball(back(0.60), 0.13, EMBER).glowing());
+        }
+        BOUNCER => {
+            out.push(ball(at, 0.17, LIME).glowing());
+        }
+        BOMB => {
+            out.push(ball(at, 0.30, BOMBSHELL));
+            out.push(ball(at + up * 0.30, 0.06, EMBER).glowing());
+        }
+        CLUSTER => {
+            // A brass shell with a hot tracer tip.
+            out.push(DrawPrim::cylinder(back(0.34), at, 0.10, BRASS, false));
+            out.push(ball(at + d * 0.06, 0.075, EMBER).glowing());
+        }
+        BOMBLET => {
+            out.push(ball(at, 0.11, EMBER).glowing());
+        }
+        SWARM => {
+            // A tiny dart: a slim body and a bright nose.
+            out.push(DrawPrim::cylinder(back(0.26), at - d * 0.05, 0.045, MAGENTA, false));
+            out.push(ball(at + d * 0.05, 0.06, MAGENTA).glowing());
+        }
+        TELEPORT => {
+            // An orb inside a halo: the ring is what says "portal".
+            out.push(DrawPrim::cylinder(at - d * 0.012, at + d * 0.012, 0.30, VIOLET, false).glowing());
+            out.push(ball(at, 0.18, VIOLET).glowing());
+        }
+        NOVA => {
+            // A screen-clearing warhead: huge, icy, ringed in cyan.
+            out.push(DrawPrim::cylinder(at - d * 0.015, at + d * 0.015, 0.64, CYAN, false).glowing());
+            out.push(ball(at, 0.50, ICE));
+        }
+        _ => {
+            out.push(ball(at, 0.10, HOT));
+        }
+    }
+}
+
+/// The projectiles as primitives. `alpha` is how far the frame is into the
 /// current tick (0..1), exactly as for the worms: a bolt moves a metre a tick,
 /// so drawing it only where it was at the last tick would judder on a 144 Hz
 /// display. A projectile flies straight (or nearly), so instead of storing its
 /// last position, step back along its velocity.
-pub fn projectiles(list: &[Projectile], alpha: f32) -> Vec<DrawCapsule> {
-    list.iter()
-        .map(|p| {
-            let (colour, radius) = look(p.weapon);
-            let at = p.pos - p.vel * DT * (1.0 - alpha);
-            // The streak behind it says which way it goes. A bomb or a bomblet at
-            // rest has no direction, so it is a short stub.
-            let speed = p.vel.length();
-            let tail = if speed > 0.5 { at - p.vel / speed * (speed * 0.03).clamp(0.0, 1.2) } else { at - Vec3::Y * 0.01 };
-            DrawCapsule { a: tail, b: at, radius, colour, shadow: false }
-        })
-        .collect()
+pub fn projectiles(list: &[Projectile], alpha: f32) -> Vec<DrawPrim> {
+    let mut out = Vec::with_capacity(list.len() * 3);
+    for p in list {
+        let at = p.pos - p.vel * DT * (1.0 - alpha);
+        ammo(p.weapon, at, p.vel, &mut out);
+    }
+    out
 }
 
 enum Shape {
@@ -80,11 +155,22 @@ struct Effect {
     burst: bool,
     /// Radius of a line effect, in metres.
     width: f32,
+    /// Self-lit: flashes, fireballs and beams are their own light source, so the
+    /// shader draws them flat and bright. Dust and smoke are lit normally.
+    hot: bool,
 }
 
 impl Effect {
     fn burst(shape: Shape, colour: Vec3, life: f32) -> Effect {
-        Effect { shape, colour, vel: Vec3::ZERO, gravity: 0.0, age: 0.0, life, burst: true, width: 0.12 }
+        Effect { shape, colour, vel: Vec3::ZERO, gravity: 0.0, age: 0.0, life, burst: true, width: 0.12, hot: false }
+    }
+
+    /// Draw it self-lit (flat and bright). Only for things small enough that a
+    /// flat colour reads as light: a flash, a spark, a beam. A big fireball is
+    /// left shaded, or it turns into a flat balloon.
+    fn glow(mut self) -> Effect {
+        self.hot = true;
+        self
     }
 
     fn puff(at: Vec3, vel: Vec3, radius: f32, colour: Vec3, life: f32, gravity: f32) -> Effect {
@@ -97,6 +183,7 @@ impl Effect {
             life,
             burst: false,
             width: 0.0,
+            hot: false,
         }
     }
 }
@@ -115,39 +202,85 @@ impl Effects {
     pub fn add(&mut self, event: &Event) {
         match *event {
             Event::Explosion { pos, radius } => {
-                self.push_burst(Effect::burst(
-                    Shape::Ball { at: pos, radius },
-                    Vec3::new(1.0, 0.62, 0.22),
-                    0.25 + radius * 0.04,
+                // The sim's `radius` is the *blast* radius (the edge of the
+                // damage sphere), so the visible ball has to sit well inside it:
+                // a fireball as big as the damage volume hides the whole fight.
+                self.push_burst(
+                    Effect::burst(
+                        Shape::Ball { at: pos, radius: radius * 0.26 },
+                        Vec3::new(1.0, 0.98, 0.92),
+                        0.10,
+                    )
+                    .glow(),
+                );
+                let fire = [
+                    (0.44, 0.12, Vec3::new(1.0, 0.60, 0.20)),
+                    (0.33, 0.17, Vec3::new(1.0, 0.80, 0.28)),
+                    (0.22, 0.20, Vec3::new(1.0, 0.96, 0.78)),
+                ];
+                for (k, (size, dist, col)) in fire.into_iter().enumerate() {
+                    // Deterministic spray, like every other effect here: no RNG.
+                    let a = k as f32 * 2.1 + pos.x * 1.3 + pos.z * 0.7;
+                    let off = Vec3::new(a.cos(), 0.2 + 0.5 * (a * 1.7).sin(), a.sin()) * radius * dist;
+                    self.push_burst(Effect::burst(
+                        Shape::Ball { at: pos + off, radius: radius * size },
+                        col,
+                        0.25 + radius * 0.04,
+                    ));
+                }
+                // Debris sparks fly out, then a small dark smoke puff rises:
+                // small, because a big one would swallow the fireball.
+                self.debris(pos, radius);
+                self.push_dust(Effect::puff(
+                    pos + Vec3::Y * 0.3,
+                    Vec3::Y * 1.2,
+                    radius * 0.22,
+                    SMOKE,
+                    0.8 + radius * 0.05,
+                    -0.2,
                 ));
-                // A little dust thrown out by the blast, heavier than a landing.
                 self.dust(pos + Vec3::Y * 0.2, 10.0);
             }
             Event::Beam { from, to } => {
-                self.push_burst(Effect::burst(Shape::Line { from, to }, Vec3::new(0.6, 1.0, 1.0), 0.2));
+                // A hot line, with a flash at each end: the muzzle it left and
+                // the point it hit. One capsule, so it stays cheap.
+                let mut line = Effect::burst(Shape::Line { from, to }, BEAM, 0.20).glow();
+                line.width = 0.24;
+                self.push_burst(line);
+                self.push_burst(Effect::burst(Shape::Ball { at: from, radius: 0.24 }, BEAM, 0.09).glow());
+                self.push_burst(Effect::burst(Shape::Ball { at: to, radius: 0.55 }, BEAM, 0.16).glow());
             }
-            Event::Shot { pos, .. } => {
-                // The tracer's direction is known to `main`; a short hot ball at
-                // the muzzle is enough from any angle and needs no extra state.
-                self.push_burst(Effect::puff(pos, Vec3::ZERO, 0.18, HOT, 0.06, 0.0));
+            Event::Shot { weapon, pos, .. } => {
+                // A short hot ball at the muzzle in the weapon's own colour (the
+                // tracer's direction is known to `main`), plus a wisp of smoke
+                // that drifts up after it.
+                let (col, size) = flash(weapon);
+                self.push_burst(Effect::puff(pos, Vec3::ZERO, size, col, 0.06, 0.0).glow());
+                self.push_dust(Effect::puff(pos + Vec3::Y * 0.02, Vec3::Y * 0.5, 0.08, SMOKE, 0.4, -0.1));
             }
             Event::Hit { pos, .. } => {
                 self.hit(pos);
             }
             Event::Died { pos, .. } => {
-                self.push_burst(Effect::burst(
-                    Shape::Ball { at: pos + Vec3::Y * 0.9, radius: 1.3 },
-                    Vec3::new(1.0, 1.0, 0.9),
-                    0.45,
-                ));
+                self.push_burst(
+                    Effect::burst(
+                        Shape::Ball { at: pos + Vec3::Y * 0.9, radius: 1.3 },
+                        Vec3::new(1.0, 1.0, 0.9),
+                        0.45,
+                    )
+                    .glow(),
+                );
             }
             Event::Teleported { from, to, .. } => {
                 for at in [from, to] {
-                    self.push_burst(Effect::burst(
-                        Shape::Ball { at: at + Vec3::Y * 0.9, radius: 1.0 },
-                        Vec3::new(0.7, 0.5, 1.0),
-                        0.3,
-                    ));
+                    self.push_burst(
+                        Effect::burst(
+                            Shape::Ball { at: at + Vec3::Y * 0.9, radius: 1.0 },
+                            Vec3::new(0.7, 0.5, 1.0),
+                            0.3,
+                        )
+                        .glow(),
+                    );
                 }
             }
             _ => {}
@@ -157,7 +290,7 @@ impl Effects {
     /// A hit: a brief flash and a fan of sparks. `pos` is the point on the
     /// victim, so the sparks read as coming off the body, not the shooter.
     pub fn hit(&mut self, at: Vec3) {
-        self.push_burst(Effect::puff(at, Vec3::ZERO, 0.16, Vec3::new(1.0, 0.98, 0.9), 0.07, 0.0));
+        self.push_burst(Effect::puff(at, Vec3::ZERO, 0.16, Vec3::new(1.0, 0.98, 0.9), 0.07, 0.0).glow());
         for i in 0..5 {
             // Deterministic spray: no RNG in the viewer, and the same hit at the
             // same place looks the same in a replay.
@@ -172,6 +305,25 @@ impl Effects {
                 0.12 + i as f32 * 0.02,
                 16.0,
             ));
+        }
+    }
+
+    /// A fan of debris thrown out of an explosion: bigger and farther than a
+    /// hit's sparks, so a rocket reads as a real blast rather than a pop.
+    fn debris(&mut self, at: Vec3, radius: f32) {
+        let n = 7;
+        for i in 0..n {
+            let a = i as f32 * 2.399 + at.x * 1.3 + at.z * 0.7;
+            let up = 0.35 + 0.55 * (i as f32 * 2.1).sin().abs();
+            let dir = Vec3::new(a.cos(), up, a.sin()).normalize_or_zero();
+            self.push_burst(Effect::puff(
+                at,
+                dir * (4.0 + radius * 0.8),
+                0.06,
+                SPARK,
+                0.20 + (i as f32 % 3.0) * 0.03,
+                14.0,
+            ).glow());
         }
     }
 
@@ -221,7 +373,7 @@ impl Effects {
         self.dust.retain(|e| e.age < e.life);
     }
 
-    pub fn capsules(&self) -> Vec<DrawCapsule> {
+    pub fn capsules(&self) -> Vec<DrawPrim> {
         self.list
             .iter()
             .chain(self.dust.iter())
@@ -237,16 +389,12 @@ impl Effects {
                             1.0 - u
                         };
                         // A capsule needs a direction: a stub makes a sphere.
-                        DrawCapsule {
-                            a: at,
-                            b: at + Vec3::Y * 0.01,
-                            radius: radius * size,
-                            colour: e.colour,
-                            shadow: false,
-                        }
+                        let ball = DrawPrim::capsule(at, at + Vec3::Y * 0.01, radius * size, e.colour, false);
+                        if e.hot { ball.glowing() } else { ball }
                     }
                     Shape::Line { from, to } => {
-                        DrawCapsule { a: from, b: to, radius: e.width * (1.0 - u), colour: e.colour, shadow: false }
+                        let line = DrawPrim::capsule(from, to, e.width * (1.0 - u), e.colour, false);
+                        if e.hot { line.glowing() } else { line }
                     }
                 }
             })
@@ -276,13 +424,23 @@ mod tests {
         e.capsules().len()
     }
 
+    /// The `a` endpoint of a puff (all effect primitives are capsules).
+    fn a_of(c: &DrawPrim) -> Vec3 {
+        match *c {
+            DrawPrim::Capsule { a, .. } | DrawPrim::Cylinder { a, .. } => a,
+            DrawPrim::Cuboid { centre, .. } => centre,
+        }
+    }
+
     #[test]
-    fn a_shot_flashes_briefly() {
+    fn a_shot_flashes_briefly_then_smokes() {
         let mut e = Effects::default();
         e.add(&Event::Shot { worm: 0, weapon: 0, pos: Vec3::ZERO });
-        assert_eq!(count(&e), 1);
+        assert_eq!(count(&e), 2, "a flash and a wisp of smoke");
         e.update(0.07);
-        assert_eq!(count(&e), 0, "a muzzle flash is over in a few frames");
+        assert_eq!(count(&e), 1, "the flash is over, the smoke hangs on");
+        e.update(0.5);
+        assert_eq!(count(&e), 0);
     }
 
     #[test]
@@ -301,11 +459,29 @@ mod tests {
         let mut e = Effects::default();
         e.dust(Vec3::ZERO, 12.0);
         assert!(count(&e) >= 4, "hard landings throw a ring: {}", count(&e));
-        let at = e.capsules()[0].a;
+        let at = a_of(&e.capsules()[0]);
         e.update(0.1);
-        assert!((e.capsules()[0].a - at).length() > 0.001, "the puffs move");
+        assert!((a_of(&e.capsules()[0]) - at).length() > 0.001, "the puffs move");
         e.update(1.0);
         assert_eq!(count(&e), 0);
+    }
+
+    #[test]
+    fn a_projectile_at_rest_still_draws_a_real_sphere() {
+        // A dropped bomb has no velocity, so the motion frame has no forward
+        // vector. It must still produce a usable sphere, not a degenerate one.
+        let bomb = Projectile { pos: Vec3::new(3.0, 4.0, 5.0), vel: Vec3::ZERO, weapon: BOMB, owner: 0, life: 3.0 };
+        let prims = projectiles(std::slice::from_ref(&bomb), 1.0);
+        assert!(!prims.is_empty());
+        for p in &prims {
+            match *p {
+                DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
+                    assert!(a.is_finite() && b.is_finite() && radius > 0.0, "{a:?} {b:?} {radius}");
+                    assert!((a - b).length() > 0.0 || radius > 0.0, "a sphere needs a radius");
+                }
+                DrawPrim::Cuboid { centre, half, .. } => assert!(centre.is_finite() && half.max_element() > 0.0),
+            }
+        }
     }
 
     #[test]

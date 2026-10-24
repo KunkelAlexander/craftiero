@@ -68,9 +68,15 @@ Headless modes (no window needed):
 cargo run -p viewer --release -- --shot out.png --edits --cam 62,36,54,180,-12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50
+cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 66.5,19.4,41,226,-11 --weapon 8
 cargo run -p viewer --release -- --bench --size 1920x1080
 cargo test -p sdf -p sim -p viewer
 ```
+
+`--fire id[,ticks]` fires that weapon and takes the picture `ticks` later (so
+projectiles and blasts are in the air); `--weapon id` just holds it, with no
+shot, which is the way to look at a gun. `--no-brush` hides the orange dig
+ring that otherwise sits on the terrain behind the character.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.

@@ -81,4 +81,4 @@ Fork of the 2D "Neon Bomber-Liero" (see git history before the "Fork for 3D" com
 
 ## Commands
 - `cargo test -p sdf -p sim -p viewer`, `cargo run -p sdf --release --example bench`
-- `cargo run -p viewer --release` (interactive), `-- --shot out.png [--edits --cam x,y,z,yaw,pitch --worm x,z,yaw [--rope]]` (headless screenshot; `--fire id[,ticks]` fires that weapon and shoots the picture some ticks later), `-- --bench` (GPU ms per pass). Windows defaults to DX12; `WGPU_BACKEND=vulkan` overrides.
+- `cargo run -p viewer --release` (interactive), `-- --shot out.png [--edits --cam x,y,z,yaw,pitch --worm x,z,yaw [--rope]]` (headless screenshot; `--fire id[,ticks]` fires that weapon and shoots the picture some ticks later, `--weapon id` holds it with no shot, `--no-brush` hides the dig ring), `-- --bench` (GPU ms per pass). Windows defaults to DX12; `WGPU_BACKEND=vulkan` overrides.

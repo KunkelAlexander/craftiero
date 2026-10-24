@@ -59,8 +59,8 @@ impl Gpu {
 /// the textures and is updated by `Renderer::sync`.
 pub struct FrameParams<'a> {
     pub camera: &'a Camera,
-    /// Worms, guns and ropes (at most `MAX_CAPSULES`, the rest are dropped).
-    pub capsules: &'a [DrawCapsule],
+    /// Worms, guns, ropes and effects (at most `MAX_CAPSULES`, the rest are dropped).
+    pub capsules: &'a [DrawPrim],
     /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
     pub brush: Option<(Vec3, f32)>,
     pub time: f32,
@@ -69,23 +69,87 @@ pub struct FrameParams<'a> {
     pub outlines: bool,
 }
 
-/// How many capsules the shader's uniform block holds (`array<Capsule, 64>`).
-pub const MAX_CAPSULES: usize = 64;
+/// How many primitives the shader's uniform block holds (`array<Prim, 256>`).
+/// Raised above 128 so four worms can each carry an oversized, multi-part weapon
+/// with room left over for projectiles and effects.
+pub const MAX_CAPSULES: usize = 256;
 
-/// A line segment swept by a sphere. Worms are drawn as these: the ray-capsule
-/// test has a closed-form answer, so the raymarcher finds them with a few
-/// multiplications per pixel instead of a mesh pass or a second distance field.
+/// One primitive the raymarcher intersects in closed form (no sphere tracing),
+/// so each stays a handful of multiplications per pixel. Worms are mostly
+/// capsules; a gun is boxes and cylinders, because flat faces and hard edges are
+/// what stop a character reading as a soft, AI-generated blob.
 #[derive(Clone, Copy)]
-pub struct DrawCapsule {
-    pub a: Vec3,
-    pub b: Vec3,
-    pub radius: f32,
-    /// The colour as picked in a paint program (sRGB); the shader converts it.
-    pub colour: Vec3,
+pub enum DrawPrim {
+    /// A line segment swept by a sphere (rounded ends).
+    Capsule { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool },
+    /// A line segment swept by a disc (flat ends), for a crisp gun barrel.
+    Cylinder { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool },
+    /// A hard-edged box, long axis along `forward`, its "up" taken from world up.
+    Cuboid { centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool, glow: bool },
+}
+
+impl DrawPrim {
+    pub fn capsule(a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool) -> DrawPrim {
+        DrawPrim::Capsule { a, b, radius, colour, shadow, glow: false }
+    }
+    pub fn cylinder(a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool) -> DrawPrim {
+        DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: false }
+    }
+    pub fn cuboid(centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool) -> DrawPrim {
+        DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: false }
+    }
+
+    /// Make it self-lit: the shader skips shading and draws the colour flat and
+    /// bright, so a muzzle, coil or hot core reads as a light source instead of
+    /// painted plastic.
+    pub fn glowing(self) -> DrawPrim {
+        match self {
+            DrawPrim::Capsule { a, b, radius, colour, shadow, .. } => {
+                DrawPrim::Capsule { a, b, radius, colour, shadow, glow: true }
+            }
+            DrawPrim::Cylinder { a, b, radius, colour, shadow, .. } => {
+                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: true }
+            }
+            DrawPrim::Cuboid { centre, half, forward, colour, shadow, .. } => {
+                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: true }
+            }
+        }
+    }
+
     /// Does it cast a shadow on the terrain? (Bodies do; eyes and ropes are too
     /// small to matter, and every caster costs every terrain pixel a test.)
-    pub shadow: bool,
+    pub fn shadow(&self) -> bool {
+        match self {
+            DrawPrim::Capsule { shadow, .. }
+            | DrawPrim::Cylinder { shadow, .. }
+            | DrawPrim::Cuboid { shadow, .. } => *shadow,
+        }
+    }
+
+    fn glow(&self) -> bool {
+        match self {
+            DrawPrim::Capsule { glow, .. }
+            | DrawPrim::Cylinder { glow, .. }
+            | DrawPrim::Cuboid { glow, .. } => *glow,
+        }
+    }
+
+    /// A conservative bounding sphere (centre, radius), used by the tile mask and
+    /// the shader's cheap reject before the full intersection.
+    fn bounds(&self) -> (Vec3, f32) {
+        match self {
+            DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
+                ((*a + *b) * 0.5, radius + (*b - *a).length() * 0.5)
+            }
+            DrawPrim::Cuboid { centre, half, .. } => (*centre, half.length()),
+        }
+    }
 }
+
+/// The primitive kind stored in the shader's `col.w`.
+const KIND_CAPSULE: f32 = 0.0;
+const KIND_CYLINDER: f32 = 1.0;
+const KIND_CUBOID: f32 = 2.0;
 
 /// The screen is cut into 32 x 18 tiles, and every tile gets a bitmask of the
 /// capsules that can be seen in it. Why: looping over all capsules for every
@@ -95,13 +159,14 @@ pub struct DrawCapsule {
 pub const TILES_X: usize = 32;
 pub const TILES_Y: usize = 18;
 
-// Must match `struct Capsule` in shaders.rs: three vec4s.
+// Must match `struct Prim` in shaders.rs: four vec4s.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuCapsule {
-    a: [f32; 4],      // xyz: start, w: radius
-    b: [f32; 4],      // xyz: end, w: radius of a sphere around the whole capsule
-    colour: [f32; 4], // rgb
+struct GpuPrim {
+    a: [f32; 4],      // capsule/cylinder: start.xyz + radius; cuboid: centre.xyz
+    b: [f32; 4],      // capsule/cylinder: end.xyz; cuboid: half extents. w = bound radius
+    c: [f32; 4],      // cuboid: forward axis.xyz; capsule/cylinder: unused
+    colour: [f32; 4], // rgb + kind (0 capsule, 1 cylinder, 2 cuboid)
 }
 
 // Must match `struct U` in shaders.rs: vec4s all the way, so no padding questions.
@@ -116,27 +181,31 @@ struct Uniforms {
     brush: [f32; 4],
     flags: [f32; 4],
     size: [f32; 4],
-    counts: [f32; 4], // x: number of capsules in use, y: shadow casters (the first y)
-    capsules: [GpuCapsule; MAX_CAPSULES],
-    tiles: [[u32; 4]; 2 * TILES_X * TILES_Y / 4],
+    counts: [f32; 4], // x: number of primitives in use, y: shadow casters (the first y)
+    capsules: [GpuPrim; MAX_CAPSULES],
+    tiles: [[u32; 4]; TILE_WORDS * TILES_X * TILES_Y / 4],
 }
 
 /// The number of 4-tile groups in one word of the tile masks.
 const TILE_GROUPS: usize = TILES_X * TILES_Y / 4;
 
+/// How many 32-bit words a tile mask needs to cover every capsule bit. This is
+/// the one number that grows with `MAX_CAPSULES`: 64 capsules fit in two words,
+/// 128 in four. `tile_masks` packs that many blocks and the shader reads them.
+pub const TILE_WORDS: usize = MAX_CAPSULES / 32;
+
 /// For every screen tile, which capsules (bit i = capsule i) might be seen in it.
 /// Conservative: a tile may be marked without a capsule in it, never the reverse.
-/// Up to 64 capsules means two 32-bit words per tile; they are packed as two
-/// blocks, so the shader can pick the block with the capsule index.
-fn tile_masks(cam: &Camera, aspect: f32, capsules: &[&DrawCapsule]) -> [[u32; 4]; 2 * TILE_GROUPS] {
-    let mut words = [[0u32; 2]; TILES_X * TILES_Y];
+/// `TILE_WORDS` 32-bit words per tile are packed as that many blocks, so the
+/// shader can pick the block with the capsule index.
+fn tile_masks(cam: &Camera, aspect: f32, prims: &[&DrawPrim]) -> [[u32; 4]; TILE_WORDS * TILE_GROUPS] {
+    let mut words = [[0u32; TILE_WORDS]; TILES_X * TILES_Y];
     let (right, up) = cam.right_up();
     let fwd = cam.forward();
     let (hy, hx) = ((cam.fov_y * 0.5).tan(), (cam.fov_y * 0.5).tan() * aspect);
-    for (i, c) in capsules.iter().enumerate() {
-        // A sphere around the whole capsule, then the sphere's rectangle on screen.
-        let mid = (c.a + c.b) * 0.5;
-        let r = c.radius + (c.b - c.a).length() * 0.5;
+    for (i, c) in prims.iter().enumerate() {
+        // A sphere around the whole primitive, then the sphere's rectangle on screen.
+        let (mid, r) = c.bounds();
         let rel = mid - cam.pos;
         let depth = rel.dot(fwd);
         if depth + r < 0.0 {
@@ -166,12 +235,38 @@ fn tile_masks(cam: &Camera, aspect: f32, capsules: &[&DrawCapsule]) -> [[u32; 4]
             }
         }
     }
-    let mut packed = [[0u32; 4]; 2 * TILE_GROUPS];
+    let mut packed = [[0u32; 4]; TILE_WORDS * TILE_GROUPS];
     for (k, w) in words.iter().enumerate() {
-        packed[k / 4][k % 4] = w[0];
-        packed[TILE_GROUPS + k / 4][k % 4] = w[1];
+        for word in 0..TILE_WORDS {
+            packed[word * TILE_GROUPS + k / 4][k % 4] = w[word];
+        }
     }
     packed
+}
+
+/// Pack a `DrawPrim` into the GPU's uniform layout (see `struct Prim` in
+/// shaders.rs). The kind is stashed in the colour's alpha channel and the
+/// self-lit flag in `c.w` (the only float every kind leaves free).
+fn pack(c: &DrawPrim) -> GpuPrim {
+    let glow = if c.glow() { 1.0 } else { 0.0 };
+    let (a, b, radius, colour, kind) = match *c {
+        DrawPrim::Capsule { a, b, radius, colour, .. } => (a, b, radius, colour, KIND_CAPSULE),
+        DrawPrim::Cylinder { a, b, radius, colour, .. } => (a, b, radius, colour, KIND_CYLINDER),
+        DrawPrim::Cuboid { centre, half, forward, colour, .. } => {
+            return GpuPrim {
+                a: centre.extend(0.0).to_array(),
+                b: half.extend(half.length()).to_array(),
+                c: forward.normalize_or_zero().extend(glow).to_array(),
+                colour: colour.extend(KIND_CUBOID).to_array(),
+            };
+        }
+    };
+    GpuPrim {
+        a: a.extend(radius).to_array(),
+        b: b.extend(radius + (b - a).length() * 0.5).to_array(),
+        c: [0.0, 0.0, 0.0, glow],
+        colour: colour.extend(kind).to_array(),
+    }
 }
 
 pub struct Renderer {
@@ -506,23 +601,16 @@ impl Renderer {
         let (brush_pos, brush_r) = f.brush.unwrap_or((Vec3::ZERO, 0.0));
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // Shadow casters first: the shader's shadow loop runs over just those.
-        let ordered: Vec<&DrawCapsule> = (f.capsules.iter().filter(|c| c.shadow))
-            .chain(f.capsules.iter().filter(|c| !c.shadow))
+        let ordered: Vec<&DrawPrim> = (f.capsules.iter().filter(|c| c.shadow()))
+            .chain(f.capsules.iter().filter(|c| !c.shadow()))
             .take(MAX_CAPSULES)
             .collect();
-        let casters = ordered.iter().filter(|c| c.shadow).count();
+        let casters = ordered.iter().filter(|c| c.shadow()).count();
         let tiles = tile_masks(cam, aspect, &ordered);
-        let mut capsules = [GpuCapsule::zeroed(); MAX_CAPSULES];
+        let mut capsules = [GpuPrim::zeroed(); MAX_CAPSULES];
         let used = ordered.len();
         for (gpu, c) in capsules.iter_mut().zip(&ordered) {
-            *gpu = GpuCapsule {
-                a: c.a.extend(c.radius).to_array(),
-                // The bounding sphere (centred on the middle) is what lets the
-                // shader skip a capsule with two multiplications instead of the
-                // full test: see `cap_hit`.
-                b: c.b.extend(c.radius + (c.b - c.a).length() * 0.5).to_array(),
-                colour: c.colour.extend(0.0).to_array(),
-            };
+            *gpu = pack(c);
         }
         let u = Uniforms {
             cam_pos: cam.pos.extend(0.0).to_array(),
@@ -1000,8 +1088,8 @@ mod tests {
     use super::*;
     use sdf::{Op, Shape};
 
-    fn caps(a: Vec3, b: Vec3, radius: f32) -> DrawCapsule {
-        DrawCapsule { a, b, radius, colour: Vec3::ONE, shadow: true }
+    fn caps(a: Vec3, b: Vec3, radius: f32) -> DrawPrim {
+        DrawPrim::capsule(a, b, radius, Vec3::ONE, true)
     }
 
     fn bit_set(masks: &[[u32; 4]], tx: usize, ty: usize, bit: usize) -> bool {
@@ -1017,6 +1105,7 @@ mod tests {
         let aspect = 16.0 / 9.0;
         let (hy, hx) = ((70f32.to_radians() * 0.5).tan(), (70f32.to_radians() * 0.5).tan() * aspect);
         let capsule = caps(Vec3::new(2.0, -1.0, 12.0), Vec3::new(2.5, 1.0, 14.0), 0.45);
+        let (a, b, radius) = (Vec3::new(2.0, -1.0, 12.0), Vec3::new(2.5, 1.0, 14.0), 0.45);
         for yaw in [-1.2f32, -0.5, 0.0, 0.4, 1.3] {
             for pitch in [-0.8f32, 0.0, 0.6] {
                 let cam = Camera { pos: Vec3::new(0.3, 0.2, 0.0), yaw, pitch, fov_y: 70f32.to_radians() };
@@ -1025,9 +1114,9 @@ mod tests {
                 let fwd = cam.forward();
                 // Points on and around the capsule's surface.
                 for k in 0..=10 {
-                    let centre = capsule.a.lerp(capsule.b, k as f32 / 10.0);
+                    let centre = a.lerp(b, k as f32 / 10.0);
                     for dir in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z] {
-                        let rel = centre + dir * capsule.radius - cam.pos;
+                        let rel = centre + dir * radius - cam.pos;
                         let depth = rel.dot(fwd);
                         if depth < 0.2 {
                             continue;
@@ -1042,6 +1131,35 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tile_masks_cover_a_cuboid() {
+        // The bounding sphere of a box must be conservative: every corner that
+        // faces the camera has to land in a marked tile, or the box is clipped.
+        let aspect = 16.0 / 9.0;
+        let (hy, hx) = ((70f32.to_radians() * 0.5).tan(), (70f32.to_radians() * 0.5).tan() * aspect);
+        let half = Vec3::new(0.3, 0.2, 0.9);
+        let cuboid = DrawPrim::cuboid(Vec3::new(0.0, 0.0, 12.0), half, Vec3::Z, Vec3::ONE, true);
+        let cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 70f32.to_radians() };
+        let masks = tile_masks(&cam, aspect, &[&cuboid]);
+        let (right, up) = cam.right_up();
+        let fwd = cam.forward();
+        for (sx, sy, sz) in [(1.0f32, 1.0f32, 1.0f32), (1.0, 1.0, -1.0), (1.0, -1.0, 1.0), (1.0, -1.0, -1.0), (-1.0, 1.0, 1.0), (-1.0, 1.0, -1.0), (-1.0, -1.0, 1.0), (-1.0, -1.0, -1.0)] {
+            let p = Vec3::new(half.x * sx, half.y * sy, 12.0 + half.z * sz);
+            let rel = p - cam.pos;
+            let depth = rel.dot(fwd);
+            if depth < 0.2 {
+                continue;
+            }
+            let (nx, ny) = (rel.dot(right) / (depth * hx), rel.dot(up) / (depth * hy));
+            if nx.abs() >= 1.0 || ny.abs() >= 1.0 {
+                continue;
+            }
+            let tx = ((nx * 0.5 + 0.5) * TILES_X as f32) as usize;
+            let ty = ((0.5 - ny * 0.5) * TILES_Y as f32) as usize;
+            assert!(bit_set(&masks, tx, ty, 0), "corner ({sx},{sy},{sz}) tile ({tx},{ty}) misses");
         }
     }
 
@@ -1062,14 +1180,15 @@ mod tests {
     }
 
     #[test]
-    fn tile_masks_cover_capsules_past_the_first_word() {
-        // The mask has two words per tile now. Bit 39 must come from the
-        // second block, or every capsule after the 32nd would be invisible.
+    fn tile_masks_cover_capsules_in_every_word() {
+        // Bits 39 and 100 land in the second and fourth words: a capsule must
+        // still be visible there, or everything past word zero disappears.
         let capsule = caps(Vec3::new(0.0, 0.0, 10.0), Vec3::new(0.0, 1.0, 10.0), 0.5);
-        let refs: Vec<&DrawCapsule> = (0..40).map(|_| &capsule).collect();
+        let refs: Vec<&DrawPrim> = (0..MAX_CAPSULES).map(|_| &capsule).collect();
         let cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 70f32.to_radians() };
         let masks = tile_masks(&cam, 16.0 / 9.0, &refs);
         assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 39));
+        assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 100));
     }
 
     #[test]

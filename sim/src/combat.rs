@@ -38,9 +38,13 @@ const BEAM_SLACK: f32 = 0.3;
 /// push: a rocket at your feet should launch you, and a rocket beside you
 /// should at least lift you off the floor, where friction would eat the speed.
 const KNOCK_LIFT: f32 = 0.35;
-/// Where shots start: this far along the aim from the eye, so they clear the
-/// worm's own body.
+/// How far along the barrel from the hand a shot starts. Deliberately inside
+/// the drawn barrel: the gun hides it until it reaches the muzzle, so the bolt
+/// is first seen leaving the tip.
 const MUZZLE: f32 = 0.8;
+/// The muzzle flash is placed further along the barrel than the shot starts, so
+/// it sits at the tip instead of inside the barrel (where the gun would hide it).
+const FLASH_AHEAD: f32 = 0.5;
 /// Build lumps join the terrain with a rounded crease this wide, like clay.
 const BUILD_SMOOTH: f32 = 0.4;
 /// Extra room around a worm (and a spawn point) that a lump must leave free,
@@ -102,7 +106,17 @@ impl World {
         }
         let id = w.id;
         let def = &WEAPONS[id as usize];
-        let (eye, aim) = (worm.eye(), worm.aim_dir());
+        let (aim, eye, gun) = (worm.aim_dir(), worm.eye(), worm.muzzle());
+        // Where the crosshair is: how far the eye ray reaches before it hits
+        // rock (with nothing in reach, far enough that the correction is nil).
+        let range = self.grid.raycast(eye, aim, 100.0).unwrap_or(100.0);
+        let crosshair = eye + aim * range;
+        // Aiming almost straight down at your own feet is the one case where
+        // starting at the hand is wrong: the blast lands level with your foot and
+        // beside you, so it shoves you sideways instead of up and a rocket jump
+        // stops working. Fall back to the body's axis for that shot.
+        let steep = -aim.y > 0.9 && range < 3.0;
+        let hand = if steep { worm.hand() } else { gun };
         // Find the build spot before spending a charge: aiming at a wall too
         // close, or at a worm, should not cost you a lump.
         let build_at = match def.kind {
@@ -130,16 +144,29 @@ impl World {
         let muzzle = match build_at {
             Some(at) => at,
             None if def.kind == Kind::Projectile && def.speed == 0.0 => feet + Vec3::Y * 0.5,
-            None => eye + aim * MUZZLE,
+            None => hand + aim * MUZZLE,
         };
-        self.events.push(Event::Shot { worm: i as u8, weapon: id, pos: muzzle });
+        // The direction the shot travels: from the barrel *to* the crosshair, so
+        // it converges instead of flying parallel and staying a hand's width off
+        // for its whole flight. (The old code used `aim` from a point beside the
+        // body, which is why bolts looked like they came out of the chest.)
+        //
+        // Very close in, the crosshair point is barely a metre away and
+        // converging would swing the gun round (a rocket aimed at your own feet
+        // would leave sideways). Fade the correction out under 3 m, exactly as
+        // the viewer's `crosshair_aim` does.
+        let want = (crosshair - muzzle).normalize_or_zero();
+        let blend = ((range - 1.0) / 2.0).clamp(0.0, 1.0);
+        let shot = aim.lerp(want, blend).normalize_or_zero();
+        let shot = if shot.length_squared() > 0.5 { shot } else { aim };
+        self.events.push(Event::Shot { worm: i as u8, weapon: id, pos: muzzle + shot * FLASH_AHEAD });
 
         match def.kind {
             // A swarm is one shot that makes several projectiles, each with
             // its own random error.
             Kind::Projectile => {
                 for _ in 0..def.pellets {
-                    let dir = spread_dir(&mut self.rng, aim, def.spread);
+                    let dir = spread_dir(&mut self.rng, shot, def.spread);
                     self.projectiles.push(Projectile {
                         pos: muzzle,
                         vel: dir * def.speed,
@@ -150,7 +177,7 @@ impl World {
                 }
             }
             Kind::Beam => {
-                let dir = spread_dir(&mut self.rng, aim, def.spread);
+                let dir = spread_dir(&mut self.rng, shot, def.spread);
                 self.fire_beam(i, def, muzzle, dir);
             }
             // A lump is an ordinary terrain edit, so it needs no new rules,

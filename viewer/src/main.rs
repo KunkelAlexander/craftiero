@@ -69,6 +69,9 @@ struct Config {
     /// `--fire weapon_id[,ticks]`: that worm fires once and the picture is taken
     /// this many ticks later (default 10), so projectiles and blasts can be seen.
     fire: Option<(u8, u32)>,
+    /// `--weapon id`: that worm simply holds this weapon, without firing, so a
+    /// screenshot shows the gun itself instead of a muzzle flash.
+    weapon: Option<u8>,
     brush: bool,
     shadows: bool,
     ao: bool,
@@ -87,6 +90,7 @@ fn parse_args() -> Config {
         worm: None,
         rope: false,
         fire: None,
+        weapon: None,
         brush: true,
         shadows: true,
         ao: true,
@@ -123,6 +127,7 @@ fn parse_args() -> Config {
                 let (id, ticks) = v.split_once(',').unwrap_or((&v, "10"));
                 c.fire = Some((id.trim().parse().expect("--fire weapon_id[,ticks]"), ticks.trim().parse().expect("ticks")));
             }
+            "--weapon" => c.weapon = Some(value("--weapon").parse().expect("--weapon weapon_id")),
             "--no-brush" => c.brush = false,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
@@ -296,6 +301,10 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
         // that has just been dropped on the ground still faces +Z. The shot's
         // yaw is documented as where the worm faces, so point it there.
         world.worms[0].face_yaw = yaw.to_radians();
+        // `--weapon` shows a held weapon with no shot, so its silhouette is clear.
+        if let Some(id) = cfg.weapon {
+            world.worms[0].current = (id as usize).min(world.worms[0].weapons.len() - 1);
+        }
         if cfg.rope {
             // Shoot the rope up and forward, then let it swing for a third of a second.
             let shoot = Input { pitch: 0.7, rope: true, ..look };
@@ -880,6 +889,10 @@ impl Viewer {
                     self.feel.shake((0.012 + radius * 0.008) * falloff * falloff);
                 }
                 Event::Shot { worm, weapon, .. } => {
+                    // The gun recoils and the face reacts, for any worm.
+                    if let Some(anim) = self.anims.get_mut(worm as usize) {
+                        anim.fired();
+                    }
                     if worm == 0 {
                         let kick = match weapon {
                             ROCKET => 0.045,

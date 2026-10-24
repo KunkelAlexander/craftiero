@@ -6,8 +6,9 @@
 // and the gun. There are no legs: it gets around by undulating, which is also
 // what most of the animation below is about.
 
-use crate::renderer::DrawCapsule;
+use crate::renderer::DrawPrim;
 use glam::Vec3;
+use sim::weapons::{BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR};
 use sim::{Action, Worm, WORM_HEIGHT};
 use std::f32::consts::TAU;
 
@@ -18,8 +19,8 @@ const COLOURS: [Vec3; 4] = [
     Vec3::new(0.96, 0.80, 0.30), // yellow
     Vec3::new(0.45, 0.78, 0.40), // green
 ];
-const GUN: Vec3 = Vec3::new(0.22, 0.20, 0.28);
 const EYE: Vec3 = Vec3::new(1.0, 0.97, 0.9);
+const IRIS: Vec3 = Vec3::new(0.13, 0.42, 0.55);
 const PUPIL: Vec3 = Vec3::new(0.04, 0.03, 0.06);
 const MOUTH: Vec3 = Vec3::new(0.20, 0.07, 0.09);
 const ROPE: Vec3 = Vec3::new(0.92, 0.86, 0.70);
@@ -40,6 +41,9 @@ pub struct Anim {
     /// Set on the update where the worm touches down.
     landed: bool,
     was_grounded: bool,
+    /// Seconds since this worm last fired, for the gun's recoil and the face's
+    /// reaction. Starts old, so a freshly spawned worm does not kick.
+    fire: f32,
 }
 
 impl Default for Anim {
@@ -51,6 +55,7 @@ impl Default for Anim {
             phase: 0.0,
             landed: false,
             was_grounded: true,
+            fire: 1.0,
         }
     }
 }
@@ -69,6 +74,7 @@ impl Anim {
         self.landed = !self.was_grounded && worm.on_ground;
         self.was_grounded = worm.on_ground;
         self.clock = (self.clock + dt) % 1000.0;
+        self.fire = (self.fire + dt).min(10.0);
         // Running makes the undulation quicker; idle keeps a slow ripple.
         let gait = if worm.on_ground {
             3.0 + worm.forward_vel.abs() * 0.55
@@ -77,11 +83,312 @@ impl Anim {
         };
         self.phase = (self.phase + dt * gait) % TAU;
     }
+
+    /// The worm pulled the trigger: reset the recoil clock.
+    pub fn fired(&mut self) {
+        self.fire = 0.0;
+    }
+}
+
+// --- weapons --------------------------------------------------------------
+//
+// Only the viewer knows what a weapon looks like. Each one is an oversized,
+// distinct silhouette built from the same three analytic primitives, so a piece
+// costs one cheap closed-form raycast and needs no new shader code.
+const GUNMETAL: Vec3 = Vec3::new(0.33, 0.35, 0.44);
+const DARKMETAL: Vec3 = Vec3::new(0.17, 0.18, 0.24);
+const STEEL: Vec3 = Vec3::new(0.52, 0.56, 0.66);
+const OLIVE: Vec3 = Vec3::new(0.38, 0.45, 0.25);
+const RUST: Vec3 = Vec3::new(0.56, 0.27, 0.16);
+const BRASS: Vec3 = Vec3::new(0.80, 0.62, 0.26);
+const HIVE: Vec3 = Vec3::new(0.30, 0.18, 0.34);
+const ORANGE: Vec3 = Vec3::new(0.88, 0.50, 0.16);
+const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
+const CYAN: Vec3 = Vec3::new(0.35, 0.92, 1.0);
+const LIME: Vec3 = Vec3::new(0.55, 0.95, 0.30);
+const ICE: Vec3 = Vec3::new(0.80, 0.92, 1.0);
+const MAGENTA: Vec3 = Vec3::new(0.90, 0.35, 0.85);
+const VIOLET: Vec3 = Vec3::new(0.55, 0.42, 1.0);
+const EMBER: Vec3 = Vec3::new(1.0, 0.55, 0.16);
+const TOXIC: Vec3 = Vec3::new(0.72, 1.0, 0.22);
+const HOTSPOT: Vec3 = Vec3::new(1.0, 0.98, 0.85);
+
+/// A local frame for laying out a gun. `t` runs along the barrel from the hand,
+/// `x` is sideways and `y` is up; every length is in metres before `s`, so a
+/// whole silhouette is tuned by editing literals.
+#[derive(Clone, Copy)]
+struct Gun {
+    hand: Vec3,
+    fwd: Vec3,
+    side: Vec3,
+    up: Vec3,
+    s: f32,
+    back: Vec3,
+}
+
+impl Gun {
+    fn new(hand: Vec3, fwd: Vec3, recoil: f32, scale: f32) -> Gun {
+        // A zero aim would collapse every offset, so fall back to straight ahead.
+        let fwd = if fwd.length_squared() > 1.0e-8 { fwd.normalize() } else { Vec3::Z };
+        let mut side = fwd.cross(Vec3::Y);
+        if side.length_squared() < 1.0e-6 {
+            side = Vec3::X; // aiming straight up: any perpendicular will do
+        }
+        let side = side.normalize();
+        let up = side.cross(fwd).normalize();
+        Gun { hand, fwd, side, up, s: scale, back: -fwd * recoil }
+    }
+
+    fn at(&self, t: f32, x: f32, y: f32) -> Vec3 {
+        self.hand + (self.fwd * t + self.side * x + self.up * y) * self.s + self.back
+    }
+
+    /// A tube along the barrel: barrels, coils, prongs, fins.
+    fn tube(&self, a: (f32, f32, f32), b: (f32, f32, f32), r: f32, col: Vec3) -> DrawPrim {
+        DrawPrim::cylinder(
+            self.at(a.0, a.1, a.2),
+            self.at(b.0, b.1, b.2),
+            (r * self.s).max(0.004),
+            col,
+            false,
+        )
+    }
+
+    /// A hard-edged box: receivers, grips, sights, fins.
+    fn plate(&self, c: (f32, f32, f32), h: (f32, f32, f32), col: Vec3) -> DrawPrim {
+        DrawPrim::cuboid(
+            self.at(c.0, c.1, c.2),
+            Vec3::new(h.0.max(0.002), h.1.max(0.002), h.2.max(0.002)) * self.s,
+            self.fwd,
+            col,
+            false,
+        )
+    }
+
+    /// A sphere: warheads, bombs, eyes of a weapon.
+    fn ball(&self, c: (f32, f32, f32), r: f32, col: Vec3) -> DrawPrim {
+        let p = self.at(c.0, c.1, c.2);
+        DrawPrim::capsule(p, p + self.up * (0.004 * self.s), (r * self.s).max(0.004), col, false)
+    }
+
+    /// A very short fat tube: a collar, coil or muzzle ring. Cheaper than a hoop.
+    fn flange(&self, t: f32, r: f32, thick: f32, col: Vec3) -> DrawPrim {
+        self.tube((t - thick * 0.5, 0.0, 0.0), (t + thick * 0.5, 0.0, 0.0), r, col)
+    }
+
+    /// An open hoop across the barrel, from `n` tangential tubes (an n-gon with
+    /// overlapping joints). Reads as a portal ring or a beam emitter mouth.
+    fn hoop(&self, t: f32, radius: f32, r: f32, n: usize, col: Vec3, out: &mut Vec<DrawPrim>) {
+        let step = TAU / n as f32;
+        for k in 0..n {
+            let a0 = k as f32 * step;
+            let a1 = a0 + step * 1.12; // overlap, so no gap shows at a joint
+            out.push(self.tube(
+                (t, radius * a0.cos(), radius * a0.sin()),
+                (t, radius * a1.cos(), radius * a1.sin()),
+                r,
+                col,
+            ));
+        }
+    }
+
+    /// A cone from `t0` to `t1`, `r0` to `r1`, from stacked straight tubes: the
+    /// raycast primitive has no cone, and a few steps read as one from any angle.
+    fn cone(&self, t0: f32, t1: f32, r0: f32, r1: f32, n: usize, col: Vec3, out: &mut Vec<DrawPrim>) {
+        for k in 0..n {
+            let u0 = k as f32 / n as f32;
+            let u1 = (k + 1) as f32 / n as f32;
+            let mid = (u0 + u1) * 0.5;
+            let r = (r0 + (r1 - r0) * mid).max(0.004);
+            out.push(self.tube(
+                (t0 + (t1 - t0) * u0, 0.0, 0.0),
+                (t0 + (t1 - t0) * u1, 0.0, 0.0),
+                r,
+                col,
+            ));
+        }
+    }
+}
+
+/// The gun each weapon becomes: an oversized, distinct silhouette assembled from
+/// the same three analytic primitives, so a piece costs one cheap closed-form
+/// raycast and no new shader code is needed.
+///
+/// Weapons are pure eye-candy: none casts a shadow (`false` everywhere below) and
+/// none exists in the sim (the projectile leaves the sim's hand, not these
+/// shapes), so the only cost is drawing them.
+///
+/// The layout is written in a local frame: `t` along the barrel from the hand,
+/// `x` sideways, `y` up, in metres. One scale multiplies every length, so the
+/// whole arsenal stays in proportion as the worm grows.
+fn weapon(id: u8, hand: Vec3, fwd: Vec3, recoil: f32, rs: f32, colour: Vec3, out: &mut Vec<DrawPrim>) {
+    // A touch larger than the worm's scale. R&C guns are chunky; a weapon that
+    // is small next to the character reads as a toy.
+    let g = Gun::new(hand, fwd, recoil * 1.5, rs * 1.25);
+    // The worm's own colour survives as a small stripe, so you can still tell
+    // whose gun is whose.
+    let trim = colour;
+
+    match id {
+        BLASTER => {
+            // A chunky ray pistol: receiver, glowing energy cell underneath,
+            // collared barrel, bright muzzle.
+            out.push(g.plate((0.00, 0.0, -0.16), (0.05, 0.07, 0.12), DARKMETAL));
+            out.push(g.plate((0.20, 0.0, 0.03), (0.09, 0.10, 0.22), GUNMETAL));
+            out.push(g.plate((0.18, 0.10, 0.03), (0.05, 0.012, 0.16), trim));
+            out.push(g.plate((0.28, 0.0, 0.15), (0.055, 0.035, 0.09), DARKMETAL));
+            out.push(g.tube((0.02, 0.0, -0.15), (0.26, 0.0, -0.15), 0.055, CYAN).glowing());
+            out.push(g.tube((0.32, 0.0, 0.0), (0.86, 0.0, 0.0), 0.055, DARKMETAL));
+            out.push(g.flange(0.46, 0.088, 0.05, GUNMETAL));
+            out.push(g.flange(0.64, 0.085, 0.045, GUNMETAL));
+            out.push(g.flange(0.84, 0.09, 0.03, GUNMETAL));
+            out.push(g.tube((0.86, 0.0, 0.0), (0.94, 0.0, 0.0), 0.08, CYAN).glowing());
+            out.push(g.ball((0.93, 0.0, 0.0), 0.05, HOTSPOT).glowing());
+        }
+        ROCKET => {
+            // A bazooka: a fat tube with a blast flare behind, four fins and a
+            // loaded rocket poking out of the muzzle.
+            g.cone(-0.20, 0.04, 0.24, 0.19, 2, GUNMETAL, out);
+            out.push(g.flange(-0.18, 0.16, 0.04, EMBER).glowing());
+            out.push(g.tube((0.02, 0.0, 0.0), (1.02, 0.0, 0.0), 0.19, OLIVE));
+            out.push(g.flange(1.00, 0.215, 0.06, DARKMETAL));
+            g.cone(1.06, 1.44, 0.14, 0.02, 3, EMBER, out);
+            out.push(g.ball((1.46, 0.0, 0.0), 0.06, HOTSPOT).glowing());
+            out.push(g.plate((0.92, 0.21, 0.0), (0.03, 0.13, 0.16), DARKMETAL));
+            out.push(g.plate((0.92, -0.21, 0.0), (0.03, 0.13, 0.16), DARKMETAL));
+            out.push(g.plate((0.92, 0.0, 0.21), (0.13, 0.03, 0.16), DARKMETAL));
+            out.push(g.plate((0.92, 0.0, -0.21), (0.13, 0.03, 0.16), DARKMETAL));
+            out.push(g.plate((0.05, 0.0, -0.24), (0.06, 0.08, 0.13), DARKMETAL));
+            out.push(g.plate((0.55, 0.0, -0.25), (0.05, 0.07, 0.11), GUNMETAL));
+            out.push(g.plate((0.35, 0.0, 0.20), (0.09, 0.03, 0.06), trim));
+        }
+        RAILGUN => {
+            // A very long twin-rail rifle with glowing coils and a backpack.
+            out.push(g.plate((0.18, 0.0, 0.02), (0.075, 0.09, 0.26), GUNMETAL));
+            out.push(g.plate((0.42, 0.0, 0.16), (0.035, 0.045, 0.16), DARKMETAL));
+            out.push(g.ball((0.58, 0.0, 0.16), 0.035, VIOLET).glowing());
+            out.push(g.tube((0.30, 0.06, 0.0), (1.55, 0.06, 0.0), 0.022, STEEL));
+            out.push(g.tube((0.30, -0.06, 0.0), (1.55, -0.06, 0.0), 0.022, STEEL));
+            out.push(g.flange(0.55, 0.10, 0.05, VIOLET).glowing());
+            out.push(g.flange(0.85, 0.10, 0.05, VIOLET).glowing());
+            out.push(g.flange(1.15, 0.10, 0.05, VIOLET).glowing());
+            out.push(g.tube((1.55, 0.06, 0.0), (1.80, 0.06, 0.0), 0.03, VIOLET).glowing());
+            out.push(g.tube((1.55, -0.06, 0.0), (1.80, -0.06, 0.0), 0.03, VIOLET).glowing());
+            out.push(g.plate((-0.18, 0.0, 0.0), (0.12, 0.16, 0.18), DARKMETAL));
+            out.push(g.ball((-0.18, 0.0, 0.10), 0.05, VIOLET).glowing());
+            out.push(g.plate((0.02, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
+            out.push(g.plate((0.18, 0.0, 0.11), (0.06, 0.015, 0.14), trim));
+        }
+        BOUNCER => {
+            // A spring cannon: a coil of fat rings and a bright ball in a cradle.
+            out.push(g.tube((0.02, 0.0, 0.0), (0.42, 0.0, 0.0), 0.17, RUST));
+            for k in 0..5 {
+                out.push(g.flange(0.48 + k as f32 * 0.09, 0.155, 0.035, LIME).glowing());
+            }
+            out.push(g.tube((0.90, 0.13, 0.0), (1.02, 0.13, 0.0), 0.035, DARKMETAL));
+            out.push(g.tube((0.90, -0.13, 0.0), (1.02, -0.13, 0.0), 0.035, DARKMETAL));
+            out.push(g.ball((1.16, 0.0, 0.0), 0.20, LIME));
+            out.push(g.plate((0.04, 0.0, -0.22), (0.05, 0.08, 0.12), DARKMETAL));
+            out.push(g.plate((0.20, 0.0, 0.17), (0.09, 0.02, 0.07), trim));
+        }
+        BOMB => {
+            // A tosser holding one enormous bomb in a three-claw cradle, fuse lit.
+            out.push(g.plate((0.08, 0.0, 0.02), (0.07, 0.10, 0.15), RUST));
+            out.push(g.tube((0.24, 0.0, 0.0), (0.52, 0.19, 0.0), 0.035, DARKMETAL));
+            out.push(g.tube((0.24, 0.0, 0.0), (0.50, -0.12, 0.14), 0.035, DARKMETAL));
+            out.push(g.tube((0.24, 0.0, 0.0), (0.50, -0.12, -0.14), 0.035, DARKMETAL));
+            out.push(g.flange(0.46, 0.29, 0.07, DARKMETAL));
+            out.push(g.ball((0.74, 0.0, 0.0), 0.30, BOMBSHELL));
+            out.push(g.tube((0.82, 0.05, 0.15), (0.94, 0.12, 0.28), 0.022, RUST));
+            out.push(g.ball((0.96, 0.13, 0.30), 0.06, EMBER).glowing());
+            out.push(g.plate((0.02, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
+            out.push(g.plate((0.10, 0.09, 0.02), (0.03, 0.012, 0.10), trim));
+        }
+        CLUSTER => {
+            // A gatling drum: six fat barrels around a hot hub.
+            out.push(g.tube((0.02, 0.0, 0.0), (0.44, 0.0, 0.0), 0.25, DARKMETAL));
+            out.push(g.flange(-0.02, 0.21, 0.05, EMBER).glowing());
+            out.push(g.flange(0.44, 0.26, 0.05, GUNMETAL));
+            for k in 0..6 {
+                let a = k as f32 * TAU / 6.0;
+                let (x, y) = (a.cos() * 0.155, a.sin() * 0.155);
+                out.push(g.tube((0.44, x, y), (1.00, x, y), 0.055, BRASS));
+            }
+            out.push(g.ball((0.46, 0.0, 0.0), 0.09, EMBER).glowing());
+            out.push(g.plate((0.25, 0.0, 0.29), (0.06, 0.04, 0.16), GUNMETAL));
+            out.push(g.plate((0.02, 0.0, -0.29), (0.05, 0.09, 0.12), DARKMETAL));
+            out.push(g.plate((0.22, 0.0, -0.26), (0.10, 0.02, 0.10), trim));
+        }
+        SWARM => {
+            // A hive pod: seven launch tubes in a hexagonal cluster.
+            out.push(g.plate((0.32, 0.0, 0.0), (0.26, 0.26, 0.32), HIVE));
+            for k in 0..6 {
+                let a = k as f32 * TAU / 6.0;
+                let (x, y) = (a.cos() * 0.15, a.sin() * 0.15);
+                out.push(g.tube((0.64, x, y), (0.94, x, y), 0.05, MAGENTA));
+            }
+            out.push(g.tube((0.64, 0.0, 0.0), (0.94, 0.0, 0.0), 0.05, MAGENTA));
+            out.push(g.ball((0.95, 0.0, 0.0), 0.06, MAGENTA).glowing());
+            out.push(g.tube((0.30, 0.0, 0.30), (0.24, 0.0, 0.46), 0.015, DARKMETAL));
+            out.push(g.ball((0.23, 0.0, 0.47), 0.035, MAGENTA).glowing());
+            out.push(g.plate((0.04, 0.0, -0.28), (0.05, 0.09, 0.12), DARKMETAL));
+            out.push(g.plate((0.32, 0.265, 0.0), (0.012, 0.12, 0.16), trim));
+        }
+        TELEPORT => {
+            // A portal caster: a big open hoop with a hot core on a stubby pistol.
+            out.push(g.plate((0.10, 0.0, 0.0), (0.07, 0.10, 0.14), GUNMETAL));
+            out.push(g.tube((0.22, 0.0, 0.0), (0.40, 0.0, 0.0), 0.055, DARKMETAL));
+            g.hoop(0.58, 0.40, 0.062, 8, VIOLET, out);
+            out.push(g.tube((0.58, 0.0, 0.0), (0.58, 0.34, 0.18), 0.032, DARKMETAL));
+            out.push(g.tube((0.58, 0.0, 0.0), (0.58, -0.34, -0.18), 0.032, DARKMETAL));
+            out.push(g.ball((0.58, 0.0, 0.0), 0.15, HOTSPOT).glowing());
+            out.push(g.plate((0.06, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
+        }
+        NOVA => {
+            // A warhead launcher: the biggest silhouette in the game, a 0.9 m
+            // bomb with a glowing equator and four fins.
+            out.push(g.tube((0.00, 0.0, 0.0), (0.38, 0.0, 0.0), 0.14, GUNMETAL));
+            out.push(g.flange(0.36, 0.18, 0.06, DARKMETAL));
+            out.push(g.ball((0.72, 0.0, 0.0), 0.44, ICE));
+            out.push(g.flange(0.72, 0.50, 0.035, CYAN).glowing());
+            g.cone(1.08, 1.38, 0.17, 0.02, 3, ICE, out);
+            out.push(g.plate((0.16, 0.26, 0.0), (0.03, 0.14, 0.13), DARKMETAL));
+            out.push(g.plate((0.16, -0.26, 0.0), (0.03, 0.14, 0.13), DARKMETAL));
+            out.push(g.plate((0.16, 0.0, 0.26), (0.14, 0.03, 0.13), DARKMETAL));
+            out.push(g.plate((0.16, 0.0, -0.26), (0.14, 0.03, 0.13), DARKMETAL));
+            out.push(g.plate((0.02, 0.0, -0.22), (0.05, 0.09, 0.12), DARKMETAL));
+            out.push(g.plate((0.16, 0.0, 0.17), (0.08, 0.02, 0.06), trim));
+        }
+        BUILD => {
+            // A constructor: an orange body, a canister, and an open glowing
+            // emitter ring with a hot core, so a block is clearly going there.
+            out.push(g.plate((0.18, 0.0, 0.02), (0.10, 0.11, 0.22), ORANGE));
+            out.push(g.tube((0.02, 0.0, 0.21), (0.40, 0.0, 0.21), 0.075, TOXIC));
+            g.hoop(0.50, 0.20, 0.035, 6, TOXIC, out);
+            out.push(g.ball((0.50, 0.0, 0.0), 0.08, HOTSPOT).glowing());
+            out.push(g.tube((0.46, 0.19, 0.0), (0.62, 0.23, 0.0), 0.022, TOXIC).glowing());
+            out.push(g.tube((0.46, -0.19, 0.0), (0.62, -0.23, 0.0), 0.022, TOXIC).glowing());
+            out.push(g.plate((0.02, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
+            out.push(g.plate((0.16, 0.11, 0.02), (0.012, 0.06, 0.12), trim));
+        }
+        TRACTOR => {
+            // A beam projector: a flared cone ending in a glowing hoop.
+            out.push(g.plate((0.14, 0.0, 0.02), (0.09, 0.10, 0.18), RUST));
+            g.cone(0.30, 0.80, 0.07, 0.34, 3, DARKMETAL, out);
+            g.hoop(0.80, 0.34, 0.03, 6, TOXIC, out);
+            out.push(g.ball((0.60, 0.0, 0.0), 0.12, TOXIC).glowing());
+            out.push(g.plate((0.02, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
+            out.push(g.plate((0.14, 0.0, 0.11), (0.05, 0.012, 0.10), trim));
+        }
+        _ => {
+            // BOMBLET is never held; unknown ids draw nothing.
+        }
+    }
 }
 
 /// The capsules for `worms`, each drawn at `positions[i]` (the sim's position
 /// smoothed between two ticks, see `Viewer::frame`).
-pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawCapsule> {
+pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawPrim> {
     let mut out = Vec::new();
     for (i, (worm, &pos)) in worms.iter().zip(positions).enumerate() {
         if !worm.alive {
@@ -90,12 +397,8 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawC
         let anim = anims.get(i).copied().unwrap_or_default();
         let colour = COLOURS[i % COLOURS.len()];
         let rs = WORM_HEIGHT / 1.8;
-        let caps = |a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool| DrawCapsule {
-            a,
-            b,
-            radius,
-            colour,
-            shadow,
+        let caps = |a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool| {
+            DrawPrim::capsule(a, b, radius, colour, shadow)
         };
 
         let (face, right) = basis(worm.face_yaw);
@@ -135,6 +438,13 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawC
             pose.stretch = 1.0 - 0.12 * k;
             pose.wide = 1.0 + 0.10 * k;
             pose.deep = 1.0 + 0.06 * k;
+        }
+        // A jump starts from a crouch: a beat of anticipation before the spring,
+        // which sells the launch far better than an instant stretch.
+        if action == Action::Jump && anim.since < 0.06 {
+            let k = 1.0 - anim.since / 0.06;
+            pose.stretch = 1.0 - 0.09 * k;
+            pose.wide = 1.0 + 0.06 * k;
         }
         // Rising stretches the worm; falling lets it compress a little.
         if air && !tumble && !rope && !climb {
@@ -176,73 +486,130 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawC
         let lift = bob + breathe;
 
         // Body: four points, three overlapping capsules. Alternating shades
-        // make the segmentation read even on the flat toon bands. The lowest
-        // sphere touches the ground, so the worm sits on the terrain instead of
-        // being cut off by it.
-        let body_y = [0.46, 0.78, 1.10, 1.43];
-        let body_r = [0.46, 0.43, 0.36, 0.30];
+        // make the segmentation read even on the flat toon bands. A narrow body
+        // and a big head is the Dr Nefarious silhouette: it makes the gun beside
+        // it look enormous.
+        let body_y = [0.34, 0.80, 1.17, 1.50];
+        let body_r = [0.36, 0.32, 0.27, 0.22];
         let mut prev = rig.at(sway(0.0), body_y[0] + lift, surge(0.0));
         for k in 1..body_y.len() {
             let t = k as f32 / (body_y.len() - 1) as f32;
             let p = rig.at(sway(t), body_y[k] + lift, surge(t));
             let r = 0.5 * (body_r[k - 1] + body_r[k]) * rs;
-            let shade = if k % 2 == 0 { colour } else { darken(colour, 0.82) };
+            let shade = if k % 2 == 0 { colour } else { darken(colour, 0.84) };
             out.push(caps(prev, p, r, shade, true));
             prev = p;
         }
 
-        // Head: a bulb on top of the neck, with a big cartoon face.
-        let head_x = sway(1.0) * 0.7;
-        let head = Vec3::new(head_x, 1.52 + lift, 0.0);
+        // Head: a big bulb on top of the neck, the character's largest feature.
+        let head_x = sway(1.0) * 0.6;
+        let head = Vec3::new(head_x, 1.58 + lift, 0.0);
         out.push(caps(
             rig.at(head.x, head.y - 0.02, 0.0),
             rig.at(head.x, head.y + 0.02, 0.0),
-            0.34 * rs,
-            lighten(colour, 1.06),
+            0.37 * rs,
+            lighten(colour, 1.07),
             true,
+        ));
+
+        // Nose: a small forward bump, so the head has a front and a muzzle
+        // instead of being a blank sphere.
+        let nose = head + look * 0.38 - Vec3::Y * 0.01;
+        out.push(caps(
+            rig.at(nose.x, nose.y, nose.z),
+            rig.at(nose.x, nose.y + 0.01, nose.z),
+            0.11 * rs,
+            darken(colour, 0.80),
+            false,
         ));
 
         // Belly stripe: a light band on the front. Besides being worm-like, it
         // shows which way the body faces when the mouse aims elsewhere.
         let belly = lighten(colour, 1.35);
         out.push(caps(
-            rig.at(sway(0.18), 0.44 + lift, 0.36),
-            rig.at(sway(0.72), 1.10 + lift, 0.29),
-            0.12 * rs,
+            rig.at(sway(0.18), 0.42 + lift, 0.36),
+            rig.at(sway(0.72), 1.06 + lift, 0.29),
+            0.10 * rs,
             belly,
             false,
         ));
 
-        // Eyes: white eyeballs and dark pupils on the front of the head. They
-        // look along the aim, so the body can turn while the mouse looks
-        // somewhere else. The occasional blink is a radius, not a new capsule.
+        // Face: the brows lead the expression, the eyes follow the aim, the
+        // mouth opens to shout or breathe. A firing worm frowns, a flying one
+        // looks surprised. This is what keeps the character from reading as a
+        // dead-eyed model.
+        let frown = ((0.22 - anim.fire) / 0.22).clamp(0.0, 1.0);
+        let surprise = if air && !tumble { 1.0 } else { 0.0 };
+        let brow_angle = frown * 0.11 - surprise * 0.09;
         let blink = if (anim.clock + (i as f32) * 0.9) % 4.3 < 0.10 { 0.15 } else { 1.0 };
         for side in [-1.0, 1.0] {
-            let eye = head + look * 0.28 + Vec3::X * (0.14 * side) + Vec3::Y * 0.04;
+            let inner = head + look * 0.20 + Vec3::X * (0.07 * side) + Vec3::Y * (0.20 + brow_angle);
+            let outer = head + look * 0.24 + Vec3::X * (0.23 * side) + Vec3::Y * (0.15 - brow_angle);
             out.push(caps(
-                rig.at(eye.x - look.x * 0.02, eye.y - look.y * 0.02, eye.z - look.z * 0.02),
-                rig.at(eye.x + look.x * 0.04, eye.y + look.y * 0.04, eye.z + look.z * 0.04),
-                0.105 * rs * blink,
+                rig.at(inner.x, inner.y, inner.z),
+                rig.at(outer.x, outer.y, outer.z),
+                0.025 * rs,
+                darken(colour, 0.55),
+                false,
+            ));
+        }
+        for side in [-1.0, 1.0] {            let eye = head + look * 0.30 + Vec3::X * (0.16 * side) + Vec3::Y * 0.05;
+            // White eyeball, a coloured iris and a dark pupil, each in front of
+            // the last, so the eye reads as a real ball looking along the aim.
+            out.push(caps(
+                rig.at(eye.x - look.x * 0.03, eye.y - look.y * 0.03, eye.z - look.z * 0.03),
+                rig.at(eye.x + look.x * 0.03, eye.y + look.y * 0.03, eye.z + look.z * 0.03),
+                0.125 * rs * blink,
                 EYE,
                 false,
             ));
-            let pupil = eye + look * 0.125;
+            let iris = eye + look * 0.08;
+            out.push(caps(
+                rig.at(iris.x, iris.y, iris.z),
+                rig.at(iris.x, iris.y + 0.01, iris.z),
+                0.072 * rs * blink,
+                IRIS,
+                false,
+            ));
+            let pupil = eye + look * 0.115;
             out.push(caps(
                 rig.at(pupil.x, pupil.y, pupil.z),
                 rig.at(pupil.x, pupil.y + 0.01, pupil.z),
-                0.048 * rs * blink,
+                0.042 * rs * blink,
                 PUPIL,
                 false,
             ));
         }
 
-        // Mouth: a small dark line under the eyes.
-        let mouth = head + look * 0.33 - Vec3::Y * 0.10;
+        // Mouth: a wide dark line that opens with a shout or a gasp.
+        let open = ((0.25 - anim.fire) / 0.25).clamp(0.0, 1.0) + if air { 0.5 } else { 0.0 };
+        let mouth = head + look * 0.35 - Vec3::Y * (0.11 + 0.05 * open);
+        let mw = 0.10 + 0.05 * open;
         out.push(caps(
-            rig.at(mouth.x - 0.09, mouth.y, mouth.z),
-            rig.at(mouth.x + 0.09, mouth.y, mouth.z),
-            0.028 * rs,
+            rig.at(mouth.x - mw, mouth.y, mouth.z),
+            rig.at(mouth.x + mw, mouth.y, mouth.z),
+            0.034 * rs,
             MOUTH,
+            false,
+        ));
+
+        // A single springy antenna with a ball tip: it swings on its own, so the
+        // worm keeps a little life even standing still.
+        let head_top = head + Vec3::Y * 0.36;
+        let a_sway = if ground { (anim.clock * 2.4).sin() * 0.15 } else { (anim.clock * 4.2).sin() * 0.26 };
+        let tip = head_top + Vec3::X * a_sway + Vec3::Y * 0.26;
+        out.push(caps(
+            rig.at(head_top.x, head_top.y, head_top.z),
+            rig.at(tip.x, tip.y, tip.z),
+            0.032 * rs,
+            darken(colour, 0.72),
+            false,
+        ));
+        out.push(caps(
+            rig.at(tip.x, tip.y, tip.z),
+            rig.at(tip.x, tip.y + 0.02, tip.z),
+            0.075 * rs,
+            lighten(colour, 1.25),
             false,
         ));
 
@@ -269,41 +636,40 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawC
         } else {
             let swing = anim.phase.sin() * 0.15 * run;
             (
-                Vec3::new(-0.55, 0.92, 0.10 + swing),
-                Vec3::new(0.55, 0.98 + 0.03 * run, 0.24),
+                Vec3::new(-0.50, 1.02, 0.10 + swing),
+                Vec3::new(0.60, 1.15 + 0.03 * run, 0.26),
             )
         };
-        let shoulder_l = Vec3::new(-0.42, 1.16, 0.02);
-        let shoulder_r = Vec3::new(0.42, 1.16, 0.02);
-        let arm = darken(colour, 0.86);
-        out.push(caps(
-            rig.at(shoulder_l.x, shoulder_l.y, shoulder_l.z),
-            rig.at(hand_l.x, hand_l.y, hand_l.z),
-            0.085 * rs,
-            arm,
-            false,
-        ));
-        out.push(caps(
-            rig.at(shoulder_r.x, shoulder_r.y, shoulder_r.z),
-            rig.at(hand_r.x, hand_r.y, hand_r.z),
-            0.085 * rs,
-            arm,
-            false,
-        ));
+        let shoulder_l = Vec3::new(-0.30, 1.18, 0.02);
+        let shoulder_r = Vec3::new(0.30, 1.18, 0.02);
+        let arm = darken(colour, 0.84);
+        let glove = darken(colour, 0.68);
+        for (shoulder, hand) in [(shoulder_l, hand_l), (shoulder_r, hand_r)] {
+            out.push(caps(
+                rig.at(shoulder.x, shoulder.y, shoulder.z),
+                rig.at(hand.x, hand.y, hand.z),
+                0.065 * rs,
+                arm,
+                false,
+            ));
+            // A gloved hand at the end of the arm, a size up from the wrist.
+            out.push(caps(
+                rig.at(hand.x, hand.y, hand.z),
+                rig.at(hand.x, hand.y + 0.01, hand.z),
+                0.075 * rs,
+                glove,
+                false,
+            ));
+        }
 
-        // Gun: a thick grip at the hand and a slim barrel along the aim. The
-        // end sphere is the muzzle.
+        // The weapon. Each id gets its own oversized, distinct silhouette built
+        // from the same three primitives, so the per-pixel cost stays one cheap
+        // closed-form raycast per piece. `fwd` is the aim in the rig's rotated
+        // frame, so the gun flips with the body on a double jump.
         let hand_r_world = rig.at(hand_r.x, hand_r.y, hand_r.z);
-        let grip = hand_r + look * 0.12;
-        let muzzle = hand_r + look * 0.68;
-        out.push(caps(hand_r_world, rig.at(grip.x, grip.y, grip.z), 0.105 * rs, GUN, false));
-        out.push(caps(
-            rig.at(grip.x, grip.y, grip.z),
-            rig.at(muzzle.x, muzzle.y, muzzle.z),
-            0.050 * rs,
-            darken(GUN, 0.80),
-            false,
-        ));
+        let recoil = ((0.12 - anim.fire) / 0.12).clamp(0.0, 1.0) * 0.10;
+        let fwd = (rig.right * look.x + rig.up * look.y + rig.face * look.z).normalize_or_zero();
+        weapon(worm.weapons[worm.current].id, hand_r_world, fwd, recoil, rs, colour, &mut out);
 
         // Tail: two tapering segments behind the body, wagging out of phase.
         // It is the clearest cue for which way the body faces.
@@ -315,14 +681,19 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawC
             -0.60,
         );
         let tail_tip = Vec3::new(
-            -0.30 + wag,
+            -0.28 + wag * 0.8,
             if climb { 0.08 } else { 0.52 },
-            -0.72,
+            -0.78,
+        );
+        let tail_whip = Vec3::new(
+            -0.44 + wag * 1.15,
+            if climb { 0.02 } else { 0.62 },
+            -0.86,
         );
         out.push(caps(
             rig.at(tail_base.x, tail_base.y, tail_base.z),
             rig.at(tail_mid.x, tail_mid.y, tail_mid.z),
-            0.15 * rs,
+            0.12 * rs,
             darken(colour, 0.90),
             false,
         ));
@@ -330,7 +701,14 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawC
             rig.at(tail_mid.x, tail_mid.y, tail_mid.z),
             rig.at(tail_tip.x, tail_tip.y, tail_tip.z),
             0.070 * rs,
-            darken(colour, 0.80),
+            darken(colour, 0.82),
+            false,
+        ));
+        out.push(caps(
+            rig.at(tail_tip.x, tail_tip.y, tail_tip.z),
+            rig.at(tail_whip.x, tail_whip.y, tail_whip.z),
+            0.040 * rs,
+            darken(colour, 0.72),
             false,
         ));
 
@@ -449,6 +827,35 @@ mod tests {
         w
     }
 
+    /// The `a` endpoint of a capsule/cylinder (the head and body segments these
+    /// tests inspect are all capsules); a cuboid's centre stands in for it.
+    fn a_of(c: &DrawPrim) -> Vec3 {
+        match *c {
+            DrawPrim::Capsule { a, .. } | DrawPrim::Cylinder { a, .. } => a,
+            DrawPrim::Cuboid { centre, .. } => centre,
+        }
+    }
+
+    /// The highest point of a primitive, for the squash test.
+    fn top(c: &DrawPrim) -> f32 {
+        match *c {
+            DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => a.y.max(b.y) + radius,
+            DrawPrim::Cuboid { centre, half, .. } => centre.y + half.y,
+        }
+    }
+
+    /// Every primitive must be finite and have a positive size.
+    fn sane(c: &DrawPrim) -> bool {
+        match *c {
+            DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
+                a.is_finite() && b.is_finite() && radius.is_finite() && radius > 0.0
+            }
+            DrawPrim::Cuboid { centre, half, forward, .. } => {
+                centre.is_finite() && half.is_finite() && forward.is_finite() && half.max_element() > 0.0
+            }
+        }
+    }
+
     #[test]
     fn the_body_undulates_as_it_walks() {
         let w = worm(Action::Walk, true);
@@ -459,7 +866,7 @@ mod tests {
         let a = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
         anim.phase = 1.4;
         let b = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        let moved = (a[0].a - b[0].a).length();
+        let moved = (a_of(&a[0]) - a_of(&b[0])).length();
         assert!(moved > 0.02, "the body sways as it walks: {moved}");
         assert!(moved < 0.3, "but does not leave the collision capsule: {moved}");
     }
@@ -473,7 +880,7 @@ mod tests {
         let dig = capsules(std::slice::from_ref(&w), &[pos], &anims);
         w.digging = false;
         let idle = capsules(std::slice::from_ref(&w), &[pos], &anims);
-        assert!(dig[3].a.y < idle[3].a.y - 0.05, "the head comes down to work");
+        assert!(a_of(&dig[3]).y < a_of(&idle[3]).y - 0.05, "the head comes down to work");
     }
 
     #[test]
@@ -497,10 +904,11 @@ mod tests {
             anim.update(&w, 1.0 / 60.0);
             let pos = w.pos;
             let caps = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-            assert!(caps.len() <= 16, "{action:?}: {} capsules", caps.len());
+            // A worm plus an oversized weapon. Four of these still leave room in
+            // MAX_CAPSULES for projectiles and effects (see `four_fully_rigged...`).
+            assert!(caps.len() <= 40, "{action:?}: {} capsules", caps.len());
             for c in &caps {
-                assert!(c.a.is_finite() && c.b.is_finite() && c.radius.is_finite(), "{action:?}");
-                assert!(c.radius > 0.0, "{action:?}");
+                assert!(sane(c), "{action:?}");
             }
         }
     }
@@ -530,13 +938,13 @@ mod tests {
         let start = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
         anim.since = 0.62; // exactly one turn: the same orientation again
         let end = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        let head_start = start[3].a; // the head capsule, after the three body ones
-        let head_end = end[3].a;
+        let head_start = a_of(&start[3]); // the head capsule, after the three body ones
+        let head_end = a_of(&end[3]);
         assert!((head_start - head_end).length() < 0.02, "full flip returns: {head_start:?} vs {head_end:?}");
 
         anim.since = 0.31; // halfway: head below the feet
         let middle = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        assert!((head_start - middle[3].a).length() > 0.3, "halfway is visibly flipped");
+        assert!((head_start - a_of(&middle[3])).length() > 0.3, "halfway is visibly flipped");
     }
 
     #[test]
@@ -551,10 +959,10 @@ mod tests {
         anim.update(&w, 0.0);
         assert!(anim.landed);
         let squashed = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        let tallest = squashed.iter().map(|c| c.a.y.max(c.b.y)).fold(f32::MIN, f32::max);
+        let tallest = squashed.iter().map(top).fold(f32::MIN, f32::max);
         anim.since = 0.5; // the squash is over
         let normal = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        let normal_tallest = normal.iter().map(|c| c.a.y.max(c.b.y)).fold(f32::MIN, f32::max);
+        let normal_tallest = normal.iter().map(top).fold(f32::MIN, f32::max);
         assert!(tallest < normal_tallest, "squash is shorter: {tallest} vs {normal_tallest}");
     }
 }

@@ -24,12 +24,20 @@ use sdf::{Grid, Op, Shape};
 pub const DT: f32 = 1.0 / 60.0;
 
 // --- the worm's body -----------------------------------------------------
+/// The collision capsule. The *drawn* body is slimmer than this (see
+/// `body_r` in the viewer): the character reads better thin, but the movement
+/// rules (what it can climb, what gap it fits) are tuned around this radius.
 pub const WORM_RADIUS: f32 = 0.45;
 pub const WORM_HEIGHT: f32 = 1.8;
 /// Eye (and aim origin) above the feet.
 pub const EYE_HEIGHT: f32 = 1.5;
-/// Height of the hand: where the rope and (later) the gun are.
-const HAND_HEIGHT: f32 = 1.1;
+/// Height of the hand: where the rope and the gun are.
+const HAND_HEIGHT: f32 = 1.15;
+/// How far out to the body's right and forward the gun hand sits. These are the
+/// viewer's standing arm pose, repeated here because the sim decides where a
+/// shot starts (and that has to be the barrel, not the chest).
+const HAND_RIGHT: f32 = 0.60;
+const HAND_FORWARD: f32 = 0.26;
 /// Pattern: Spatial approximation. The collision shape is a capsule, tested as
 /// three spheres up its axis (feet, middle, head). A sphere against a distance
 /// field is one lookup: `distance < radius` means touching, and the gradient
@@ -282,6 +290,19 @@ impl Worm {
 
     pub fn hand(&self) -> Vec3 {
         self.pos + Vec3::Y * HAND_HEIGHT
+    }
+
+    /// Where the gun is: out to the right hand and a little forward of the body
+    /// axis. The offsets mirror the viewer's standing arm pose (`hand_r` in
+    /// `worms.rs`), so a shot starts where the gun is *drawn* rather than in the
+    /// middle of the chest.
+    pub fn muzzle(&self) -> Vec3 {
+        let (s, c) = self.face_yaw.sin_cos();
+        // The body's forward and right, the same convention as the viewer's
+        // `basis`: for yaw 0 forward is +Z and right is -X.
+        let face = Vec3::new(s, 0.0, c);
+        let right = Vec3::new(-c, 0.0, s);
+        self.hand() + right * HAND_RIGHT + face * HAND_FORWARD
     }
 
     /// The two ends of the body's axis: the centres of the foot and head

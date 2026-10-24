@@ -7,37 +7,53 @@
 // The world constants are pasted in from the `sdf` crate, so the shader can
 // never disagree with the CPU about voxel size or world extent.
 
+use crate::renderer::{MAX_CAPSULES, TILES_X, TILES_Y};
 use glam::IVec3;
 
 fn f(x: f32) -> String {
     format!("{x:?}") // {:?} keeps the ".0" that WGSL needs on float literals
 }
 
+/// The uniform block with the capsule/tile counts pasted in from the renderer,
+/// so the WGSL can never disagree with the CPU about how many there are.
+fn uniforms() -> String {
+    let groups = TILES_X * TILES_Y / 4;
+    COMMON_UNIFORMS
+        .replace("$CAPS", &MAX_CAPSULES.to_string())
+        .replace("$TILES", &(crate::renderer::TILE_WORDS * groups).to_string())
+        .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
+        .replace("$GROUPS", &groups.to_string())
+}
+
 pub fn march(world_chunks: IVec3) -> String {
     let dims = (world_chunks * sdf::CHUNK).as_vec3();
     let metres = dims * sdf::VOX;
-    format!("{COMMON_UNIFORMS}{MARCH}")
+    format!("{}{MARCH}", uniforms())
         .replace("$VOX", &f(sdf::VOX))
         .replace("$BAND", &f(sdf::BAND))
         .replace("$CHUNK_M", &f(sdf::CHUNK as f32 * sdf::VOX))
         .replace("$DIMS", &format!("{}, {}, {}", f(dims.x), f(dims.y), f(dims.z)))
         .replace("$WORLD_M", &format!("{}, {}, {}", f(metres.x), f(metres.y), f(metres.z)))
         .replace("$CHUNKS", &format!("{}, {}, {}", world_chunks.x, world_chunks.y, world_chunks.z))
+        .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
+        .replace("$GROUPS", &(TILES_X * TILES_Y / 4).to_string())
 }
 
 pub fn post() -> String {
-    format!("{COMMON_UNIFORMS}{POST}")
+    format!("{}{POST}", uniforms())
 }
 
 // One uniform block shared by both passes. Everything is vec4 so the Rust side
 // needs no padding thought (WGSL aligns vec3 to 16 bytes, which bites).
 const COMMON_UNIFORMS: &str = r#"
-// A worm part: a segment from `a` to `b` swept by a sphere of radius a.w.
-// (`array<Capsule, 64>` below must match MAX_CAPSULES in renderer.rs.)
-struct Capsule {
-    a: vec4<f32>,           // xyz: start, w: radius
-    b: vec4<f32>,           // xyz: end, w: radius of a sphere around the whole capsule
-    col: vec4<f32>,         // rgb, as picked in a paint program (sRGB)
+// One analytic primitive, intersected in closed form (not sphere-traced). The
+// fields mean different things per kind, read from `col.w`: 0 capsule, 1 flat
+// cylinder, 2 cuboid. (`array<Prim, $CAPS>` must match MAX_CAPSULES in renderer.rs.)
+struct Prim {
+    a: vec4<f32>,           // capsule/cylinder: start.xyz + radius; cuboid: centre.xyz
+    b: vec4<f32>,           // capsule/cylinder: end.xyz; cuboid: half extents. w = bound radius
+    c: vec4<f32>,           // cuboid: forward axis.xyz; capsule/cylinder: unused
+    col: vec4<f32>,         // rgb (sRGB) + w: kind 0/1/2
 }
 
 struct U {
@@ -50,11 +66,11 @@ struct U {
     flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
     counts: vec4<f32>,      // x: number of capsules in use, y: shadow casters (the first y)
-    caps: array<Capsule, 64>,
+    caps: array<Prim, $CAPS>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
-    // which capsules can be seen in the tile. With up to 64 capsules each tile
-    // needs two 32-bit words; the second block starts after the first 144 vec4s.
-    tiles: array<vec4<u32>, 288>,
+    // which capsules can be seen in the tile. With up to $CAPS capsules each
+    // tile needs $WORDS 32-bit words; word w starts at vec4 $GROUPS*w.
+    tiles: array<vec4<u32>, $TILES>,
 }
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -235,11 +251,131 @@ fn cap_normal(p: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>) -> vec3<f32> {
     return normalize(p - (pa + ba * k));
 }
 
+// The other two primitives, then a dispatcher over all three. A cylinder and a
+// capsule share the ray/cylinder solve; a cylinder just ends in flat discs
+// instead of spheres. A cuboid is a slab test in its own (forward-aligned) frame.
+
+fn box_axes(fwd: vec3<f32>) -> mat3x3<f32> {
+    let z = normalize(fwd);
+    var x = cross(vec3<f32>(0.0, 1.0, 0.0), z);
+    if (dot(x, x) < 0.001) { x = vec3<f32>(1.0, 0.0, 0.0); } else { x = normalize(x); }
+    let y = cross(z, x);
+    return mat3x3<f32>(x, y, z);
+}
+
+fn cyl_hit(ro: vec3<f32>, rd: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>, ra: f32, rb: f32) -> f32 {
+    let mid = (pa + pb) * 0.5;
+    let om = ro - mid;
+    let bm = dot(om, rd);
+    let cm = dot(om, om) - rb * rb;
+    if (bm * bm < cm || (bm > 0.0 && cm > 0.0)) { return -1.0; }
+    let ba = pb - pa;
+    let baba = dot(ba, ba);
+    let bard = dot(ba, rd);
+    let oa = ro - pa;
+    let baoa = dot(ba, oa);
+    let rdoa = dot(rd, oa);
+    let oaoa = dot(oa, oa);
+    let a = baba - bard * bard;
+    let b = baba * rdoa - baoa * bard;
+    let c = baba * oaoa - baoa * baoa - ra * ra * baba;
+    var best = -1.0;
+    let h = b * b - a * c;
+    if (h >= 0.0 && a > 1.0e-9) {
+        let sq = sqrt(h);
+        let inv = 1.0 / a;
+        var t = (-b - sq) * inv;
+        var y = baoa + t * bard;
+        if (t > 0.0 && y > 0.0 && y < baba) { best = t; }
+        t = (-b + sq) * inv;
+        y = baoa + t * bard;
+        if (t > 0.0 && y > 0.0 && y < baba && (best < 0.0 || t < best)) { best = t; }
+    }
+    if (abs(bard) > 1.0e-6) {
+        var t = -baoa / bard;
+        if (t > 0.0 && (best < 0.0 || t < best)) {
+            let q = oa + rd * t;
+            if (dot(q, q) - (dot(q, ba) * dot(q, ba)) / baba <= ra * ra) { best = t; }
+        }
+        t = (baba - baoa) / bard;
+        if (t > 0.0 && (best < 0.0 || t < best)) {
+            let q = oa + rd * t;
+            if (dot(q, q) - (dot(q, ba) * dot(q, ba)) / baba <= ra * ra) { best = t; }
+        }
+    }
+    return best;
+}
+
+fn cuboid_hit(ro: vec3<f32>, rd: vec3<f32>, centre: vec3<f32>, half: vec3<f32>, fwd: vec3<f32>, rb: f32) -> f32 {
+    let om = ro - centre;
+    let bm = dot(om, rd);
+    let cm = dot(om, om) - rb * rb;
+    if (bm * bm < cm || (bm > 0.0 && cm > 0.0)) { return -1.0; }
+    let mt = transpose(box_axes(fwd));
+    let ol = mt * (ro - centre);
+    let dl = mt * rd;
+    var tmin = -1.0e9;
+    var tmax = 1.0e9;
+    for (var i = 0; i < 3; i++) {
+        if (abs(dl[i]) < 1.0e-6) {
+            if (abs(ol[i]) > half[i]) { return -1.0; }
+        } else {
+            let inv = 1.0 / dl[i];
+            let t1 = (-half[i] - ol[i]) * inv;
+            let t2 = (half[i] - ol[i]) * inv;
+            tmin = max(tmin, min(t1, t2));
+            tmax = min(tmax, max(t1, t2));
+            if (tmin > tmax) { return -1.0; }
+        }
+    }
+    if (tmax < 0.0) { return -1.0; }
+    return max(tmin, 0.0);
+}
+
+fn cyl_normal(p: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>, ra: f32) -> vec3<f32> {
+    let ba = pb - pa;
+    let len = length(ba);
+    let axis = ba / len;
+    let along = dot(p - pa, axis);
+    let radial = (p - pa) - axis * along;
+    if (length(radial) < ra * 0.999) {
+        return select(-axis, axis, along > len * 0.5);
+    }
+    return radial / length(radial);
+}
+
+fn cuboid_normal(p: vec3<f32>, centre: vec3<f32>, fwd: vec3<f32>, half: vec3<f32>) -> vec3<f32> {
+    let m = box_axes(fwd);
+    let q = transpose(m) * (p - centre);
+    let dx = half.x - abs(q.x);
+    let dy = half.y - abs(q.y);
+    let dz = half.z - abs(q.z);
+    if (dx < dy && dx < dz) { return m[0] * sign(q.x); }
+    if (dy < dz) { return m[1] * sign(q.y); }
+    return m[2] * sign(q.z);
+}
+
+fn prim_hit(ro: vec3<f32>, rd: vec3<f32>, i: i32) -> f32 {
+    let p = u.caps[i];
+    let k = i32(p.col.w + 0.5);
+    if (k == 0) { return cap_hit(ro, rd, p.a.xyz, p.b.xyz, p.a.w, p.b.w); }
+    if (k == 1) { return cyl_hit(ro, rd, p.a.xyz, p.b.xyz, p.a.w, p.b.w); }
+    return cuboid_hit(ro, rd, p.a.xyz, p.b.xyz, p.c.xyz, p.b.w);
+}
+
+fn prim_normal(p: vec3<f32>, i: i32) -> vec3<f32> {
+    let pr = u.caps[i];
+    let k = i32(pr.col.w + 0.5);
+    if (k == 0) { return cap_normal(p, pr.a.xyz, pr.b.xyz); }
+    if (k == 1) { return cyl_normal(p, pr.a.xyz, pr.b.xyz, pr.a.w); }
+    return cuboid_normal(p, pr.a.xyz, pr.c.xyz, pr.b.xyz);
+}
+
 // Does a shadow caster block this ray? (For shadows on the terrain. The casters
-// are the first `counts.y` capsules.)
+// are the first `counts.y` primitives.)
 fn caps_block(ro: vec3<f32>, rd: vec3<f32>) -> bool {
     for (var i = 0; i < i32(u.counts.y); i++) {
-        if (cap_hit(ro, rd, u.caps[i].a.xyz, u.caps[i].b.xyz, u.caps[i].a.w, u.caps[i].b.w) > 0.0) { return true; }
+        if (prim_hit(ro, rd, i) > 0.0) { return true; }
     }
     return false;
 }
@@ -306,14 +442,14 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     let tile_i = tile.y * 32u + tile.x;
     let lane = tile_i & 3u;
     let group = tile_i >> 2u;
-    // Two words: capsules 0..31, then 32..63. The second word starts after the
-    // 144 vec4s of the first block (see `tile_masks` in renderer.rs).
-    for (var w = 0u; w < 2u; w += 1u) {
-        var mask = u.tiles[group + w * 144u][lane];
+    // $WORDS words: capsules 0..31, then 32..63, and so on. Word w starts
+    // $GROUPS vec4s into the tile array (see `tile_masks` in renderer.rs).
+    for (var w = 0u; w < $WORDSu; w += 1u) {
+        var mask = u.tiles[group + w * $GROUPSu][lane];
         while (mask != 0u) {
             let i = i32(firstTrailingBit(mask)) + i32(w * 32u);
             mask = mask & (mask - 1u);   // clear the lowest set bit
-            let h = cap_hit(ro, rd, u.caps[i].a.xyz, u.caps[i].b.xyz, u.caps[i].a.w, u.caps[i].b.w);
+            let h = prim_hit(ro, rd, i);
             if (h > 0.0 && h < tc) { tc = h; ci = i; }
         }
     }
@@ -361,7 +497,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             n = normal_at(p);
             base = albedo(p, n);
         } else {
-            n = cap_normal(p, u.caps[ci].a.xyz, u.caps[ci].b.xyz);
+            n = prim_normal(p, ci);
             base = srgb(u.caps[ci].col.rgb);
         }
 
@@ -376,9 +512,10 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             if (kind == 1 && caps_block(so, u.sun.xyz)) { lit = 0.0; }
         }
         var occl = 1.0;
-        if (u.flags.z > 0.5) {
+        if (u.flags.z > 0.5 && kind == 1) {
             // Cheap ambient occlusion: how far below "free space" is the field
-            // a few steps out along the normal?
+            // a few steps out along the normal? (Terrain only: a capsule's
+            // normal is meaningless to the terrain field, so skip the samples.)
             var o = 0.0;
             var w = 1.0;
             for (var i = 1; i <= 4; i++) {
@@ -390,15 +527,35 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         }
 
         let tint = mix(vec3<f32>(0.42, 0.45, 0.70), vec3<f32>(1.10, 1.0, 0.86), toon(lit));
-        col = base * tint * mix(0.55, 1.0, occl);
-
-        // A warm lamp at the camera so caves and shadowed ground stay readable.
-        // It only fills in where the sun does not reach (1 - toon(lit)), and
-        // uses the same banding so it still looks drawn, not rendered.
+        // A self-lit primitive (a muzzle, a coil, a hot core) ignores the sun:
+        // flat and bright is what sells it as a light source instead of painted
+        // plastic. `c.w` carries the flag (see `pack` in renderer.rs).
+        let self_lit = kind == 3 && u.caps[ci].c.w > 0.5;
         let to_cam = ro - p;
         let lamp_d = length(to_cam);
-        let lamp = max(dot(n, to_cam / lamp_d), 0.0) * (1.0 - smoothstep(3.0, 26.0, lamp_d));
-        col += base * vec3<f32>(1.0, 0.78, 0.5) * toon(lamp) * 0.5 * (1.0 - toon(lit)) * mix(0.5, 1.0, occl);
+        if (self_lit) {
+            col = base * 1.45;
+        } else {
+            col = base * tint * mix(0.55, 1.0, occl);
+
+            // A warm lamp at the camera so caves and shadowed ground stay readable.
+            // It only fills in where the sun does not reach (1 - toon(lit)), and
+            // uses the same banding so it still looks drawn, not rendered.
+            let lamp = max(dot(n, to_cam / lamp_d), 0.0) * (1.0 - smoothstep(3.0, 26.0, lamp_d));
+            col += base * vec3<f32>(1.0, 0.78, 0.5) * toon(lamp) * 0.5 * (1.0 - toon(lit)) * mix(0.5, 1.0, occl);
+        }
+
+        // A glossy skin: capsules catch a small highlight and a cool rim, which
+        // is what separates a "drawn" prop from flat toon bands. Terrain stays
+        // matte. It is a few multiplications on worm pixels only.
+        if (kind == 3 && !self_lit) {
+            let v = to_cam / lamp_d;
+            let h = normalize(u.sun.xyz + v);
+            let spec = pow(max(dot(n, h), 0.0), 36.0) * lit;
+            col += vec3<f32>(1.0, 0.96, 0.86) * spec * 0.45;
+            let rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+            col += vec3<f32>(0.55, 0.72, 1.0) * rim * 0.22;
+        }
 
         // The brush: tint the terrain it would change and draw its rim.
         if (kind == 1 && u.brush.w > 0.0) {
@@ -518,21 +675,23 @@ fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renderer::{MAX_CAPSULES, TILES_X, TILES_Y};
+    use crate::renderer::{MAX_CAPSULES, TILES_X, TILES_Y, TILE_WORDS};
 
-    // The WGSL has these numbers written out; the Rust side owns them. A
-    // mismatch would silently read the wrong tile or overrun the uniform.
+    // The WGSL has these numbers pasted in from the Rust side; a mismatch would
+    // silently read the wrong tile or overrun the uniform. Test the resolved
+    // strings, which is what the GPU actually compiles.
     #[test]
     fn shader_constants_match_the_renderer() {
-        assert!(COMMON_UNIFORMS.contains(&format!("array<Capsule, {MAX_CAPSULES}>")));
-        assert!(COMMON_UNIFORMS.contains(&format!(
-            "array<vec4<u32>, {}>",
-            2 * TILES_X * TILES_Y / 4
-        )));
-        assert!(MARCH.contains(&format!("vec2<f32>({TILES_X}.0, {TILES_Y}.0)")));
-        assert!(MARCH.contains(&format!("vec2<u32>({}u, {}u)", TILES_X - 1, TILES_Y - 1)));
-        assert!(MARCH.contains(&format!("tile.y * {TILES_X}u")));
-        assert!(MARCH.contains(&format!("w * {}u", TILES_X * TILES_Y / 4)));
-        assert!(MAX_CAPSULES <= 64, "two 32-bit words cover the tile mask");
+        let groups = TILES_X * TILES_Y / 4;
+        let u = uniforms();
+        assert!(u.contains(&format!("array<Prim, {MAX_CAPSULES}>")));
+        assert!(u.contains(&format!("array<vec4<u32>, {}>", TILE_WORDS * groups)));
+        let m = march(glam::IVec3::splat(2));
+        assert!(m.contains(&format!("vec2<f32>({TILES_X}.0, {TILES_Y}.0)")));
+        assert!(m.contains(&format!("vec2<u32>({}u, {}u)", TILES_X - 1, TILES_Y - 1)));
+        assert!(m.contains(&format!("tile.y * {TILES_X}u")));
+        assert!(m.contains(&format!("w < {}u", TILE_WORDS)));
+        assert!(m.contains(&format!("w * {}u", groups)));
+        assert!(MAX_CAPSULES % 32 == 0, "every word must be full");
     }
 }
