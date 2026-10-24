@@ -60,10 +60,10 @@ const STEP_UP: f32 = 0.9;
 /// less than the body radius, so the foot would still be against the face; the
 /// mantle has to place the body on top of the lip in one go.
 const MANTLE_REACH: f32 = 0.6;
-/// A mantle only lands on a roughly flat top (cos 32 degrees). Otherwise the
-/// long forward step would let the worm skate up any steep slope in 0.6 m
-/// leaps instead of walking it.
-const MANTLE_FLAT: f32 = 0.85;
+/// A mantle only lands on a roughly flat-ish top (cos 45 degrees). The walk is
+/// blocked only by surfaces steeper than 70 degrees, so this cannot be used to
+/// skate up a walkable slope; it just lets a crater rim on a hillside count.
+const MANTLE_FLAT: f32 = 0.7;
 /// Largest move between collision checks. The distance field is only valid in a
 /// 1 m band, and a fast worm could otherwise end a tick deeper in rock than the
 /// field can say which way is out.
@@ -174,6 +174,10 @@ pub struct Worm {
     pub(crate) jump_was_down: bool,
     /// Mid-air jumps left before landing. One, until the double jump is used.
     pub(crate) air_jumps: u8,
+    /// Ticks since the worm last stood on the ground (for coyote jumps).
+    pub(crate) coyote: u8,
+    /// Ticks left on a jump press that could not be used yet (jump buffering).
+    pub(crate) jump_buffer: u8,
     /// The wall most recently touched, and how long a wall kick is still legal.
     pub(crate) wall_normal: Vec3,
     pub(crate) wall_timer: u8,
@@ -216,6 +220,8 @@ impl Worm {
             rope_was_down: false,
             jump_was_down: false,
             air_jumps: 1,
+            coyote: 0,
+            jump_buffer: 0,
             wall_normal: Vec3::Y,
             wall_timer: 0,
             climb_cooldown: 0,
@@ -557,24 +563,47 @@ pub(crate) fn slide(grid: &Grid, worm: &mut Worm, disp: Vec3) -> Collision {
 /// either).
 pub(crate) fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: Vec3) -> Collision {
     let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
-    let got = flat(worm.pos - start);
-    if got >= intended * 0.5 {
+    if flat(worm.pos - start) >= intended * 0.5 {
         return Collision::default(); // not blocked enough to need help
     }
+    let speed = want / DT;
+    try_ledge_mantle(grid, worm, start, want, STEP_UP, speed, 0.0).unwrap_or_default()
+}
+
+/// Pull the worm onto a ledge it is touching: lift by `lift`, carry it
+/// `MANTLE_REACH` along `forward`, then lower it onto a supported, roughly flat
+/// top. `speed` is the horizontal velocity kept on success; `min_rise` rejects a
+/// mantle that would only move the worm sideways or down. Returns `None` (and
+/// puts everything back) when there is no ledge to mantles onto.
+///
+/// Used by the walk (`try_step_up`) and, from the air, by the ledge grab: the
+/// jump that reaches a lip but hits its face should pull the worm over, not
+/// bounce it back into the hole.
+pub(crate) fn try_ledge_mantle(
+    grid: &Grid,
+    worm: &mut Worm,
+    start: Vec3,
+    forward: Vec3,
+    lift: f32,
+    speed: Vec3,
+    min_rise: f32,
+) -> Option<Collision> {
+    let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
+    let got = flat(worm.pos - start);
     let (blocked_pos, blocked_vel) = (worm.pos, worm.vel);
-    worm.pos = start + Vec3::Y * STEP_UP;
+    worm.pos = start + Vec3::Y * lift;
     let fits = BODY_SPHERES.iter().all(|&h| grid.sample(worm.pos + Vec3::Y * h) >= WORM_RADIUS * 0.99);
-    if fits {
+    if fits && forward.length_squared() > 1.0e-6 {
         // A step-up is a mantle, not a walk: move at least `MANTLE_REACH` so the
         // worm ends up on top of the lip instead of with its foot still against
         // the face (a tick's walk is only ~0.2 m, half a radius).
-        let step = want.normalize_or_zero() * want.length().max(MANTLE_REACH);
+        let step = forward.normalize() * forward.length().max(MANTLE_REACH);
         let mut hit = slide(grid, worm, step);
         // Lower the worm until its foot touches something, a little at a time. (Dropping
         // it the whole way and pushing it out again would shove it back off the
         // ledge's corner by as much as it had just moved forward.)
         let mut dropped = 0.0;
-        while dropped < STEP_UP && grid.sample(worm.pos + Vec3::Y * WORM_RADIUS) > WORM_RADIUS + 0.02 {
+        while dropped < lift && grid.sample(worm.pos + Vec3::Y * WORM_RADIUS) > WORM_RADIUS + 0.02 {
             worm.pos.y -= 0.05;
             dropped += 0.05;
         }
@@ -585,18 +614,19 @@ pub(crate) fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f
         }
         // Only a mantle that ends on the ground is progress; stepping forward
         // over a drop is a fall, and the normal move already handles it. And
-        // only onto a roughly flat top: otherwise the worm could use the long
-        // mantle step to skate up any steep slope in 0.6 m leaps.
+        // only onto a roughly flat top: otherwise the long mantle step could be
+        // used to skate up any steep slope in 0.6 m leaps.
         let supported = grid.sample(worm.pos + Vec3::Y * WORM_RADIUS) <= WORM_RADIUS + 0.06;
         let onto_a_ledge = grid.gradient(worm.pos).y >= MANTLE_FLAT;
-        if supported && onto_a_ledge && flat(worm.pos - start) > got + 0.02 {
-            worm.vel = Vec3::new(want.x / DT, worm.vel.y, want.z / DT);
-            return hit;
+        let high_enough = worm.pos.y >= start.y + min_rise;
+        if supported && onto_a_ledge && high_enough && flat(worm.pos - start) > got + 0.02 {
+            worm.vel = Vec3::new(speed.x, worm.vel.y, speed.z);
+            return Some(hit);
         }
     }
     worm.pos = blocked_pos;
     worm.vel = blocked_vel;
-    Collision::default()
+    None
 }
 
 /// Is the worm standing on something? If the feet are within `GROUND_SKIN`
@@ -1021,8 +1051,35 @@ mod tests {
         assert!(!w.worms[0].on_ground, "walked off the edge");
         run(&mut w, 3, go);
         w.step(&[Input { jump: true, ..go }]);
-        assert_eq!(w.worms[0].action, Action::DoubleJump, "the fall can be recovered");
-        assert!(w.worms[0].vel.y > 0.0, "the air jump pushes up: {}", w.worms[0].vel.y);
+        // Within the coyote window this is a ground jump, which is even better:
+        // it leaves the real mid-air jump unused.
+        assert_eq!(w.worms[0].action, Action::Jump, "a late jump off the edge still counts");
+        assert!(w.worms[0].vel.y > 0.0, "it pushes up: {}", w.worms[0].vel.y);
+        assert_eq!(w.worms[0].air_jumps, 1, "and the air jump is still there");
+    }
+
+    #[test]
+    fn a_jump_pressed_just_before_landing_fires_on_touchdown() {
+        let mut w = settled(flat, (16.0, 16.0));
+        {
+            // Falling the last half metre with no air jump left.
+            let worm = &mut w.worms[0];
+            worm.pos.y = 4.6;
+            worm.vel.y = -8.0;
+            worm.on_ground = false;
+            worm.action = Action::Freefall;
+            worm.air_jumps = 0;
+            worm.coyote = 0;
+        }
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        for _ in 0..30 {
+            w.step(&[Input::default()]);
+            if w.worms[0].vel.y > 0.0 {
+                break;
+            }
+        }
+        assert!(w.worms[0].vel.y > 0.0, "the buffered jump fired on landing");
+        assert_eq!(w.worms[0].action, Action::Jump);
     }
 
     #[test]
@@ -1484,5 +1541,21 @@ mod tests {
         let worm = &w.worms[0];
         assert!(worm.pos.y > 3.8, "climbed out: y = {}", worm.pos.y);
         assert!(worm.pos.x > 24.0, "and kept going: x = {}", worm.pos.x);
+    }
+
+    #[test]
+    fn a_jump_grabs_a_ledge_above_the_step_height() {
+        // A 2.2 m wall: too tall to walk up (STEP_UP is 0.9), and the jump hits
+        // its face before the feet clear the top. The grab should pull the worm
+        // over instead of cancelling its speed and dropping it back.
+        fn wall(p: Vec3) -> f32 {
+            (p.y - 4.0).min((p.y - 6.2).max(18.0 - p.x))
+        }
+        let mut w = settled(wall, (17.4, 16.0));
+        let jump_in = Input { yaw: FRAC_PI_2, move_dir: Vec2::new(0.0, 1.0), jump: true, ..Input::default() };
+        run(&mut w, 30, jump_in);
+        let worm = &w.worms[0];
+        assert!(worm.pos.y > 6.1 && worm.on_ground, "grabbed the ledge: {:?}", worm.pos);
+        assert!(worm.pos.x > 18.0, "and is standing on top of it: {:?}", worm.pos);
     }
 }

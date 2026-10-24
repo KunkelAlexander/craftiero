@@ -41,7 +41,7 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 |---|---|
 | W A S D, mouse | run (the body turns; the mouse aims), look |
 | Space | jump (hold for height); press again in mid-air to double jump |
-| hold W into a wall | climb it; S climbs down; Space kicks off the wall. Low ledges and crater rims (up to ~1 m) are climbed automatically |
+| hold W into a wall | climb it; S climbs down; Space kicks off the wall. Low ledges and crater rims (up to ~1 m) are climbed automatically, and a jump that reaches a higher lip grabs it |
 | left mouse (hold) | fire the current weapon |
 | 1 2 3 4 5 6 7 8 9 0 -, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor |
 | Left Shift (hold) | dig: a smooth 3 m tunnel where you look (up to 4 m away), five bites a second |

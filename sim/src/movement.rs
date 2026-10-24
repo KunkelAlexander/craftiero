@@ -14,8 +14,11 @@
 //!     the air cannot push you past running speed, so hopping is never a
 //!     faster way to travel than running;
 //!   * a jump cut is gravity, not a velocity clamp;
-//!   * small ledges are mantled (up to 0.9 m) and steep crater walls are
-//!     walked up to about 70 degrees, so blast holes do not trap the worm;
+//!   * input is forgiving: a jump a few ticks after leaving a ledge still
+//!     counts (coyote), and a press just before touchdown is buffered;
+//!   * small ledges are mantled (up to 0.9 m), steep crater walls are walked up
+//!     to about 70 degrees, and a jump that reaches a higher lip grabs it and
+//!     pulls the worm over, so blast holes do not trap the worm;
 //!   * walls are climbed by holding into them, and kicked off with jump.
 //!
 //! The ramp, brake and turn rates are tuned for a 1.8 m character close to the
@@ -27,7 +30,7 @@
 //! is the body. Aim and facing are separate on purpose.
 
 use crate::world::{
-    body_fits, push_out_of_rock, settle_on_ground, slide, try_step_up, Action, Worm,
+    body_fits, push_out_of_rock, settle_on_ground, slide, try_ledge_mantle, try_step_up, Action, Worm,
 };
 use crate::{Input, Rope, DT, WORM_HEIGHT, WORM_RADIUS};
 use glam::Vec3;
@@ -89,6 +92,17 @@ const JUMP_CUT: f32 = 21.0 * V;
 const JUMP_U: f32 = 43.0;
 const DOUBLE_JUMP_U: f32 = 53.0;
 const WALL_KICK_U: f32 = 64.0;
+/// A jump pressed this close to leaving the ground still counts (0.1 s). Walking
+/// off a ledge and pressing a tick or two late is a jump, not a fall.
+const COYOTE: u8 = 6;
+/// A jump pressed this close to landing is remembered and fires on touchdown
+/// (0.1 s), instead of being swallowed by the last few centimetres of the fall.
+const JUMP_BUFFER: u8 = 6;
+/// A jump that reaches a ledge grabs it: the lip can be this far above the feet
+/// when the body hits it. The grab pulls the worm up and over instead of
+/// bouncing it back into the hole (called the ledge grab in the code; it reuses
+/// the walk's mantle).
+const LEDGE_UP: f32 = 1.2;
 /// How long a wall kick is still legal after touching a wall: the hit tick
 /// plus a short grace, 8 ticks at 60 Hz.
 const WALL_WINDOW: u8 = 8;
@@ -165,6 +179,19 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
 
     let jump_pressed = input.jump && !worm.jump_was_down;
     worm.jump_was_down = input.jump;
+    if jump_pressed {
+        worm.jump_buffer = JUMP_BUFFER;
+    } else {
+        worm.jump_buffer = worm.jump_buffer.saturating_sub(1);
+    }
+    // Coyote time: keep a jump available for a few ticks after the ground
+    // disappears. `on_ground` is from the end of the last tick, so a worm that
+    // walked off a ledge this tick still has the full window.
+    if worm.on_ground {
+        worm.coyote = COYOTE;
+    } else {
+        worm.coyote = worm.coyote.saturating_sub(1);
+    }
     let mut jump_used = false;
 
     worm.wall_timer = worm.wall_timer.saturating_sub(1);
@@ -199,6 +226,8 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
             worm.vel.y += ROPE_JUMP;
             align_face_to_velocity(worm);
             worm.action = Action::Freefall;
+            worm.jump_buffer = 0;
+            worm.coyote = 0;
             jump_used = true;
         } else {
             step_rope(grid, worm, input);
@@ -223,14 +252,17 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
         return;
     }
 
-    if jump_pressed && !jump_used {
-        if worm.on_ground {
+    // A buffered press can fire here (a coyote jump) or, if this tick is the
+    // landing, in `land`. Only a fresh press can kick off a wall or use the
+    // mid-air jump; the buffer exists for the ground.
+    if !jump_used {
+        if worm.jump_buffer > 0 && (worm.on_ground || worm.coyote > 0) {
             ground_jump(worm);
             jump_used = true;
-        } else if worm.wall_timer > 0 {
+        } else if jump_pressed && worm.wall_timer > 0 {
             wall_kick(worm);
             jump_used = true;
-        } else if can_air_jump(worm) {
+        } else if jump_pressed && can_air_jump(worm) {
             double_jump(worm);
             jump_used = true;
         }
@@ -419,6 +451,8 @@ fn step_air(
         worm.vel.y = -TERMINAL;
     }
 
+    let start = worm.pos;
+    let horiz = flat(worm.vel);
     let hit = slide(grid, worm, worm.vel * DT);
 
     // A wall we were moving into: remember it for the wall-kick window.
@@ -436,6 +470,28 @@ fn step_air(
         }
     }
 
+    // Ledge grab: the jump reached a lip but the body hit its face. If the
+    // player is still pushing into it (or the jump carried the worm into it),
+    // pull the worm up and over instead of cancelling its speed and dropping it
+    // back into the crater.
+    if !matches!(worm.action, Action::Tumble | Action::WallKick) {
+        if let Some(n) = hit.wall {
+            let push = flat(wish).normalize_or_zero().dot(-n);
+            let carried = flat(horiz).dot(-n);
+            if push > 0.3 || carried > 0.5 {
+                let dir = if push > 0.3 { flat(wish).normalize_or_zero() } else { flat(horiz).normalize_or_zero() };
+                let forward = dir * DT;
+                if try_ledge_mantle(grid, worm, start, forward, LEDGE_UP, horiz, 0.2).is_some() {
+                    // The grab itself is the landing; do not chain the jump
+                    // press that got us here into a jump off the new ledge.
+                    worm.jump_buffer = 0;
+                    land(worm);
+                    return;
+                }
+            }
+        }
+    }
+
     // Holding toward a tall wall grabs it, exactly like walking into one.
     if !input.dig && mag > 0.3 && worm.climb_cooldown == 0 {
         if let Some(n) = hit.wall {
@@ -448,7 +504,7 @@ fn step_air(
 
     let settled = settle_on_ground(grid, worm, false);
     if (hit.ground || settled) && worm.vel.y <= 0.5 {
-        land(worm, jump_pressed);
+        land(worm);
         return;
     }
 
@@ -459,7 +515,7 @@ fn step_air(
 
 /// Land from any airborne action. The single air jump is available again as
 /// soon as the worm touches the ground.
-fn land(worm: &mut Worm, jump_pressed: bool) {
+fn land(worm: &mut Worm) {
     let from = worm.action;
     let flat_vel = flat(worm.vel);
     // A tumble or a rope can arrive sideways; point the body the way it is
@@ -476,8 +532,9 @@ fn land(worm: &mut Worm, jump_pressed: bool) {
     worm.action = if worm.forward_vel.abs() > 0.2 { Action::Walk } else { Action::Idle };
     worm.air_jumps = 1;
 
-    // A press on the landing frame is still a jump.
-    if jump_pressed && from != Action::Tumble {
+    // A jump pressed just before touchdown was remembered by the buffer; this
+    // is the frame it gets to fire.
+    if worm.jump_buffer > 0 && from != Action::Tumble {
         ground_jump(worm);
     }
 }
@@ -497,6 +554,8 @@ fn ground_jump(worm: &mut Worm) {
     worm.on_ground = false;
     worm.wall_timer = 0;
     worm.air_jumps = 1;
+    worm.coyote = 0;
+    worm.jump_buffer = 0;
 }
 
 fn can_air_jump(worm: &Worm) -> bool {
@@ -516,6 +575,8 @@ fn double_jump(worm: &mut Worm) {
     worm.air_jumps = 0;
     worm.on_ground = false;
     worm.wall_timer = 0;
+    worm.coyote = 0;
+    worm.jump_buffer = 0;
 }
 
 fn wall_kick(worm: &mut Worm) {
@@ -532,6 +593,8 @@ fn wall_kick(worm: &mut Worm) {
     worm.climb_cooldown = CLIMB_REGRAB;
     // A kick is a launch: it arms the air jump again.
     worm.air_jumps = 1;
+    worm.coyote = 0;
+    worm.jump_buffer = 0;
 }
 
 // --------------------------------------------------------------- climb ----

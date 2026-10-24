@@ -42,7 +42,8 @@ Controls
   1-9 0 -           pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
                     Bomb Cluster Swarm Teleport Nova Block Tractor
   hold W into a wall  climb it; S climbs down; Space kicks off the wall
-                     (low ledges and crater rims are climbed automatically)
+                     (low ledges and crater rims are climbed automatically;
+                     a jump that reaches a higher lip grabs it)
   Left Shift        dig (hold); the ring shows the hole, straight ahead of the worm
   E / Q             reel the rope in (pulls you, so you can launch yourself) / out
   F                 fly camera with the M1 brush: W A S D Space Ctrl Shift fly,
