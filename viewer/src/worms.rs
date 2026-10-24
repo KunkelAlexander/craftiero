@@ -8,8 +8,10 @@
 
 use crate::renderer::DrawPrim;
 use glam::Vec3;
-use sim::weapons::{BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR};
-use sim::{Action, Worm, WORM_HEIGHT};
+use sim::weapons::{
+    BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+};
+use sim::{whip_path, Action, Worm, WHIP_POINTS, WORM_HEIGHT};
 use std::f32::consts::TAU;
 
 /// One colour per player (as picked in a paint program).
@@ -112,6 +114,9 @@ const VIOLET: Vec3 = Vec3::new(0.55, 0.42, 1.0);
 const EMBER: Vec3 = Vec3::new(1.0, 0.55, 0.16);
 const TOXIC: Vec3 = Vec3::new(0.72, 1.0, 0.22);
 const HOTSPOT: Vec3 = Vec3::new(1.0, 0.98, 0.85);
+/// The plasma whip's energy: hot violet, close to the magenta of the Swarm
+/// without being the same weapon's colour.
+const PLASMA: Vec3 = Vec3::new(0.55, 0.28, 1.0);
 
 /// A local frame for laying out a gun. `t` runs along the barrel from the hand,
 /// `x` is sideways and `y` is up; every length is in metres before `s`, so a
@@ -227,6 +232,7 @@ fn recoil_style(id: u8) -> (f32, f32) {
         SWARM => (0.09, 0.06),
         BOUNCER => (0.07, 0.06),
         TELEPORT => (0.07, 0.06),
+        WHIP => (0.06, 0.04),
         BLASTER => (0.06, 0.05),
         BOMB => (0.05, 0.04),
         BUILD | TRACTOR => (0.035, 0.02),
@@ -256,6 +262,8 @@ fn weapon(
     kick_rise: f32,
     rs: f32,
     colour: Vec3,
+    clock: f32,
+    fire: f32,
     out: &mut Vec<DrawPrim>,
 ) {
     // A touch larger than the worm's scale. R&C guns are chunky; a weapon that
@@ -415,6 +423,41 @@ fn weapon(
             out.push(g.ball((0.60, 0.0, 0.0), 0.12, TOXIC).glowing());
             out.push(g.plate((0.02, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
             out.push(g.plate((0.14, 0.0, 0.11), (0.05, 0.012, 0.10), trim));
+        }
+        WHIP => {
+            // A plasma lash: a stubby handle, a bright core and two prongs.
+            out.push(g.plate((0.12, 0.0, 0.02), (0.06, 0.09, 0.15), DARKMETAL));
+            out.push(g.tube((0.02, 0.0, 0.0), (0.32, 0.0, 0.0), 0.06, GUNMETAL));
+            out.push(g.flange(0.32, 0.095, 0.04, PLASMA).glowing());
+            out.push(g.tube((0.32, 0.10, 0.0), (0.46, 0.16, 0.0), 0.018, PLASMA).glowing());
+            out.push(g.tube((0.32, -0.10, 0.0), (0.46, -0.16, 0.0), 0.018, PLASMA).glowing());
+            out.push(g.ball((0.38, 0.0, 0.0), 0.10, HOTSPOT).glowing());
+            out.push(g.plate((0.04, 0.0, -0.19), (0.05, 0.08, 0.12), DARKMETAL));
+            out.push(g.plate((0.16, 0.10, 0.02), (0.012, 0.05, 0.10), trim));
+            // Between strikes the lash hangs from the emitter and undulates,
+            // so the weapon reads as a whip even when it is not cracking. A
+            // strike replaces it with the sim's random, full-length lash (see
+            // `effects.rs`), which is why it hides for the first few frames.
+            if fire > 0.30 {
+                let from = g.at(0.46, 0.0, 0.0);
+                let path = whip_path(from, g.fwd, g.side, clock * 4.5, 2.4 * rs);
+                for k in 0..WHIP_POINTS - 1 {
+                    let t = k as f32 / (WHIP_POINTS - 1) as f32;
+                    let r = (0.055 - 0.028 * t) * rs;
+                    let col = if k % 3 == 0 { PLASMA } else { lighten(PLASMA, 1.2) };
+                    out.push(
+                        DrawPrim::capsule(path[k], path[k + 1], r, col, false)
+                            .glowing()
+                            .inkless(),
+                    );
+                }
+                let tip = path[WHIP_POINTS - 1];
+                out.push(
+                    DrawPrim::capsule(tip, tip + Vec3::Y * 0.004, 0.06 * rs, HOTSPOT, false)
+                        .glowing()
+                        .inkless(),
+                );
+            }
         }
         _ => {
             // BOMBLET is never held; unknown ids draw nothing.
@@ -728,6 +771,8 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             kick_rise * kick,
             rs,
             colour,
+            anim.clock,
+            anim.fire,
             &mut out,
         );
 

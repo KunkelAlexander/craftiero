@@ -25,18 +25,20 @@ pub const CLUSTER: u8 = 5;
 pub const SWARM: u8 = 6;
 pub const TELEPORT: u8 = 7;
 pub const NOVA: u8 = 8;
-/// Places a lump of rock where you aim ("build = add").
+/// Throws up a rectangular wall of rock in front of the worm ("build = add").
 pub const BUILD: u8 = 9;
 /// The forming tool: a stream of small lumps, so you can draw a bridge or a
 /// wall by sweeping the aim ("tractor beam", PLAN.md). Not a new mechanic, only
 /// the Build weapon with a short cooldown, a small lump and a big magazine.
 pub const TRACTOR: u8 = 10;
+/// A short-range lash of plasma: it cuts a sine-wave scar into the rock.
+pub const WHIP: u8 = 11;
 /// What a Cluster shell splits into. Not in the arsenal: only the shell makes it.
-pub const BOMBLET: u8 = 11;
+pub const BOMBLET: u8 = 12;
 
 /// Every weapon a player carries, in slot order. (The 2D game let you pick five
 /// of them on a loadout screen; that comes back with the menus, M6.)
-pub const ARSENAL: [u8; 11] = [BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, CLUSTER, SWARM, TELEPORT, NOVA, BUILD, TRACTOR];
+pub const ARSENAL: [u8; 12] = [BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, CLUSTER, SWARM, TELEPORT, NOVA, BUILD, TRACTOR, WHIP];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -47,6 +49,11 @@ pub enum Kind {
     /// Adds a lump of terrain at the aim point, within `range`. The magazine
     /// is the number of lumps you carry.
     Build,
+    /// Adds one rectangular wall of terrain just ahead of the worm.
+    Wall,
+    /// A short melee sweep: a sine-wave lash that damages what it touches and
+    /// carves a scar along its path.
+    Whip,
 }
 
 /// The few behaviours that are more than a number. A weapon has at most one, so
@@ -116,7 +123,7 @@ impl WeaponState {
     }
 }
 
-pub static WEAPONS: [WeaponDef; 12] = [
+pub static WEAPONS: [WeaponDef; 13] = [
     WeaponDef {
         name: "Neon Blaster",
         kind: Kind::Projectile,
@@ -230,8 +237,13 @@ pub static WEAPONS: [WeaponDef; 12] = [
         name: "Cluster",
         kind: Kind::Projectile,
         damage: 0.0,
-        speed: 28.0,
-        lifetime: 1.0,
+        // A mortar, not a throw: slow enough and heavy enough that the arc
+        // reads. At 45 degrees it peaks about 7 m up and lands about 27 m
+        // away; aiming higher trades range for a taller curve. The fuse
+        // outlasts a steep lob so the shell comes back down instead of
+        // bursting in the air halfway through its arc.
+        speed: 22.0,
+        lifetime: 2.6,
         cooldown: 0.9,
         mag: 3,
         reload: 3.0,
@@ -242,7 +254,7 @@ pub static WEAPONS: [WeaponDef; 12] = [
         knockback: 0.0,
         terrain: 0.0,
         pellets: 1,
-        gravity: 8.0, // a lob
+        gravity: 18.0, // a high lob: point up to arc it over cover
         bounce: 0.0,
         special: Special::Cluster(7, BOMBLET),
     },
@@ -308,19 +320,22 @@ pub static WEAPONS: [WeaponDef; 12] = [
     },
     WeaponDef {
         name: "Block",
-        kind: Kind::Build,
+        kind: Kind::Wall,
         damage: 0.0,
         speed: 0.0,
         lifetime: 0.0,
-        cooldown: 0.15, // fast enough to throw up a wall in one sweep of the aim
-        mag: 6,
+        // One deliberate shield per press. The old fast cooldown let the aim
+        // sweep out a whole fortress of lumps; a wall that covers the worm
+        // should cost a beat and be worth placing.
+        cooldown: 0.50,
+        mag: 4,
         reload: 2.0,
         spread: 0.0,
-        range: 14.0,
+        range: 0.0,
         blast_radius: 0.0,
         blast_damage: 0.0,
         knockback: 0.0,
-        terrain: 1.4,
+        terrain: 0.0,
         pellets: 1,
         gravity: 0.0,
         bounce: 0.0,
@@ -346,6 +361,30 @@ pub static WEAPONS: [WeaponDef; 12] = [
         blast_damage: 0.0,
         knockback: 0.0,
         terrain: 0.8,
+        pellets: 1,
+        gravity: 0.0,
+        bounce: 0.0,
+        special: Special::None,
+    },
+    WeaponDef {
+        name: "Plasma Whip",
+        kind: Kind::Whip,
+        // A short reach and a slow cadence, but a hard hit: this is the
+        // close-quarters answer to a rocket in the face.
+        damage: 34.0,
+        speed: 0.0,
+        lifetime: 0.0,
+        cooldown: 0.42,
+        mag: 15,
+        reload: 1.8,
+        spread: 0.0,
+        // The lash is six metres long; `terrain` is the radius of the groove
+        // it burns into whatever rock that length passes through.
+        range: 6.0,
+        blast_radius: 0.0,
+        blast_damage: 0.0,
+        knockback: 14.0,
+        terrain: 0.28,
         pellets: 1,
         gravity: 0.0,
         bounce: 0.0,

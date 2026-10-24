@@ -341,6 +341,10 @@ pub enum Event {
     Shot { worm: u8, weapon: u8, pos: Vec3 },
     /// A beam weapon's line, for drawing.
     Beam { from: Vec3, to: Vec3 },
+    /// A plasma whip's lash. `dir`, `side` and `phase` are what the viewer
+    /// needs to rebuild the same sine wave the sim used for the hit and scar
+    /// (see `whip_path`); `length` is the reach.
+    Whip { from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32 },
     Explosion { pos: Vec3, radius: f32 },
     Hit { victim: u8, pos: Vec3, damage: f32 },
     Died { victim: u8, killer: u8, pos: Vec3 },

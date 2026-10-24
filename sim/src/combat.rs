@@ -50,8 +50,36 @@ const BUILD_SMOOTH: f32 = 0.4;
 /// Extra room around a worm (and a spawn point) that a lump must leave free,
 /// because the rounded join adds a little material beyond the lump's radius.
 const BUILD_MARGIN: f32 = 0.15;
+/// The Block wall: a thick upright rectangle thrown up just ahead of the worm.
+/// The centre is `WALL_AHEAD` metres in front, unless the first rock is closer,
+/// in which case it is nudged back so the wall still stands proud of the rock.
+const WALL_AHEAD: f32 = 2.00;
+/// Below this the wall would grow through the worm (or into the gun), so the
+/// shot is free. The near face is `WALL_MIN_AHEAD - WALL_HALF_T` metres from
+/// the worm, which keeps it just beyond the drawn gun's tip.
+const WALL_MIN_AHEAD: f32 = 1.60;
+/// 8.75 m wide and 6 m tall: big enough to hide a whole worm and the ground it
+/// stands on, which is what makes it read as a shield rather than a lump.
+const WALL_HALF_W: f32 = 4.375;
+const WALL_HALF_H: f32 = 3.00;
+const WALL_HALF_T: f32 = 0.30;
+/// Centre height above the feet. The bottom sinks below the ground, so a small
+/// dip or slope ahead cannot leave a gap for a bolt to fly through.
+const WALL_LIFT: f32 = 2.45;
+/// Keep the wall this clear of a worm or a spawn point.
+const WALL_MARGIN: f32 = 0.12;
+/// Round the join with the old terrain a little, but keep the box's faces flat
+/// and its corners crisp: this is a wall, not a lump.
+const WALL_SMOOTH: f32 = 0.16;
 /// A bouncing projectile slower than this comes to rest (a dropped bomb).
 const RESTING_SPEED: f32 = 1.0;
+/// How close a worm's body must come to the lash's centreline to be hit. The
+/// drawn chain is thin, so this is deliberately more generous than it looks.
+const WHIP_HIT: f32 = 0.55;
+/// How many points the plasma whip's sine wave is sampled at. Fixed so the
+/// event that tells the viewer what to draw and the path the sim scars are
+/// literally the same array, not two implementations that can drift apart.
+pub const WHIP_POINTS: usize = 14;
 
 #[derive(Clone, Debug)]
 pub struct Projectile {
@@ -65,14 +93,56 @@ pub struct Projectile {
     pub life: f32,
 }
 
-/// Where a lobbed shot will go, for the aim aid on screen. `points` is the
-/// flight path (a point every few ticks) and `hit` is where it will land, with
-/// the rock's `normal` there so the marker can lie on the slope.
+/// Where a shot will go, for the aim aid on screen.
+///
+/// Three shapes share this, because they answer the same question — "where is
+/// this shot going to land, and what will it do there?":
+///
+/// * a lobbed shell fills `points` with its arc and `hit` with its landing mark;
+/// * a straight blast shell leaves `points` empty and sets `blast`, so only the
+///   explosion's footprint is drawn at the mark;
+/// * a ricochet marks `hit` and adds `bounce`, a short stub showing the way the
+///   shell leaves the surface. The real shell keeps bouncing; only the first
+///   one is shown, because after that every pebble sends it somewhere else.
+///
+/// `normal` is the rock's normal at the mark, so the ring can lie on a slope.
 #[derive(Clone, Debug, Default)]
 pub struct AimPath {
     pub points: Vec<Vec3>,
     pub hit: Option<Vec3>,
     pub normal: Vec3,
+    /// Radius of the blast the shot makes at the mark, in metres. Zero means a
+    /// plain landing mark (the Cluster's shell is its own marker).
+    pub blast: f32,
+    /// Where a ricochet leaves the surface after the first hit: `(from, to)`.
+    pub bounce: Option<(Vec3, Vec3)>,
+}
+
+/// The lash of a plasma whip: a sine wave growing out of `from` along `dir`,
+/// in the plane spanned by `dir` and `side`. The amplitude grows towards the
+/// tip, so the wave leaves the emitter straight and whips at the end.
+///
+/// The sim samples this once to find what it hits and to carve the scar, and
+/// the viewer calls it with the same arguments to draw the identical curve.
+/// `phase` and the direction of `side` are random per strike, which is what
+/// makes every lash look different.
+pub fn whip_path(from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32) -> [Vec3; WHIP_POINTS] {
+    let dir = if dir.length_squared() > 1.0e-8 { dir.normalize() } else { Vec3::Z };
+    // Keep `side` perpendicular even if the caller passes an imprecise one.
+    let side = side - dir * side.dot(dir);
+    let side = if side.length_squared() > 1.0e-6 { side.normalize() } else { dir.any_orthonormal_vector() };
+    let up = dir.cross(side).normalize_or_zero();
+    let mut points = [Vec3::ZERO; WHIP_POINTS];
+    for (k, p) in points.iter_mut().enumerate() {
+        let t = k as f32 / (WHIP_POINTS - 1) as f32;
+        // A little shorter than the classic whip's arc, and proportional to
+        // the reach so a held (short) lash is not a wild corkscrew.
+        let amp = 0.12 * length * t * t;
+        let wave = (phase + t * std::f32::consts::TAU * 1.35).sin() * amp;
+        let twist = (phase * 1.7 - t * std::f32::consts::TAU * 0.8).cos() * amp * 0.22;
+        *p = from + dir * (length * t) + side * wave + up * twist;
+    }
+    points
 }
 
 impl World {
@@ -141,12 +211,13 @@ impl World {
         (muzzle, shot)
     }
 
-    /// The arc a lobbed shot will follow, and where it will land.
+    /// The aim aid a weapon should draw, and where it lands.
     ///
-    /// Only weapons that are actually thrown in an arc report one: a blaster
-    /// bolt or a rocket flies flat, and in R&C those get no trajectory either.
-    /// The flight is stepped exactly as `step_projectiles` does it (minus the
-    /// random spread), so the landing mark lands on the rock the shot will hit.
+    /// Not every weapon gets one. The aid exists to answer a question the
+    /// crosshair cannot: "where will this go, and what will it do there?" A
+    /// blaster bolt flies along the reticle, so a line on top of it is noise. A
+    /// lobbed shell, a ricochet and a big blast all make that question worth
+    /// answering. `World` owns the rule, so the viewer never has to guess.
     pub fn aim_path(&self, i: usize) -> Option<AimPath> {
         let worm = self.worms.get(i)?;
         if !worm.alive {
@@ -154,14 +225,50 @@ impl World {
         }
         let id = worm.weapons[worm.current].id;
         let def = &WEAPONS[id as usize];
-        // A lobbed shell, not a flat shot and not a bouncer: the arc is only
-        // honest for a weapon that lands where it stops. (R&C draws this for
-        // the lobbed weapons, and leaves the straight ones to the crosshair.)
-        let lobbed = def.gravity > 0.0 && def.speed > 0.0 && def.speed <= 30.0;
-        if def.kind != Kind::Projectile || !lobbed {
-            return None;
-        }
         let (muzzle, shot) = self.shot_plan(i);
+
+        // A thrown shell: the arc is the weapon, so show it and the landing
+        // mark. The Cluster is the only one slow enough and heavy enough for
+        // the arc to be readable (the Bomb is dropped, the Bouncer ricochets).
+        let lobbed = def.kind == Kind::Projectile
+            && def.gravity > 0.0
+            && def.speed > 0.0
+            && def.speed <= 30.0;
+        if lobbed {
+            return self.lob_path(def, muzzle, shot);
+        }
+
+        // A ricocheting shell: show the first surface it will hit and the way
+        // it leaves. Simulating the whole chain would make every bump a
+        // different answer, and the skill of reading a bounce is the point.
+        let ricochet = def.kind == Kind::Projectile && def.bounce > 0.0 && def.speed > 0.0;
+        if ricochet {
+            return self.bounce_path(def, muzzle, shot);
+        }
+
+        // A straight shell with a blast (Rocket, Nova): no arc, because it
+        // really does fly where the reticle points, but its explosion size at
+        // the mark. Spending the Nova's one round is a decision worth making
+        // with the 8 m footprint in view. Swarm is excluded: its pellets home
+        // and fan out, so a single mark would be a lie.
+        let flat_blast = def.kind == Kind::Projectile
+            && def.blast_radius > 0.0
+            && def.gravity == 0.0
+            && def.speed > 0.0
+            && def.pellets == 1
+            && matches!(def.special, Special::None);
+        if flat_blast {
+            return self.blast_mark(def, muzzle, shot);
+        }
+
+        None
+    }
+
+    /// The arc a lobbed shot will follow, and where it will land.
+    ///
+    /// The flight is stepped exactly as `step_projectiles` does it (minus the
+    /// random spread), so the landing mark lands on the rock the shot will hit.
+    fn lob_path(&self, def: &WeaponDef, muzzle: Vec3, shot: Vec3) -> Option<AimPath> {
         let mut pos = muzzle;
         let mut vel = shot * def.speed;
         let mut points = Vec::new();
@@ -194,7 +301,63 @@ impl World {
             }
             None => Vec3::Y,
         };
-        Some(AimPath { points, hit, normal })
+        Some(AimPath { points, hit, normal, ..Default::default() })
+    }
+
+    /// The Bouncer's first ricochet: where it hits and the short leg it leaves
+    /// along. The flight and the mirror come from the same maths as
+    /// `step_projectiles`, so the stub points where the shell will really go.
+    fn bounce_path(&self, def: &WeaponDef, muzzle: Vec3, shot: Vec3) -> Option<AimPath> {
+        let mut pos = muzzle;
+        let mut vel = shot * def.speed;
+        let ticks = (def.lifetime / DT).ceil() as usize;
+        for _ in 0..ticks {
+            vel.y -= def.gravity * DT;
+            let n = ((vel.length() * DT) / PROJECTILE_STEP).ceil().max(1.0) as i32;
+            let step = vel * DT / n as f32;
+            for _ in 0..n {
+                pos += step;
+                if self.grid.sample(pos) < PROJECTILE_RADIUS {
+                    let n = self.grid.gradient(pos);
+                    let normal = if n.length_squared() > 1.0e-6 {
+                        n.normalize()
+                    } else {
+                        -vel.normalize_or_zero()
+                    };
+                    // `step_projectiles` bounces from the last position outside
+                    // the rock, not from the one that touched it, so the mark
+                    // (and the ring on it) sits on the outside of the surface.
+                    pos -= step;
+                    let into = vel.dot(normal);
+                    if into < 0.0 {
+                        vel -= normal * (2.0 * into);
+                    }
+                    vel *= def.bounce;
+                    if vel.length() < 0.5 {
+                        return None; // would come to rest on the spot: no leg to draw
+                    }
+                    let to = pos + vel.normalize() * 2.0;
+                    return Some(AimPath {
+                        hit: Some(pos),
+                        normal,
+                        bounce: Some((pos, to)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The blast a straight shell will make at the reticle. `gravity` is zero
+    /// for these weapons, so the flight is the straight line and the reach is
+    /// simply speed times fuse.
+    fn blast_mark(&self, def: &WeaponDef, muzzle: Vec3, shot: Vec3) -> Option<AimPath> {
+        let reach = def.speed * def.lifetime;
+        let hit = muzzle + shot * self.grid.raycast(muzzle, shot, reach)?;
+        let n = self.grid.gradient(hit);
+        let normal = if n.length_squared() > 1.0e-6 { n.normalize() } else { -shot };
+        Some(AimPath { hit: Some(hit), normal, blast: def.blast_radius, ..Default::default() })
     }
 
     fn try_fire(&mut self, i: usize) {
@@ -206,11 +369,15 @@ impl World {
         let id = w.id;
         let def = &WEAPONS[id as usize];
         let (barrel, shot) = self.shot_plan(i);
-        // Find the build spot before spending a charge: aiming at a wall too
-        // close, or at a worm, should not cost you a lump.
-        let build_at = match def.kind {
+        // Find the terrain spot before spending a charge: aiming at a wall too
+        // close, or at a worm, should not cost you a lump or a wall.
+        let placed: Option<(Vec3, Option<Shape>)> = match def.kind {
             Kind::Build => match self.build_spot(i, def) {
-                Some(spot) => Some(spot),
+                Some(spot) => Some((spot, None)),
+                None => return,
+            },
+            Kind::Wall => match self.wall_place(i) {
+                Some((shape, at)) => Some((at, Some(shape))),
                 None => return,
             },
             _ => None,
@@ -229,11 +396,12 @@ impl World {
         }
 
         // A weapon with no speed (the bomb) is dropped at your feet, not thrown.
-        // A lump "fires" where it appears, so the flash marks the new rock.
-        let muzzle = match build_at {
-            Some(at) => at,
-            None if def.kind == Kind::Projectile && def.speed == 0.0 => feet + Vec3::Y * 0.5,
-            None => barrel,
+        // A lump or a wall "fires" where it appears, so the flash marks the new
+        // rock.
+        let (muzzle, wall) = match placed {
+            Some((at, wall)) => (at, wall),
+            None if def.kind == Kind::Projectile && def.speed == 0.0 => (feet + Vec3::Y * 0.5, None),
+            None => (barrel, None),
         };
         self.events.push(Event::Shot { worm: i as u8, weapon: id, pos: muzzle + shot * FLASH_AHEAD });
 
@@ -260,13 +428,20 @@ impl World {
             // drawing or network message: joiners learn about it from the same
             // `Edit` event that reports a crater.
             Kind::Build => {
-                if let Some(at) = build_at {
-                    let shape = Shape::Sphere { center: at, radius: def.terrain };
-                    let op = Op::Smooth(BUILD_SMOOTH);
-                    self.grid.apply(shape, op);
-                    self.events.push(Event::Edit { shape, op });
-                }
+                let shape = Shape::Sphere { center: muzzle, radius: def.terrain };
+                let op = Op::Smooth(BUILD_SMOOTH);
+                self.grid.apply(shape, op);
+                self.events.push(Event::Edit { shape, op });
             }
+            // A wall is one box-shaped edit. Same `Edit` event as a lump, so
+            // the existing terrain pipeline and networking carry it for free.
+            Kind::Wall => {
+                let shape = wall.expect("a Wall shot has a shape");
+                let op = Op::Smooth(WALL_SMOOTH);
+                self.grid.apply(shape, op);
+                self.events.push(Event::Edit { shape, op });
+            }
+            Kind::Whip => self.whip_strike(i, def, muzzle, shot),
         }
     }
 
@@ -291,6 +466,107 @@ impl World {
             None
         } else {
             Some(at)
+        }
+    }
+
+    /// Where the Block weapon throws its wall, and which way it faces.
+    ///
+    /// The wall is a vertical rectangle whose face points along the horizontal
+    /// aim, so it is always between the worm and what it is looking at. It is
+    /// placed a fixed distance ahead (or a little nearer, to stand clear of a
+    /// rock face) and sunk slightly into the ground, so there is no gap under
+    /// it. None if there is no room between the worm and the rock, or if the
+    /// box would grow through a worm or a spawn point.
+    fn wall_place(&self, i: usize) -> Option<(Shape, Vec3)> {
+        let worm = &self.worms[i];
+        // Aim flat at the wall: looking up or down should not tip the shield
+        // over. Aiming straight up or down has no horizontal direction, so fall
+        // back to where the body faces.
+        let aim = worm.aim_dir();
+        let flat = Vec3::new(aim.x, 0.0, aim.z);
+        let dir = if flat.length_squared() > 1.0e-6 {
+            flat.normalize()
+        } else {
+            let (s, c) = worm.face_yaw.sin_cos();
+            Vec3::new(s, 0.0, c)
+        };
+        // Leave a little air in front of the wall instead of burying it in the
+        // rock that is already there.
+        let clear = self
+            .grid
+            .raycast(worm.eye(), dir, WALL_AHEAD + WALL_HALF_T + 0.5)
+            .unwrap_or(f32::MAX);
+        let ahead = WALL_AHEAD.min(clear - WALL_HALF_T - 0.1);
+        if ahead < WALL_MIN_AHEAD {
+            return None;
+        }
+        let centre = worm.pos + dir * ahead + Vec3::Y * WALL_LIFT;
+        let shape = Shape::Box {
+            centre,
+            half: Vec3::new(WALL_HALF_W, WALL_HALF_H, WALL_HALF_T),
+            yaw: dir.x.atan2(dir.z),
+        };
+        // Never materialise rock through a living worm (including the owner) or
+        // a spawn point: a wall that clips a body would shove it out, and one
+        // over a spawn could wall a respawn in.
+        let free = |p: Vec3| shape.distance(p) > WALL_MARGIN;
+        let body_free = |feet: Vec3| {
+            let (a, b) = body_axis(feet);
+            free(a) && free((a + b) * 0.5) && free(b)
+        };
+        let worms_free = self.worms.iter().filter(|w| w.alive).all(|w| {
+            let (a, b) = w.axis();
+            free(a) && free((a + b) * 0.5) && free(b)
+        });
+        let spawns_free = self.spawns.iter().all(|&s| body_free(s));
+        if !worms_free || !spawns_free {
+            return None;
+        }
+        Some((shape, centre))
+    }
+
+    /// The plasma whip: a random sine-wave lash. It damages every worm the wave
+    /// passes close to, and carves its own path into any rock it crosses, which
+    /// is the scar it leaves behind.
+    fn whip_strike(&mut self, owner: usize, def: &WeaponDef, origin: Vec3, aim: Vec3) {
+        // The lash is mostly where the player aimed, but wanders enough that no
+        // two strikes land the same, and the wave's plane is rolled at random.
+        let dir = spread_dir(&mut self.rng, aim, 0.12);
+        let reference = if dir.y.abs() > 0.99 { Vec3::X } else { Vec3::Y };
+        let a = reference.cross(dir).normalize_or_zero();
+        let b = dir.cross(a).normalize_or_zero();
+        let roll = self.rng.range(0.0, std::f32::consts::TAU);
+        let side = a * roll.cos() + b * roll.sin();
+        let phase = self.rng.range(0.0, std::f32::consts::TAU);
+        let path = whip_path(origin, dir, side, phase, def.range);
+        self.events.push(Event::Whip { from: origin, dir, side, phase, length: def.range });
+
+        // A lash is a melee sweep: check the whole body of every other worm
+        // against every segment of the wave. The radius is generous because the
+        // drawn chain is thin and the wave moves.
+        for v in 0..self.worms.len() {
+            if v == owner || !self.worms[v].alive {
+                continue;
+            }
+            let (a, b) = self.worms[v].axis();
+            let touch = [a, (a + b) * 0.5, b].iter().any(|&p| {
+                path.windows(2)
+                    .any(|w| point_segment_distance(p, w[0], w[1]) < WORM_RADIUS + WHIP_HIT)
+            });
+            if touch {
+                let away = ((a + b) * 0.5 - origin).normalize_or_zero();
+                self.damage(v, def.damage, owner, away * def.knockback);
+            }
+        }
+
+        // The scar. `Carve` only changes voxels near the wave, so a lash
+        // through open air costs nothing; where it crosses rock it burns a
+        // groove along the same curve the viewer draws.
+        let op = Op::Carve;
+        for w in path.windows(2) {
+            let shape = Shape::Capsule { a: w[0], b: w[1], radius: def.terrain };
+            self.grid.apply(shape, op);
+            self.events.push(Event::Edit { shape, op });
         }
     }
 
@@ -627,7 +903,9 @@ fn point_segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR};
+    use crate::weapons::{
+        BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+    };
     use glam::IVec3;
     use sdf::Grid;
 
@@ -742,14 +1020,56 @@ mod tests {
     }
 
     #[test]
-    fn flat_shots_get_no_trajectory() {
+    fn guns_whose_shot_follows_the_reticle_get_no_aim_aid() {
         let mut w = arena(flat, &[(16.0, 16.0)]);
-        for id in [BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, SWARM] {
+        for id in [BLASTER, RAILGUN, BOMB, SWARM, TELEPORT, BUILD, TRACTOR, WHIP] {
             w.worms[0].current = id as usize;
-            assert!(w.aim_path(0).is_none(), "weapon {id} flies flat or is dropped");
+            assert!(w.aim_path(0).is_none(), "weapon {id} needs no aid");
         }
-        w.worms[0].current = CLUSTER as usize;
-        assert!(w.aim_path(0).is_some(), "but a lobbed one has an arc");
+    }
+
+    #[test]
+    fn the_shots_that_leave_the_reticle_get_an_aim_aid() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        // Straight blast shells need something on the ground in front of them;
+        // the lobbed and ricocheting ones arc down onto it by themselves.
+        w.worms[0].pitch = -0.3;
+        for id in [CLUSTER, BOUNCER, ROCKET, NOVA] {
+            w.worms[0].current = id as usize;
+            assert!(w.aim_path(0).is_some(), "weapon {id} does need one");
+        }
+    }
+
+    #[test]
+    fn a_rocket_and_a_nova_mark_their_blast_at_the_impact() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        w.worms[0].pitch = -0.3; // aim at the ground in front
+        for (id, radius) in [(ROCKET, 3.0), (NOVA, 8.0)] {
+            w.worms[0].current = id as usize;
+            let path = w.aim_path(0).expect("a blast is worth marking");
+            assert!(path.points.is_empty(), "it flies straight, so no arc");
+            assert_eq!(path.blast, radius, "the ring is the blast radius");
+            assert_eq!(path.bounce, None);
+            let hit = path.hit.expect("the ground is in the way");
+            assert!(hit.y > 3.9 && hit.y < 4.2, "the mark is on the ground: {hit:?}");
+            assert!(path.normal.y > 0.5, "the ring lies on the ground: {:?}", path.normal);
+        }
+    }
+
+    #[test]
+    fn a_bouncer_marks_the_first_ricochet() {
+        let mut w = arena(walled, &[(16.0, 16.0)]);
+        w.worms[0].current = BOUNCER as usize;
+        let path = w.aim_path(0).expect("a ricochet is worth marking");
+        assert!(path.points.is_empty(), "one bounce, not a whole predicted path");
+        assert_eq!(path.blast, 0.0);
+        let hit = path.hit.expect("the wall is in the way");
+        assert!(hit.z > 23.0, "the mark is on the wall: {hit:?}");
+        assert!(path.normal.z < -0.5, "the ring faces back at the worm: {:?}", path.normal);
+        let (from, to) = path.bounce.expect("and the shell leaves the wall");
+        assert!((from - hit).length() < 1.0e-4, "the stub starts at the mark");
+        let away = (to - from).normalize();
+        assert!(away.dot(path.normal) > 0.2, "the stub comes back off the wall: {away:?} {:?}", path.normal);
     }
 
     #[test]
@@ -903,7 +1223,7 @@ mod tests {
         let mut w = duel();
         w.worms[1].pos.z = 20.0;
         shoot(&mut w, CLUSTER, LEVEL);
-        run(&mut w, 8); // 28 m/s: well past 4 m after 8 ticks
+        run(&mut w, 8); // still in flight: passing through a worm does not burst it
         assert!(w.projectiles.iter().any(|p| p.weapon == CLUSTER), "no burst on the worm yet");
         assert_eq!(w.worms[1].hp, MAX_HP);
     }
@@ -975,37 +1295,115 @@ mod tests {
     }
 
     #[test]
-    fn the_block_weapon_adds_rock_where_you_aim_and_costs_a_charge() {
+    fn the_block_weapon_throws_up_a_thick_wall_in_front() {
         let mut w = arena(flat, &[(16.0, 16.0)]);
-        let dir = Vec3::new(0.0, (-0.5f32).sin(), (-0.5f32).cos());
-        let eye = w.worms[0].eye();
-        let t = w.grid.raycast(eye, dir, 14.0).unwrap();
-        let lump = eye + dir * (t - 0.7);
-        assert!(w.grid.sample(lump) > 0.0, "air before");
-        let events = shoot(&mut w, BUILD, -0.5);
-        assert!(w.grid.sample(lump) < -0.3, "rock after: {}", w.grid.sample(lump));
-        assert_eq!(w.worms[0].weapons[BUILD as usize].ammo, 5);
-        assert!(events.iter().any(|e| matches!(e, Event::Edit { op: Op::Smooth(_), .. })));
+        let ammo = w.worms[0].weapons[BUILD as usize].ammo;
+        let events = shoot(&mut w, BUILD, 0.0);
+        assert_eq!(w.worms[0].weapons[BUILD as usize].ammo, ammo - 1, "one charge, one wall");
+        let shape = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Edit { shape: shape @ Shape::Box { .. }, .. } => Some(*shape),
+                _ => None,
+            })
+            .expect("the wall is a box edit");
+        let Shape::Box { centre, half, .. } = shape else { unreachable!() };
+        assert!((centre.z - (w.worms[0].pos.z + WALL_AHEAD)).abs() < 0.05, "just in front");
+        assert!(w.grid.sample(centre) < -0.2, "solid at the centre");
+        assert!(w.grid.sample(centre + Vec3::X * (half.x * 0.5)) < -0.2, "solid out to the side");
+        assert!(w.grid.sample(centre + Vec3::X * (half.x + 0.6)) > 0.0, "air beside it");
+        assert!(w.grid.sample(centre + Vec3::Y * (half.y + 0.4)) > 0.0, "air above it");
+        // Thick enough to stop a bolt, and it must not contain its maker.
+        assert!((half.z * 2.0) >= 0.5, "a thick wall: {} m", half.z * 2.0);
+        let (a, b) = w.worms[0].axis();
+        for p in [a, (a + b) * 0.5, b] {
+            assert!(shape.distance(p) > 0.0, "the wall is not on the worm: {p:?}");
+        }
     }
 
     #[test]
-    fn a_lump_is_never_built_into_a_worm() {
-        let mut w = arena(flat, &[(16.0, 16.0)]);
+    fn a_block_wall_stops_a_shot_from_the_front() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 24.0)]);
+        shoot(&mut w, BUILD, 0.0);
+        let hp = w.worms[0].hp;
+        // Worm 1 turns around and fires through where the wall now stands.
+        w.step(&[
+            Input::default(),
+            Input { fire: true, weapon: RAILGUN, yaw: std::f32::consts::PI, pitch: LEVEL, ..Input::default() },
+        ]);
+        let events = w.drain_events();
+        assert_eq!(w.worms[0].hp, hp, "the wall is cover");
+        let end = events.iter().find_map(|e| if let Event::Beam { to, .. } = e { Some(*to) } else { None }).unwrap();
+        assert!(end.z > 17.0 && end.z < 19.0, "the beam ends on the wall: {end:?}");
+    }
+
+    #[test]
+    fn a_wall_is_never_thrown_through_a_worm() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 17.6)]);
         let before = w.grid.checksum();
-        let events = shoot(&mut w, BUILD, -1.55); // at its own feet
-        assert_eq!(w.grid.checksum(), before);
-        assert_eq!(w.worms[0].weapons[BUILD as usize].ammo, 6, "and it was free");
+        let events = shoot(&mut w, BUILD, 0.0);
+        assert_eq!(w.grid.checksum(), before, "no wall through the other worm");
+        assert_eq!(w.worms[0].weapons[BUILD as usize].ammo, 4, "and it was free");
         assert!(events.is_empty());
     }
 
     #[test]
-    fn a_lump_is_never_built_on_a_spawn_point() {
-        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 22.0)]);
+    fn a_wall_is_never_thrown_over_a_spawn_point() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 17.6)]);
         w.worms[1].pos = Vec3::new(2.0, 4.05, 2.0); // the second worm walks off
         let before = w.grid.checksum();
-        // Aimed at the ground where worm 1 spawned, 6 m ahead.
-        shoot(&mut w, BUILD, -0.26);
+        shoot(&mut w, BUILD, 0.0);
         assert_eq!(w.grid.checksum(), before, "the spawn column stays free");
+    }
+
+    #[test]
+    fn a_whip_path_is_a_sine_wave_from_the_origin() {
+        let path = whip_path(Vec3::ZERO, Vec3::Z, Vec3::X, 0.0, 6.0);
+        assert_eq!(path[0], Vec3::ZERO, "it starts at the emitter");
+        assert!((path[WHIP_POINTS - 1].z - 6.0).abs() < 1.0e-3, "and reaches the aim distance");
+        assert!(path.iter().any(|p| p.x.abs() > 0.1), "it is a wave, not a rod");
+        assert!(path.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn the_plasma_whip_hurts_a_worm_it_lashes() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 20.0)]);
+        w.worms[0].current = WHIP as usize;
+        let events = shoot(&mut w, WHIP, LEVEL);
+        assert!(w.worms[1].hp < MAX_HP, "the lash reached it: {}", w.worms[1].hp);
+        assert!(events.iter().any(|e| matches!(e, Event::Whip { .. })), "and the viewer is told to draw it");
+    }
+
+    #[test]
+    fn the_plasma_whip_leaves_a_scar_in_the_rock() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        let before = w.grid.checksum();
+        let events = shoot_at(&mut w, WHIP, 0.0, -0.7); // down at the ground
+        assert_ne!(w.grid.checksum(), before, "the rock is scarred");
+        assert!(events.iter().any(|e| matches!(e, Event::Edit { op: Op::Carve, .. })));
+    }
+
+    #[test]
+    fn no_two_whip_lashes_are_aligned_the_same_way() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        let mut lashes = Vec::new();
+        for _ in 0..6 {
+            w.worms[0].weapons[WHIP as usize].cooldown = 0.0;
+            let events = shoot(&mut w, WHIP, LEVEL);
+            if let Some(Event::Whip { dir, side, phase, .. }) =
+                events.iter().find(|e| matches!(e, Event::Whip { .. }))
+            {
+                lashes.push((*dir, *side, *phase));
+            }
+        }
+        assert!(lashes.len() >= 4, "the whip fired: {}", lashes.len());
+        let first = lashes[0];
+        assert!(
+            lashes.iter().skip(1).any(|p| (p.0 - first.0).length() > 1.0e-3
+                || (p.1 - first.1).length() > 1.0e-3
+                || (p.2 - first.2).abs() > 1.0e-3),
+            "each strike has its own orientation"
+        );
     }
 
     #[test]

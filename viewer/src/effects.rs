@@ -9,8 +9,8 @@
 
 use crate::renderer::DrawPrim;
 use glam::Vec3;
-use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT};
-use sim::{AimPath, Event, Projectile, DT};
+use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
+use sim::{whip_path, AimPath, Event, Projectile, DT, WHIP_POINTS};
 use std::f32::consts::TAU;
 
 /// The renderer holds `MAX_CAPSULES` (256) primitives in total, and worms,
@@ -41,6 +41,8 @@ const BRASS: Vec3 = Vec3::new(0.80, 0.62, 0.26);
 const BEAM: Vec3 = Vec3::new(0.55, 0.92, 1.0);
 const OLIVE: Vec3 = Vec3::new(0.31, 0.37, 0.20);
 const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
+const PLASMA: Vec3 = Vec3::new(0.55, 0.28, 1.0);
+const PLASMA_HOT: Vec3 = Vec3::new(0.92, 0.86, 1.0);
 
 /// A frame along the direction of travel: forward, a perpendicular, and up.
 /// Falls back to +Z for a projectile at rest, so a sphere never degenerates into
@@ -67,6 +69,7 @@ fn flash(weapon: u8) -> (Vec3, f32) {
         SWARM => (MAGENTA, 0.18),
         TELEPORT => (VIOLET, 0.26),
         NOVA => (ICE, 0.38),
+        WHIP => (PLASMA, 0.26),
         _ => (HOT, 0.20),
     }
 }
@@ -156,12 +159,12 @@ fn trail(weapon: u8) -> Option<(Vec3, f32, u32, bool)> {
     }
 }
 
-/// The aim aid for a lobbed weapon: a dotted arc and a ring where it lands.
-/// `AimPath` comes from the sim, so the ring sits on the rock the shot will
-/// really hit. R&C only shows this for thrown weapons; `World::aim_path`
-/// decides which those are.
+/// The aim aid a weapon draws: a dotted arc for a lob, a ring on the rock where
+/// the shot will land, a blast footprint, and/or a short stub leaving a
+/// ricochet. `AimPath` comes from the sim, so everything sits on the rock the
+/// shot will really hit. `World::aim_path` decides which weapons get which.
 pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
-    let mut out = Vec::with_capacity(24);
+    let mut out = Vec::with_capacity(32);
     let n = path.points.len();
     if n > 0 {
         // At most 14 dots: enough to read the curve, cheap enough that the aid
@@ -195,7 +198,11 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
         }
         let side = side.normalize();
         let up = side.cross(normal).normalize_or_zero();
-        let radius = 0.70;
+        // A blast's footprint is the whole point of the mark; a lob only needs
+        // a small "here" dot. Thicken the line a little with the ring so an
+        // 8 m Nova does not read as a hairline scribble at range.
+        let radius = if path.blast > 0.0 { path.blast } else { 0.70 };
+        let width = 0.050 + 0.004 * path.blast;
         let segments = 12;
         for k in 0..segments {
             let a0 = k as f32 * TAU / segments as f32;
@@ -205,7 +212,7 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
             // A thin continuous ring: inkless, so it stays a circle instead of
             // turning into a row of dark pebbles at a distance.
             out.push(
-                DrawPrim::capsule(p0, p1, 0.050, HINT, false)
+                DrawPrim::capsule(p0, p1, width, HINT, false)
                     .glowing()
                     .inkless(),
             );
@@ -218,6 +225,23 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
                 .inkless(),
         );
     }
+    if let Some((from, to)) = path.bounce {
+        // Three fading dashes along the first leg: enough to read the new
+        // direction, not a full second bounce that would pretend to know every
+        // pebble on the way.
+        let dir = (to - from).normalize_or_zero();
+        if dir.length_squared() > 0.5 {
+            for k in 0..3 {
+                let a = from + dir * (0.25 + 0.55 * k as f32);
+                let b = from + dir * (0.75 + 0.55 * k as f32);
+                out.push(
+                    DrawPrim::capsule(a, b, 0.060 - 0.012 * k as f32, HINT, false)
+                        .glowing()
+                        .inkless(),
+                );
+            }
+        }
+    }
     out
 }
 
@@ -226,6 +250,10 @@ enum Shape {
     Ball { at: Vec3, radius: f32 },
     /// A beam or a tracer: a thin line that thins out.
     Line { from: Vec3, to: Vec3 },
+    /// A plasma whip's sine-wave lash. The points come from the sim's own
+    /// `whip_path`, so the bright chain the player sees is the same curve that
+    /// hit and scarred the world.
+    Whip { points: [Vec3; WHIP_POINTS] },
 }
 
 struct Effect {
@@ -286,6 +314,23 @@ impl Effect {
             width: 0.0,
             hot: false,
             inkless: false,
+        }
+    }
+
+    /// The lash itself: a glowing chain that snaps out to its full length and
+    /// then fades, with the segments brightening in a travelling pulse.
+    fn whip(points: [Vec3; WHIP_POINTS]) -> Effect {
+        Effect {
+            shape: Shape::Whip { points },
+            colour: PLASMA,
+            vel: Vec3::ZERO,
+            gravity: 0.0,
+            age: 0.0,
+            life: 0.34,
+            burst: false,
+            width: 0.075,
+            hot: true,
+            inkless: true,
         }
     }
 }
@@ -362,6 +407,27 @@ impl Effects {
                 self.push_burst(line);
                 self.push_burst(Effect::burst(Shape::Ball { at: from, radius: 0.24 }, BEAM, 0.09).glow());
                 self.push_burst(Effect::burst(Shape::Ball { at: to, radius: 0.55 }, BEAM, 0.16).glow());
+            }
+            Event::Whip { from, dir, side, phase, length } => {
+                // The lash is a chain of glowing segments along the same sine
+                // wave the sim used for the hit and the scar. A bright crack
+                // and a few sparks at the tip sell the impact.
+                let points = whip_path(from, dir, side, phase, length);
+                self.push_burst(Effect::whip(points));
+                let tip = points[WHIP_POINTS - 1];
+                self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.26, PLASMA_HOT, 0.12, 0.0).glow());
+                for i in 0..4 {
+                    let a = i as f32 * 2.399 + phase;
+                    let spark = Vec3::new(a.cos(), 0.35 + 0.4 * (a * 1.7).sin().abs(), a.sin());
+                    self.push_burst(Effect::puff(
+                        tip,
+                        spark.normalize_or_zero() * (2.5 + i as f32 * 0.4),
+                        0.05,
+                        PLASMA_HOT,
+                        0.16,
+                        9.0,
+                    ).glow());
+                }
             }
             Event::Shot { weapon, pos, .. } => {
                 // A short hot ball at the muzzle in the weapon's own colour (the
@@ -530,32 +596,58 @@ impl Effects {
     }
 
     pub fn capsules(&self) -> Vec<DrawPrim> {
-        self.list
-            .iter()
-            .chain(self.dust.iter())
-            .chain(self.trails.iter())
-            .map(|e| {
-                let u = (e.age / e.life).clamp(0.0, 1.0);
-                match e.shape {
-                    Shape::Ball { at, radius } => {
-                        // A burst grows in the first third, then shrinks; dust
-                        // only shrinks, so it looks like it is settling.
-                        let size = if e.burst {
-                            if u < 0.35 { u / 0.35 } else { 1.0 - (u - 0.35) / 0.65 }
-                        } else {
-                            1.0 - u
-                        };
-                        // A capsule needs a direction: a stub makes a sphere.
-                        let ball = DrawPrim::capsule(at, at + Vec3::Y * 0.01, radius * size, e.colour, false);
-                        styled(ball, e)
-                    }
-                    Shape::Line { from, to } => {
-                        let line = DrawPrim::capsule(from, to, e.width * (1.0 - u), e.colour, false);
-                        styled(line, e)
-                    }
+        let mut out = Vec::with_capacity(self.list.len() + self.dust.len() + self.trails.len() + 16);
+        for e in self.list.iter().chain(self.dust.iter()).chain(self.trails.iter()) {
+            let u = (e.age / e.life).clamp(0.0, 1.0);
+            match &e.shape {
+                Shape::Ball { at, radius } => {
+                    // A burst grows in the first third, then shrinks; dust only
+                    // shrinks, so it looks like it is settling.
+                    let size = if e.burst {
+                        if u < 0.35 { u / 0.35 } else { 1.0 - (u - 0.35) / 0.65 }
+                    } else {
+                        1.0 - u
+                    };
+                    // A capsule needs a direction: a stub makes a sphere.
+                    let ball = DrawPrim::capsule(*at, *at + Vec3::Y * 0.01, *radius * size, e.colour, false);
+                    out.push(styled(ball, e));
                 }
-            })
-            .collect()
+                Shape::Line { from, to } => {
+                    let line = DrawPrim::capsule(*from, *to, e.width * (1.0 - u), e.colour, false);
+                    out.push(styled(line, e));
+                }
+                Shape::Whip { points } => {
+                    // The lash snaps out from the handle, holds for a beat, then
+                    // fades. Segment brightness ripples along it, so the energy
+                    // reads as moving even though the path is fixed.
+                    let extend = (u / 0.18).clamp(0.0, 1.0);
+                    let head = (extend * (WHIP_POINTS - 1) as f32).max(1.0);
+                    let fade = if u < 0.55 { 1.0 } else { 1.0 - (u - 0.55) / 0.45 };
+                    if fade <= 0.02 {
+                        continue;
+                    }
+                    for k in 0..WHIP_POINTS - 1 {
+                        if k as f32 > head {
+                            break;
+                        }
+                        let t = k as f32 / (WHIP_POINTS - 1) as f32;
+                        // A travelling pulse of brighter segments, like current
+                        // running down the lash.
+                        let pulse = 0.78 + 0.32 * ((k as f32 * 0.9 - u * 18.0).sin() * 0.5 + 0.5);
+                        let colour = (e.colour * pulse).clamp(Vec3::ZERO, Vec3::ONE);
+                        let radius = (e.width * (1.0 - 0.45 * t) * fade).max(0.004);
+                        let seg = DrawPrim::capsule(points[k], points[k + 1], radius, colour, false);
+                        out.push(styled(seg, e));
+                    }
+                    // The bright head of the crack, riding out to the tip.
+                    let k = (head as usize).min(WHIP_POINTS - 1);
+                    let p = points[k];
+                    let tip = DrawPrim::capsule(p, p + Vec3::Y * 0.004, (0.10 * fade).max(0.004), PLASMA_HOT, false);
+                    out.push(styled(tip, e));
+                }
+            }
+        }
+        out
     }
 
     fn push_burst(&mut self, e: Effect) {
@@ -697,6 +789,7 @@ mod tests {
             points: (0..10).map(|k| Vec3::new(0.0, 2.0 - k as f32 * 0.2, k as f32 * 1.5)).collect(),
             hit: Some(Vec3::new(0.0, 0.0, 13.5)),
             normal: Vec3::Y,
+            ..Default::default()
         };
         let prims = trajectory(&path);
         assert!(prims.len() >= 12, "dots plus a ring: {}", prims.len());
@@ -708,6 +801,57 @@ mod tests {
                 DrawPrim::Cuboid { centre, half, .. } => assert!(centre.is_finite() && half.max_element() > 0.0),
             }
         }
+    }
+
+    #[test]
+    fn the_aim_aid_scales_the_ring_to_the_blast_and_draws_a_bounce_stub() {
+        let at = Vec3::new(0.0, 0.0, 10.0);
+        let blast = AimPath { hit: Some(at), normal: Vec3::Y, blast: 8.0, ..Default::default() };
+        let prims = trajectory(&blast);
+        assert_eq!(prims.len(), 13, "a ring and its centre dot, no arc");
+        let far = prims
+            .iter()
+            .filter_map(|p| match *p {
+                DrawPrim::Capsule { a, .. } => Some(a.distance(at)),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(far > 7.5, "the ring is 8 m across: {far}");
+
+        let bounce = AimPath {
+            hit: Some(at),
+            normal: Vec3::Y,
+            bounce: Some((at, at + Vec3::Z * 2.0)),
+            ..Default::default()
+        };
+        let prims = trajectory(&bounce);
+        assert!(prims.len() >= 15, "a ring and a 2 m stub: {}", prims.len());
+    }
+
+    #[test]
+    fn a_whip_lashes_a_sine_wave_that_snaps_out_then_fades() {
+        let mut e = Effects::default();
+        e.add(&Event::Whip {
+            from: Vec3::ZERO,
+            dir: Vec3::Z,
+            side: Vec3::X,
+            phase: 0.0,
+            length: 6.0,
+        });
+        let prims = e.capsules();
+        assert!(prims.len() >= 8, "a chain of segments, not a dash: {}", prims.len());
+        for p in &prims {
+            match *p {
+                DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
+                    assert!(a.is_finite() && b.is_finite() && radius > 0.0);
+                }
+                DrawPrim::Cuboid { centre, half, .. } => assert!(centre.is_finite() && half.max_element() > 0.0),
+            }
+        }
+        e.update(0.1);
+        assert!(count(&e) >= 8, "the whole lash is out");
+        e.update(0.4);
+        assert_eq!(count(&e), 0, "and then it is gone");
     }
 
     #[test]

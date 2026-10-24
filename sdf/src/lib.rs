@@ -423,6 +423,34 @@ mod tests {
     }
 
     #[test]
+    fn a_box_adds_a_flat_wall() {
+        let mut g = Grid::from_fn(IVec3::new(4, 4, 4), |p| p.y - 4.0);
+        let boxy = Shape::Box {
+            centre: Vec3::new(8.0, 6.0, 8.0),
+            half: Vec3::new(2.0, 1.5, 0.3),
+            yaw: 0.0,
+        };
+        g.apply(boxy, Op::Add);
+        assert!(g.sample(Vec3::new(8.0, 6.0, 8.0)) < -0.2, "inside the wall");
+        assert!(g.sample(Vec3::new(8.0, 6.0, 8.6)) > 0.0, "past its thickness");
+        assert!(g.sample(Vec3::new(8.0, 6.0, 7.4)) > 0.0, "in front of it");
+        assert!(g.sample(Vec3::new(11.0, 6.0, 8.0)) > 0.0, "past its width");
+        assert!(g.sample(Vec3::new(8.0, 8.0, 8.0)) > 0.0, "above it");
+    }
+
+    #[test]
+    fn a_box_distance_is_rotated_with_its_yaw() {
+        let boxy = Shape::Box {
+            centre: Vec3::ZERO,
+            half: Vec3::new(2.0, 1.0, 0.3),
+            yaw: std::f32::consts::FRAC_PI_2,
+        };
+        // A box turned 90 degrees is thin along x and wide along z.
+        assert!(boxy.distance(Vec3::new(0.0, 0.0, 1.5)) < 0.0);
+        assert!(boxy.distance(Vec3::new(1.5, 0.0, 0.0)) > 0.0);
+    }
+
+    #[test]
     fn gradient_points_out_of_rock() {
         let mut g = world();
         let c = Vec3::splat(8.0);

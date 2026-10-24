@@ -11,11 +11,13 @@ the networking concepts where they appear.
 
 **Where it is:** milestone M3 of seven. You play a worm in a cave-and-hills
 world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
-integrated laptop GPU, and now fight: eleven weapons (rockets, a railgun, bombs,
-homing swarms, a teleport gun, a Nova that clears a cavern, and two that *build*
-rock). Explosions carve the terrain, rock is cover, and a dead worm comes back
+integrated laptop GPU, and now fight: twelve weapons (rockets, a railgun, bombs,
+homing swarms, a teleport gun, a Nova that clears a cavern, a plasma whip that
+scars the rock, a wall-thrower and a forming beam). Explosions carve the terrain,
+rock is cover, and a dead worm comes back
 after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
-arc to the point it will land on, and rockets leave smoke in the air. The rules
+arc to the point it will land on, a ricochet marks its first bounce, and a big
+blast shows its footprint, while rockets leave smoke in the air. The rules
 run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
@@ -45,7 +47,7 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 | Space | jump (hold for height); press again in mid-air to double jump |
 | hold W into a wall | climb it; S climbs down; Space kicks off the wall. Low ledges and crater rims (up to ~1 m) are climbed automatically, and a jump that reaches a higher lip grabs it |
 | left mouse (hold) | fire the current weapon |
-| 1 2 3 4 5 6 7 8 9 0 -, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor |
+| 1 2 3 4 5 6 7 8 9 0 - =, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor, Plasma Whip |
 | Left Shift (hold) | dig: a smooth 3 m tunnel where you look (up to 4 m away), five bites a second |
 | right mouse | shoot the ninja rope at what you look at; press again to let go |
 | E / Q | reel the rope in / out. Reeling in *pulls* you (up to 20 m/s), so you can launch yourself out of a hole |
@@ -79,7 +81,7 @@ cargo test -p sdf -p sim -p viewer
 projectiles and blasts are in the air); `--weapon id` just holds it, with no
 shot, which is the way to look at a gun. `--no-brush` hides the orange dig
 ring that otherwise sits on the terrain behind the character, and `--no-aim`
-hides the dotted trajectory that a lobbed weapon draws.
+hides the weapon aim aid: lobbed arcs, blast rings and ricochet marks.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.

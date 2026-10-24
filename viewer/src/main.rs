@@ -40,8 +40,8 @@ Controls
   W A S D           run (the worm turns), mouse  look and aim
   Space             jump (hold for height); press again in mid-air to double
   left mouse        fire (hold)              right mouse  shoot the rope / let go
-  1-9 0 -           pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
-                    Bomb Cluster Swarm Teleport Nova Block Tractor
+  1-9 0 - =         pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
+                    Bomb Cluster Swarm Teleport Nova Block Tractor Plasma Whip
   hold W into a wall  climb it; S climbs down; Space kicks off the wall
                      (low ledges and crater rims are climbed automatically;
                      a jump that reaches a higher lip grabs it)
@@ -73,7 +73,7 @@ struct Config {
     /// screenshot shows the gun itself instead of a muzzle flash.
     weapon: Option<u8>,
     brush: bool,
-    /// `--no-aim`: hide the lobbed-weapon trajectory aid in a screenshot.
+    /// `--no-aim`: hide the weapon aim aid (arcs, blast rings, ricochet marks) in a screenshot.
     aim: bool,
     shadows: bool,
     ao: bool,
@@ -145,7 +145,8 @@ fn parse_args() -> Config {
 /// The seed of the sim's random numbers (weapon spread, bomblets).
 const SEED: u32 = 1;
 
-/// The weapon a number-row key picks: 1 to 9 are the first nine, 0 the tenth.
+/// The weapon a number-row key picks: 1 to 9 are the first nine, then 0, `-`
+/// and `=`.
 fn weapon_key(key: KeyCode) -> Option<u8> {
     Some(match key {
         KeyCode::Digit1 => 0,
@@ -159,6 +160,7 @@ fn weapon_key(key: KeyCode) -> Option<u8> {
         KeyCode::Digit9 => 8,
         KeyCode::Digit0 => 9,
         KeyCode::Minus => 10,
+        KeyCode::Equal => 11,
         _ => return None,
     })
 }
@@ -358,7 +360,7 @@ fn run_shot(cfg: &Config, path: &str) {
         }
     }
     let mut capsules = worms::capsules(&world.worms, &positions, &anims);
-    // The aim aid for a lobbed weapon, if worm 0 is holding one.
+    // The aim aid worm 0's weapon calls for, if it calls for one.
     if cfg.aim {
         if let Some(path) = world.aim_path(0) {
             capsules.extend(effects::trajectory(&path));
@@ -829,7 +831,8 @@ impl Viewer {
                     &mut self.world.grid,
                 );
             }
-            // The number row picks the weapon with that id; `-` is the 11th.
+            // The number row picks the weapon with that id; `-` and `=` are the
+            // last two.
             other => {
                 if let Some(id) = weapon_key(other) {
                     self.weapon = id;
