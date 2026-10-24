@@ -37,8 +37,7 @@ const HELP: &str = "\
 Controls
   click the window  capture the mouse        Esc  release it (again to quit)
   W A S D           run (the worm turns), mouse  look and aim
-  Space             jump: hold for height; press again as you land for a double,
-                    then a triple (the triple needs speed)
+  Space             jump (hold for height); press again in mid-air to double
   left mouse        fire (hold)              right mouse  shoot the rope / let go
   1-9 0 -           pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
                     Bomb Cluster Swarm Teleport Nova Block Tractor
@@ -245,6 +244,10 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
         for _ in 0..60 {
             world.step(&[look]);
         }
+        // The sim only turns the body when there is movement input, so a worm
+        // that has just been dropped on the ground still faces +Z. The shot's
+        // yaw is documented as where the worm faces, so point it there.
+        world.worms[0].face_yaw = yaw.to_radians();
         if cfg.rope {
             // Shoot the rope up and forward, then let it swing for a third of a second.
             let shoot = Input { pitch: 0.7, rope: true, ..look };
@@ -281,7 +284,8 @@ fn run_shot(cfg: &Config, path: &str) {
     let cam = camera_from(cfg);
     let target = Offscreen::new(&gpu.device, cfg.size);
     let positions: Vec<Vec3> = world.worms.iter().map(|w| w.pos).collect();
-    let mut capsules = worms::capsules(&world.worms, &positions);
+    let anims: Vec<worms::Anim> = world.worms.iter().map(|_| worms::Anim::default()).collect();
+    let mut capsules = worms::capsules(&world.worms, &positions, &anims);
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
     capsules.extend(effects.capsules());
     let params = FrameParams {
@@ -410,7 +414,8 @@ fn run_bench(cfg: &Config) {
         .collect();
     worms[1].rope = Some(sim::Rope { anchor: Vec3::new(64.0, 60.0, 44.0), length: 10.0 });
     let positions: Vec<Vec3> = worms.iter().map(|w| w.pos).collect();
-    let capsules = worms::capsules(&worms, &positions);
+    let anims: Vec<worms::Anim> = worms.iter().map(|_| worms::Anim::default()).collect();
+    let capsules = worms::capsules(&worms, &positions, &anims);
     let with = FrameParams { camera: &views[0].1, capsules: &capsules, brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
     let without = FrameParams { capsules: &[], ..with };
     // Alternate the two, best of five rounds each: a clock change on this GPU is
@@ -479,6 +484,8 @@ struct Viewer {
     acc: f32,
     /// Where each worm was before the last tick, for drawing between ticks.
     prev_pos: Vec<Vec3>,
+    /// Per-worm animation clocks: gait phase, action age, blink and so on.
+    anims: Vec<worms::Anim>,
     seq: u32,
     /// Fireballs and beams, started by the sim's events.
     effects: Effects,
@@ -555,6 +562,7 @@ impl Viewer {
         let mut world = World::new(world::build(), &world::SPAWNS, SEED);
         let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
+        let anims = vec![worms::Anim::default(); world.worms.len()];
         let now = Instant::now();
         Viewer {
             window,
@@ -565,6 +573,7 @@ impl Viewer {
             world,
             acc: 0.0,
             prev_pos,
+            anims,
             seq: 0,
             effects: Effects::default(),
             weapon: 0,
@@ -700,6 +709,7 @@ impl Viewer {
                 self.world = World::new(world::build(), &world::SPAWNS, SEED);
                 self.effects = Effects::default();
                 self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
+                self.anims = vec![worms::Anim::default(); self.world.worms.len()];
                 self.renderer = Renderer::new(
                     &self.gpu,
                     self.surface_cfg.format,
@@ -770,6 +780,9 @@ impl Viewer {
             // sliding there from where it stood.
             if let Event::Respawned { worm } | Event::Teleported { worm, .. } = event {
                 self.prev_pos[worm as usize] = self.world.worms[worm as usize].pos;
+                if let Some(anim) = self.anims.get_mut(worm as usize) {
+                    *anim = worms::Anim::default();
+                }
             }
         }
         self.effects.update(dt);
@@ -839,6 +852,12 @@ impl Viewer {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.update(dt);
+        if self.anims.len() != self.world.worms.len() {
+            self.anims.resize(self.world.worms.len(), worms::Anim::default());
+        }
+        for (anim, worm) in self.anims.iter_mut().zip(&self.world.worms) {
+            anim.update(worm, dt);
+        }
 
         // Draw each worm between where it was a tick ago and where it is now.
         // Without this, on a display that is not exactly 60 Hz some frames would
@@ -856,7 +875,7 @@ impl Viewer {
         if !self.fly {
             self.camera.follow(draw_pos[0] + Vec3::Y * (EYE_HEIGHT + 0.2), 5.0, &self.world.grid);
         }
-        let mut capsules = worms::capsules(&self.world.worms, &draw_pos);
+        let mut capsules = worms::capsules(&self.world.worms, &draw_pos, &self.anims);
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
         capsules.extend(self.effects.capsules());
         // Show where a dig would land (or, flying, where the brush would).

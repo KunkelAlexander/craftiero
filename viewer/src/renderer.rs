@@ -69,8 +69,8 @@ pub struct FrameParams<'a> {
     pub outlines: bool,
 }
 
-/// How many capsules the shader's uniform block holds (`array<Capsule, 32>`).
-pub const MAX_CAPSULES: usize = 32;
+/// How many capsules the shader's uniform block holds (`array<Capsule, 64>`).
+pub const MAX_CAPSULES: usize = 64;
 
 /// A line segment swept by a sphere. Worms are drawn as these: the ray-capsule
 /// test has a closed-form answer, so the raymarcher finds them with a few
@@ -118,13 +118,18 @@ struct Uniforms {
     size: [f32; 4],
     counts: [f32; 4], // x: number of capsules in use, y: shadow casters (the first y)
     capsules: [GpuCapsule; MAX_CAPSULES],
-    tiles: [[u32; 4]; TILES_X * TILES_Y / 4],
+    tiles: [[u32; 4]; 2 * TILES_X * TILES_Y / 4],
 }
+
+/// The number of 4-tile groups in one word of the tile masks.
+const TILE_GROUPS: usize = TILES_X * TILES_Y / 4;
 
 /// For every screen tile, which capsules (bit i = capsule i) might be seen in it.
 /// Conservative: a tile may be marked without a capsule in it, never the reverse.
-fn tile_masks(cam: &Camera, aspect: f32, capsules: &[&DrawCapsule]) -> [[u32; 4]; TILES_X * TILES_Y / 4] {
-    let mut words = [0u32; TILES_X * TILES_Y];
+/// Up to 64 capsules means two 32-bit words per tile; they are packed as two
+/// blocks, so the shader can pick the block with the capsule index.
+fn tile_masks(cam: &Camera, aspect: f32, capsules: &[&DrawCapsule]) -> [[u32; 4]; 2 * TILE_GROUPS] {
+    let mut words = [[0u32; 2]; TILES_X * TILES_Y];
     let (right, up) = cam.right_up();
     let fwd = cam.forward();
     let (hy, hx) = ((cam.fov_y * 0.5).tan(), (cam.fov_y * 0.5).tan() * aspect);
@@ -154,15 +159,17 @@ fn tile_masks(cam: &Camera, aspect: f32, capsules: &[&DrawCapsule]) -> [[u32; 4]
             y0 = tile(ty(ny + ry) - 1.0, TILES_Y);
             y1 = tile(ty(ny - ry) + 1.0, TILES_Y);
         }
+        let (word, bit) = (i / 32, i % 32);
         for y in y0..=y1 {
             for x in x0..=x1 {
-                words[y * TILES_X + x] |= 1 << i;
+                words[y * TILES_X + x][word] |= 1 << bit;
             }
         }
     }
-    let mut packed = [[0u32; 4]; TILES_X * TILES_Y / 4];
+    let mut packed = [[0u32; 4]; 2 * TILE_GROUPS];
     for (k, w) in words.iter().enumerate() {
-        packed[k / 4][k % 4] = *w;
+        packed[k / 4][k % 4] = w[0];
+        packed[TILE_GROUPS + k / 4][k % 4] = w[1];
     }
     packed
 }
@@ -999,7 +1006,8 @@ mod tests {
 
     fn bit_set(masks: &[[u32; 4]], tx: usize, ty: usize, bit: usize) -> bool {
         let k = ty * TILES_X + tx;
-        (masks[k / 4][k % 4] & (1u32 << bit)) != 0u32
+        let groups = TILES_X * TILES_Y / 4;
+        (masks[bit / 32 * groups + k / 4][k % 4] & (1u32 << (bit % 32))) != 0u32
     }
 
     #[test]
@@ -1043,10 +1051,25 @@ mod tests {
         let far = caps(Vec3::new(0.0, 0.0, 30.0), Vec3::new(0.0, 1.0, 30.0), 0.45);
         let behind = caps(Vec3::new(0.0, 0.0, -30.0), Vec3::new(0.0, 1.0, -30.0), 0.45);
         let masks = tile_masks(&cam, 16.0 / 9.0, &[&far, &behind]);
-        let set = |bit: usize| (0..TILES_X * TILES_Y).filter(|&k| (masks[k / 4][k % 4] & (1u32 << bit)) != 0u32).count();
+        let set = |bit: usize| {
+            (0..TILES_X * TILES_Y)
+                .filter(|&k| bit_set(&masks, k % TILES_X, k / TILES_X, bit))
+                .count()
+        };
         assert!(set(0) >= 1 && set(0) <= 25, "a distant worm covers a few of the 576 tiles: {}", set(0));
         assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 0) || bit_set(&masks, TILES_X / 2 - 1, TILES_Y / 2, 0));
         assert_eq!(set(1), 0, "behind the camera is nowhere");
+    }
+
+    #[test]
+    fn tile_masks_cover_capsules_past_the_first_word() {
+        // The mask has two words per tile now. Bit 39 must come from the
+        // second block, or every capsule after the 32nd would be invisible.
+        let capsule = caps(Vec3::new(0.0, 0.0, 10.0), Vec3::new(0.0, 1.0, 10.0), 0.5);
+        let refs: Vec<&DrawCapsule> = (0..40).map(|_| &capsule).collect();
+        let cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 70f32.to_radians() };
+        let masks = tile_masks(&cam, 16.0 / 9.0, &refs);
+        assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 39));
     }
 
     #[test]

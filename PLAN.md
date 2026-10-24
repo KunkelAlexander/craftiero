@@ -125,9 +125,9 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 - The M1 brush edits the grid directly and bypasses the sim (fly mode only, a developer tool); worm digging goes through `World::step`.
 - There are no match rules yet (score limit, winner, loadout choice: every worm carries all 11 weapons) and no sound or HUD beyond the title bar. The second worm is an idle dummy that dies and respawns; it never shoots back.
 - Weapon values are first guesses and unbalanced: 3D is harder to hit than 2D and the 2D damage numbers were kept, so the Blaster is probably weak. They are table rows in `sim/src/weapons.rs`.
-- A dead worm is simply not drawn (plus a flash); the camera stays where the body fell. Capsules cap at 32 on screen (`MAX_CAPSULES`): worms first, then projectiles, then effects, so a busy fight drops the newest fireballs first.
+- A dead worm is simply not drawn (plus a flash); the camera stays where the body fell. Capsules cap at 64 on screen (`MAX_CAPSULES`): worms first, then projectiles, then effects, so a busy fight drops the newest fireballs first.
 - The arena has an invisible ceiling at 64 m (outside the grid counts as rock), and the camera is held under it.
-- A worm has no ragdoll or tilt: the capsule always stands upright.
+- The sim capsule always stands upright; the viewer hangs a cosmetic rig of capsules around it that undulates, leans, flips and squashes.
 - The M1 edit cost finding, large brushes (r = 3 to 8 m) costing 7-37 ms of CPU per edit in a logged session, is explained by the r = 8 m number above (about 9 ms in the viewer, 4 ms in the bare sim) plus background load. A Nova costs one such hitch.
 
 ### What I could not verify

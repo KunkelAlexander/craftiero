@@ -9,7 +9,7 @@
 //! The model:
 //!   * the body faces the direction it runs (`forward_vel` is a scalar), so
 //!     steering turns the worm instead of strafing;
-//!   * jumps chain single -> double -> triple only inside the landing window;
+//!   * one mid-air jump (the double jump); there is no chain and no triple;
 //!   * a jump adds height and nothing else: horizontal speed is untouched, and
 //!     the air cannot push you past running speed, so hopping is never a
 //!     faster way to travel than running;
@@ -18,14 +18,14 @@
 //!
 //! The ramp, brake and turn rates are tuned for a 1.8 m character close to the
 //! camera, not a slow, heavy one: the worm reacts on the same tick as the
-//! stick. Jump heights, gravity, chain rules and wall kicks keep the classic
-//! platformer shape.
+//! stick. Jump heights, gravity and wall kicks keep the classic platformer
+//! shape.
 //!
 //! The mouse still aims: `yaw`/`pitch` are the camera and the gun, `face_yaw`
 //! is the body. Aim and facing are separate on purpose.
 
 use crate::world::{
-    body_fits, push_out_of_rock, settle_on_ground, slide, try_step_up, Action, JumpChain, Worm,
+    body_fits, push_out_of_rock, settle_on_ground, slide, try_step_up, Action, Worm,
 };
 use crate::{Input, Rope, DT, WORM_HEIGHT, WORM_RADIUS};
 use glam::Vec3;
@@ -82,18 +82,14 @@ const JUMP_SPEED_BONUS: f32 = 0.22;
 /// Letting go while rising faster than this strengthens gravity until the
 /// speed is at most 21 units per frame (~7.1 m/s).
 const JUMP_CUT: f32 = 21.0 * V;
-/// Initial vertical speeds: 43, 53 and 70 units per frame.
+/// Initial vertical speeds: 43 for the ground jump, 53 for the one mid-air
+/// jump.
 const JUMP_U: f32 = 43.0;
 const DOUBLE_JUMP_U: f32 = 53.0;
-const TRIPLE_JUMP_U: f32 = 70.0;
 const WALL_KICK_U: f32 = 64.0;
-/// Triple jumps only happen above 19 units per frame (~6.4 m/s).
-const TRIPLE_MIN_SPEED: f32 = 19.0 * V;
 /// How long a wall kick is still legal after touching a wall: the hit tick
 /// plus a short grace, 8 ticks at 60 Hz.
 const WALL_WINDOW: u8 = 8;
-/// Landing windows are 6 reference frames (12 ticks); a press chains a jump.
-const LAND_WINDOW: u8 = 12;
 /// After a kick, do not grab the same wall again immediately.
 const CLIMB_REGRAB: u8 = 15;
 
@@ -165,11 +161,6 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
     worm.wall_timer = worm.wall_timer.saturating_sub(1);
     worm.climb_cooldown = worm.climb_cooldown.saturating_sub(1);
     worm.tumble_timer = worm.tumble_timer.saturating_sub(1);
-    worm.land_timer = worm.land_timer.saturating_sub(1);
-    if worm.land_timer == 0 && worm.action == Action::Land {
-        worm.action = Action::Idle;
-        worm.next_jump = JumpChain::Single;
-    }
 
     // Rope button: a press shoots it, or lets go if it is out.
     let rope_pressed = input.rope && !worm.rope_was_down;
@@ -224,11 +215,14 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
     }
 
     if jump_pressed && !jump_used {
-        if worm.on_ground || worm.action == Action::Land {
+        if worm.on_ground {
             ground_jump(worm);
             jump_used = true;
         } else if worm.wall_timer > 0 {
             wall_kick(worm);
+            jump_used = true;
+        } else if can_air_jump(worm) {
+            double_jump(worm);
             jump_used = true;
         }
     }
@@ -305,13 +299,11 @@ fn step_ground(
     worm.on_ground = hit.ground || settled;
     if worm.on_ground {
         worm.vel.y = 0.0;
-        if worm.action != Action::Land {
-            worm.action = if worm.forward_vel.abs() > 0.2 { Action::Walk } else { Action::Idle };
-        }
+        worm.action = if worm.forward_vel.abs() > 0.2 { Action::Walk } else { Action::Idle };
     } else {
-        // Walked off an edge: fall, but keep the speed.
+        // Walked off an edge: fall, but keep the speed. The air jump is still
+        // available, so a fall can be recovered.
         worm.action = Action::Freefall;
-        worm.land_timer = 0;
         worm.ground_normal = Vec3::Y;
         worm.vel.y = 0.0;
     }
@@ -352,11 +344,7 @@ fn step_air(
         if worm.forward_vel.abs() < 1.0e-3
             && !matches!(
                 worm.action,
-                Action::Jump
-                    | Action::DoubleJump
-                    | Action::TripleJump
-                    | Action::WallKick
-                    | Action::Climb
+                Action::Jump | Action::DoubleJump | Action::WallKick | Action::Climb
             )
         {
             align_face_to_velocity(worm);
@@ -411,7 +399,7 @@ fn step_air(
 
         // Jump cut: release the button while rising and the rest of the rise
         // is capped at `JUMP_CUT`.
-        if matches!(worm.action, Action::Jump | Action::DoubleJump | Action::TripleJump)
+        if matches!(worm.action, Action::Jump | Action::DoubleJump)
             && !input.jump
             && worm.vel.y > JUMP_CUT
         {
@@ -460,8 +448,8 @@ fn step_air(
     clamp_speed(worm);
 }
 
-/// Land from any airborne action. `next_jump` is already what the launch set
-/// (single -> double -> triple); a landing from a fall or a kick arms a double.
+/// Land from any airborne action. The single air jump is available again as
+/// soon as the worm touches the ground.
 fn land(worm: &mut Worm, jump_pressed: bool) {
     let from = worm.action;
     let flat_vel = flat(worm.vel);
@@ -476,53 +464,48 @@ fn land(worm: &mut Worm, jump_pressed: bool) {
     worm.vel = facing(worm.face_yaw) * worm.forward_vel;
     worm.on_ground = true;
     worm.ground_normal = Vec3::Y;
-    worm.action = Action::Land;
-    worm.land_timer = LAND_WINDOW;
-    if matches!(from, Action::Jump | Action::DoubleJump | Action::TripleJump) {
-        // Keep the chain the launch already picked.
-    } else if from != Action::Tumble {
-        worm.next_jump = JumpChain::Double;
-    }
+    worm.action = if worm.forward_vel.abs() > 0.2 { Action::Walk } else { Action::Idle };
+    worm.air_jumps = 1;
 
-    // A press on the landing frame is still a jump (the landing cancel).
+    // A press on the landing frame is still a jump.
     if jump_pressed && from != Action::Tumble {
         ground_jump(worm);
     }
 }
 
+/// The ground jump. It changes vertical speed and nothing else: scaling the
+/// forward speed down here would make the jump slower, and landing would then
+/// have to accelerate it back, which reads as a burst of speed just after
+/// touching down. Jumping must be a fair way to move, not a fast one.
 fn ground_jump(worm: &mut Worm) {
-    let kind = match worm.next_jump {
-        // The triple is only reachable at speed; otherwise it is a fresh single.
-        JumpChain::Triple if worm.forward_vel <= TRIPLE_MIN_SPEED => JumpChain::Single,
-        other => other,
-    };
-    let (vy, next, action) = match kind {
-        JumpChain::Single => (
-            JUMP_U * V + JUMP_SPEED_BONUS * worm.forward_vel,
-            JumpChain::Double,
-            Action::Jump,
-        ),
-        JumpChain::Double => (
-            DOUBLE_JUMP_U * V + JUMP_SPEED_BONUS * worm.forward_vel,
-            JumpChain::Triple,
-            Action::DoubleJump,
-        ),
-        JumpChain::Triple => (
-            TRIPLE_JUMP_U * V + JUMP_SPEED_BONUS * worm.forward_vel,
-            JumpChain::Single,
-            Action::TripleJump,
-        ),
-    };
-    // A jump changes the vertical speed and nothing else. Scaling the forward
-    // speed down here would make the jump slower, and landing would then have
-    // to accelerate it back, which reads as a burst of speed just after
-    // touching down. Jumping must be a fair way to move, not a fast one.
     let f = facing(worm.face_yaw);
-    worm.vel = Vec3::new(f.x * worm.forward_vel, vy, f.z * worm.forward_vel);
-    worm.action = action;
-    worm.next_jump = next;
+    worm.vel = Vec3::new(
+        f.x * worm.forward_vel,
+        JUMP_U * V + JUMP_SPEED_BONUS * worm.forward_vel,
+        f.z * worm.forward_vel,
+    );
+    worm.action = Action::Jump;
     worm.on_ground = false;
-    worm.land_timer = 0;
+    worm.wall_timer = 0;
+    worm.air_jumps = 1;
+}
+
+fn can_air_jump(worm: &Worm) -> bool {
+    worm.air_jumps > 0 && worm.action != Action::Tumble
+}
+
+/// The one mid-air jump. Like the ground jump it only adds height; the
+/// horizontal speed is untouched, so a double jump is never a speed boost.
+fn double_jump(worm: &mut Worm) {
+    let f = facing(worm.face_yaw);
+    worm.vel = Vec3::new(
+        f.x * worm.forward_vel,
+        DOUBLE_JUMP_U * V + JUMP_SPEED_BONUS * worm.forward_vel,
+        f.z * worm.forward_vel,
+    );
+    worm.action = Action::DoubleJump;
+    worm.air_jumps = 0;
+    worm.on_ground = false;
     worm.wall_timer = 0;
 }
 
@@ -536,10 +519,10 @@ fn wall_kick(worm: &mut Worm) {
     worm.pos += n * 0.06;
     worm.action = Action::WallKick;
     worm.on_ground = false;
-    worm.land_timer = 0;
     worm.wall_timer = 0;
     worm.climb_cooldown = CLIMB_REGRAB;
-    worm.next_jump = JumpChain::Double;
+    // A kick is a launch: it arms the air jump again.
+    worm.air_jumps = 1;
 }
 
 // --------------------------------------------------------------- climb ----
@@ -578,8 +561,8 @@ fn begin_climb(worm: &mut Worm, n: Vec3) {
     worm.forward_vel = 0.0;
     worm.wall_normal = n;
     worm.face_yaw = yaw_of(-n);
-    worm.land_timer = 0;
     worm.wall_timer = 0;
+    worm.air_jumps = 1;
 }
 
 fn step_climb(grid: &Grid, worm: &mut Worm, input: &Input, jump_pressed: bool) {
@@ -619,9 +602,8 @@ fn step_climb(grid: &Grid, worm: &mut Worm, input: &Input, jump_pressed: bool) {
     // Climbing down reaches the floor.
     if vertical < 0.0 && settle_on_ground(grid, worm, false) {
         worm.on_ground = true;
-        worm.action = Action::Land;
-        worm.land_timer = 8;
-        worm.next_jump = JumpChain::Double;
+        worm.action = Action::Idle;
+        worm.air_jumps = 1;
         worm.vel = Vec3::ZERO;
         return;
     }
@@ -665,9 +647,8 @@ fn try_mantle(grid: &Grid, worm: &mut Worm, n: Vec3) -> bool {
     worm.forward_vel = 0.0;
     worm.on_ground = true;
     worm.ground_normal = Vec3::Y;
-    worm.action = Action::Land;
-    worm.land_timer = 8;
-    worm.next_jump = JumpChain::Double;
+    worm.action = Action::Idle;
+    worm.air_jumps = 1;
     true
 }
 

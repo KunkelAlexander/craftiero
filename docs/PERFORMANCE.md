@@ -214,6 +214,12 @@ rope: 5 per worm). A first version looped over all of them for every pixel, and
 again in the terrain shadow ray. With four worms and one rope (17 capsules) on
 screen, open hills at 1280 x 720:
 
+> The rig has since grown to 16 capsules per worm (three body segments, head,
+> belly, four eye parts, mouth, two arms, a two-part gun and a two-part tail),
+> and the on-screen cap is 64. The numbers below are from the 5-capsule model.
+> Re-running the four-worm benchmark now gives 22.3 ms without worms and 24.1 ms
+> with them: about +1.9 ms at 1280 x 720.
+
 | Version | frame | cost of the worms |
 |---|---|---|
 | no worms | 18.5 ms | |
@@ -228,8 +234,9 @@ cost ~5.6 ms, so the maths was never the problem. My reading (not verified in a
 profiler) is that a dynamic loop over a dynamically indexed uniform array is
 slow on this GPU, probably because each iteration waits for a load. The fix is
 to avoid the loop instead of making it cheaper: the CPU projects each capsule's
-bounding sphere onto a 32 x 18 grid of screen tiles and uploads one bitmask per
-tile. A pixel reads its tile's mask and, almost everywhere, finds it zero. Only
+bounding sphere onto a 32 x 18 grid of screen tiles and uploads one 32-bit mask
+word per tile (two words once there are more than 32 capsules). A pixel reads
+its tile's mask and, almost everywhere, finds it zero. Only
 the terrain shadow ray still loops, over the worm bodies alone. A test
 (`tile_masks_cover_every_visible_point_of_a_capsule`) checks the masks never
 miss a visible point, and another checks that the constants in the WGSL match

@@ -96,12 +96,9 @@ pub struct Rope {
 pub enum Action {
     Idle,
     Walk,
-    /// Just landed. `land_timer` is the short window in which the next press
-    /// chains a double (or triple) jump.
-    Land,
     Jump,
+    /// The one mid-air jump. It can be used once per airtime.
     DoubleJump,
-    TripleJump,
     Freefall,
     /// Bounced off a wall. Gravity still applies, but the height is fixed.
     WallKick,
@@ -118,10 +115,8 @@ impl Action {
         match self {
             Action::Idle => "idle",
             Action::Walk => "walk",
-            Action::Land => "land",
             Action::Jump => "jump",
             Action::DoubleJump => "double",
-            Action::TripleJump => "triple",
             Action::Freefall => "fall",
             Action::WallKick => "wall kick",
             Action::Climb => "climb",
@@ -129,16 +124,6 @@ impl Action {
             Action::Rope => "rope",
         }
     }
-}
-
-/// The next jump a press from the ground produces. Jumps chain single ->
-/// double -> triple only if the button is pressed again inside the landing
-/// window; a triple also needs forward speed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JumpChain {
-    Single,
-    Double,
-    Triple,
 }
 
 #[derive(Clone, Debug)]
@@ -162,13 +147,15 @@ pub struct Worm {
     pub ground_normal: Vec3,
     /// Ticks until the next dig is allowed.
     pub dig_cooldown: u8,
+    /// Is the dig button down while there is rock in reach? (A pose hint for
+    /// the viewer; the digging itself still happens here.)
+    pub digging: bool,
     pub rope: Option<Rope>,
     /// Was the rope button down last tick? (To react to the press, not the hold.)
     pub(crate) rope_was_down: bool,
     pub(crate) jump_was_down: bool,
-    /// Ticks left in the landing window (a jump press here chains).
-    pub(crate) land_timer: u8,
-    pub(crate) next_jump: JumpChain,
+    /// Mid-air jumps left before landing. One, until the double jump is used.
+    pub(crate) air_jumps: u8,
     /// The wall most recently touched, and how long a wall kick is still legal.
     pub(crate) wall_normal: Vec3,
     pub(crate) wall_timer: u8,
@@ -205,11 +192,11 @@ impl Worm {
             on_ground: false,
             ground_normal: Vec3::Y,
             dig_cooldown: 0,
+            digging: false,
             rope: None,
             rope_was_down: false,
             jump_was_down: false,
-            land_timer: 0,
-            next_jump: JumpChain::Single,
+            air_jumps: 1,
             wall_normal: Vec3::Y,
             wall_timer: 0,
             climb_cooldown: 0,
@@ -233,7 +220,6 @@ impl Worm {
         self.rope = None;
         self.action = Action::Tumble;
         self.tumble_timer = 30;
-        self.land_timer = 0;
     }
 
     /// Stand up again at `pos` with every movement state cleared (a respawn, or
@@ -401,8 +387,10 @@ fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, events: &mut Vec<E
 
     // Dig. After the move, so the hole is where the worm is looking now.
     worm.dig_cooldown = worm.dig_cooldown.saturating_sub(1);
-    if input.dig && worm.dig_cooldown == 0 {
-        if let Some(centre) = dig_target(grid, worm) {
+    let target = if input.dig { dig_target(grid, worm) } else { None };
+    worm.digging = target.is_some();
+    if let Some(centre) = target {
+        if worm.dig_cooldown == 0 {
             let shape = Shape::Sphere { center: centre, radius: DIG_RADIUS };
             grid.apply(shape, Op::Carve);
             events.push(Event::Edit { shape, op: Op::Carve });
@@ -637,8 +625,8 @@ mod tests {
         w
     }
 
-    /// A flat world wide enough to reach triple-jump speed and distance
-    /// without running into the edge. 24 chunks = 96 m of run-up room.
+    /// A flat world wide enough to get up to running speed without running
+    /// into the edge. 24 chunks = 96 m of run-up room.
     fn big_flat() -> World {
         let mut w = World::new(Grid::from_fn(IVec3::new(24, 4, 8), flat), &[(6.0, 16.0)], 1);
         w.worms[0].pos.y = 4.05;
@@ -788,28 +776,78 @@ mod tests {
 
     #[test]
     fn the_jump_heights_step_up() {
-        // 43 units/frame at 30 Hz, gravity 4.2 units/frame^2:
-        // 14.5125^2 / (2 * 42.525) = 2.48 m. The double is 53 -> 3.76 m.
-        let height = |chain: JumpChain| {
-            let mut w = settled(flat, (16.0, 16.0));
-            w.worms[0].next_jump = chain;
-            let ground = w.worms[0].pos.y;
-            apex(&mut w, ground, 240, Input { jump: true, ..Input::default() })
-        };
-        let single = height(JumpChain::Single);
-        let double = height(JumpChain::Double);
+        // Ground jump: 43 units/frame at 30 Hz, gravity 4.2 units/frame^2:
+        // 14.5125^2 / (2 * 42.525) = 2.48 m. The double adds 53 -> 3.76 m
+        // from wherever it is pressed.
+        let mut w = settled(flat, (16.0, 16.0));
+        let ground = w.worms[0].pos.y;
+        let single = apex(&mut w, ground, 240, Input { jump: true, ..Input::default() });
         assert!((single - 2.48).abs() < 0.15, "single: {single}");
-        assert!((double - 3.80).abs() < 0.2, "double: {double}");
+
+        let mut w = settled(flat, (16.0, 16.0));
+        let ground = w.worms[0].pos.y;
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        // Hold to the top of the first jump, then release so the next press
+        // is a new button press (a held button does not double jump).
+        run(&mut w, 20, Input { jump: true, ..Input::default() });
+        w.step(&[Input::default()]);
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::DoubleJump);
+        let top = apex(&mut w, ground, 120, Input { jump: true, ..Input::default() });
+        assert!(top > single + 2.5 && top < single + 4.2, "single {single} -> double {top}");
     }
 
     #[test]
-    fn there_is_no_jumping_in_mid_air() {
+    fn there_is_one_double_jump_per_airtime() {
         let mut w = settled(flat, (16.0, 16.0));
         w.step(&[Input { jump: true, ..Input::default() }]);
-        run(&mut w, 10, Input { jump: true, ..Input::default() });
-        let worm = &w.worms[0];
-        assert!(!worm.on_ground);
-        assert!(worm.vel.y < 10.0, "still slowing down, no second jump: {}", worm.vel.y);
+        assert_eq!(w.worms[0].action, Action::Jump);
+        // Release, then press again in mid-air: the double.
+        w.step(&[Input::default()]);
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::DoubleJump);
+        // Release and press a third time: nothing happens.
+        w.step(&[Input::default()]);
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::DoubleJump, "no second air jump");
+        assert_eq!(w.worms[0].air_jumps, 0);
+    }
+
+    #[test]
+    fn landing_resets_the_double_jump() {
+        let mut w = settled(flat, (16.0, 16.0));
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        w.step(&[Input::default()]);
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::DoubleJump);
+        for _ in 0..240 {
+            w.step(&[Input::default()]);
+            if w.worms[0].on_ground {
+                break;
+            }
+        }
+        assert!(w.worms[0].on_ground);
+        assert_eq!(w.worms[0].air_jumps, 1, "the air jump comes back on landing");
+
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        w.step(&[Input::default()]);
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::DoubleJump, "and works again");
+    }
+
+    #[test]
+    fn a_double_jump_changes_no_horizontal_speed() {
+        let mut w = settled(flat, (6.0, 16.0));
+        let go = walk(FRAC_PI_2);
+        run(&mut w, 60, go);
+        w.step(&[Input { jump: true, ..go }]);
+        // Fly a few ticks holding forward, then press again in mid-air.
+        run(&mut w, 10, go);
+        let before = Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length();
+        w.step(&[Input { jump: true, ..go }]);
+        assert_eq!(w.worms[0].action, Action::DoubleJump);
+        let after = Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length();
+        assert!((after - before).abs() < 1.0e-4, "not a speed boost: {before} -> {after}");
     }
 
     /// Run until the worm lands, returning the highest point above `ground`.
@@ -823,54 +861,6 @@ mod tests {
             }
         }
         top
-    }
-
-    #[test]
-    fn jumps_chain_single_double_triple_on_landing() {
-        let mut w = big_flat();
-        let go = walk(FRAC_PI_2);
-        let ground = 4.0;
-        run(&mut w, 90, go); // get up to speed for the triple
-
-        w.step(&[Input { jump: true, ..go }]);
-        assert_eq!(w.worms[0].action, Action::Jump);
-        let single = jump_until_landed(&mut w, ground, Input { jump: true, ..go }, 240);
-        assert!(w.worms[0].on_ground);
-
-        w.step(&[go]); // release the button for a tick
-        assert_eq!(w.worms[0].action, Action::Land);
-        w.step(&[Input { jump: true, ..go }]);
-        assert_eq!(
-            w.worms[0].action,
-            Action::DoubleJump,
-            "a press inside the landing window is a double: speed {}",
-            w.worms[0].forward_vel
-        );
-        let double = jump_until_landed(&mut w, ground, Input { jump: true, ..go }, 300);
-
-        w.step(&[go]);
-        w.step(&[Input { jump: true, ..go }]);
-        assert_eq!(
-            w.worms[0].action,
-            Action::TripleJump,
-            "holding forward keeps enough speed for the triple: {}",
-            w.worms[0].forward_vel
-        );
-        let triple = jump_until_landed(&mut w, ground, Input { jump: true, ..go }, 360);
-
-        assert!(double > single + 0.8, "single {single} -> double {double}");
-        assert!(triple > double + 1.5, "double {double} -> triple {triple}");
-    }
-
-    #[test]
-    fn the_landing_window_expires_back_to_a_single_jump() {
-        let mut w = settled(flat, (16.0, 16.0));
-        w.step(&[Input { jump: true, ..Input::default() }]);
-        assert!(jump_until_landed(&mut w, 4.0, Input::default(), 240) > 0.0);
-        // The window is 10 ticks; wait it out.
-        run(&mut w, 30, Input::default());
-        w.step(&[Input { jump: true, ..Input::default() }]);
-        assert_eq!(w.worms[0].action, Action::Jump, "a fresh single jump");
     }
 
     #[test]
@@ -948,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn walking_off_a_ledge_gives_no_coyote_time() {
+    fn walking_off_a_ledge_leaves_the_air_jump_available() {
         // A 3 m cliff: ground at y = 4 for x < 18, at y = 1 beyond.
         fn cliff(p: Vec3) -> f32 {
             (p.y - 4.0).max(p.x - 18.0).min(p.y - 1.0)
@@ -964,8 +954,8 @@ mod tests {
         assert!(!w.worms[0].on_ground, "walked off the edge");
         run(&mut w, 3, go);
         w.step(&[Input { jump: true, ..go }]);
-        assert_eq!(w.worms[0].action, Action::Freefall);
-        assert!(w.worms[0].vel.y < 0.0, "no mid-air jump: {}", w.worms[0].vel.y);
+        assert_eq!(w.worms[0].action, Action::DoubleJump, "the fall can be recovered");
+        assert!(w.worms[0].vel.y > 0.0, "the air jump pushes up: {}", w.worms[0].vel.y);
     }
 
     #[test]
@@ -1056,11 +1046,13 @@ mod tests {
         let mut w = settled(flat, (16.0, 16.0));
         run(&mut w, 30, Input { pitch: 1.0, dig: true, ..Input::default() });
         assert!(w.drain_events().is_empty());
+        assert!(!w.worms[0].digging, "nothing in reach, so no dig pose");
         // Digging into a wall while walking forward for 3 s: one dig per
         // DIG_INTERVAL ticks at most, and plenty of them.
         let mut w = settled(walled, (17.5, 16.0));
         let dig_in = Input { yaw: FRAC_PI_2, pitch: -0.15, dig: true, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
         run(&mut w, 180, dig_in);
+        assert!(w.worms[0].digging, "the pose flag is on while rock is in reach");
         let n = w.drain_events().len();
         assert!(n >= 4, "only {n} digs in 3 s");
         assert!(n <= 180 / DIG_INTERVAL as usize + 1, "{n} digs in 3 s is faster than the limit");

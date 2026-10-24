@@ -40,7 +40,7 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 | Input | Does |
 |---|---|
 | W A S D, mouse | run (the body turns; the mouse aims), look |
-| Space | jump: hold for height; press again as you land for a double, then a triple (needs speed) |
+| Space | jump (hold for height); press again in mid-air to double jump |
 | hold W into a wall | climb it; S climbs down; Space kicks off the wall |
 | left mouse (hold) | fire the current weapon |
 | 1 2 3 4 5 6 7 8 9 0 -, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor |
@@ -92,8 +92,8 @@ over the network.
   `World::step(&[Input])` is the only way state changes. A worm is a capsule
   tested as three spheres against the distance field: push out along the
   gradient, run and turn with momentum (the body faces the run, the mouse
-  aims), chain single/double/triple jumps on landing (a jump adds height, never
-  speed), climb walls, wall-kick, dig, and swing on a rope. Weapons are rows of
+  aims), jump and double jump in mid-air (a jump adds height, never speed),
+  climb walls, wall-kick, dig, and swing on a rope. Weapons are rows of
   a table (`weapons.rs`); `combat.rs` is
   the few rules that read it: projectiles
   that step through the distance field, explosions that carve it, damage with
@@ -102,10 +102,12 @@ over the network.
 * **[`viewer/`](viewer/)** copies the grid into a 3D
   texture and **raymarches it on the GPU** (sphere tracing), shades it with a
   three-band toon ramp, and draws ink outlines from a depth/normal buffer.
-  After an edit only the changed chunks are re-uploaded. Worms are analytic
-  capsules found by a closed-form ray test inside the same shader, so they get
-  shadows, AO and outlines for free; so are projectiles and the fireballs the
-  sim's events start. It runs the sim at a fixed 60 Hz and
+  After an edit only the changed chunks are re-uploaded. Worms are rigs of
+  analytic capsules (segmented body, tail, eyes, arms and gun) found by a
+  closed-form ray test inside the same shader, so they get shadows, AO and
+  outlines for free; the rig undulates, leans, flips and squashes from the sim's
+  action and velocity. Projectiles and the fireballs the sim's events start are
+  capsules too. It runs the sim at a fixed 60 Hz and
   draws between ticks. Read it in this order: `main.rs` (window, input, game
   loop), `worms.rs`, `effects.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),
   `shaders.rs` (the WGSL), `world.rs` (the demo map), `camera.rs`.

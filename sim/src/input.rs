@@ -29,9 +29,9 @@ pub struct Input {
     /// an unreliable network).
     pub yaw: f32,
     pub pitch: f32,
-    /// Jump button. A *press* jumps from the ground. Pressing again inside the
-    /// landing window chains a double, then a triple jump (the triple needs
-    /// speed). On a wall or a rope the same press kicks off instead.
+    /// Jump button. A *press* jumps from the ground, and one press while
+    /// airborne is the double jump. On a wall or a rope the same press kicks
+    /// off instead.
     pub jump: bool,
     /// Dig button held: carves the rock the worm looks at, a few times a second.
     pub dig: bool,

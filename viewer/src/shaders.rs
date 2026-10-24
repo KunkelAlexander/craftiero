@@ -33,7 +33,7 @@ pub fn post() -> String {
 // needs no padding thought (WGSL aligns vec3 to 16 bytes, which bites).
 const COMMON_UNIFORMS: &str = r#"
 // A worm part: a segment from `a` to `b` swept by a sphere of radius a.w.
-// (`array<Capsule, 32>` below must match MAX_CAPSULES in renderer.rs.)
+// (`array<Capsule, 64>` below must match MAX_CAPSULES in renderer.rs.)
 struct Capsule {
     a: vec4<f32>,           // xyz: start, w: radius
     b: vec4<f32>,           // xyz: end, w: radius of a sphere around the whole capsule
@@ -50,10 +50,11 @@ struct U {
     flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
     counts: vec4<f32>,      // x: number of capsules in use, y: shadow casters (the first y)
-    caps: array<Capsule, 32>,
+    caps: array<Capsule, 64>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
-    // which capsules can be seen in the tile.
-    tiles: array<vec4<u32>, 144>,
+    // which capsules can be seen in the tile. With up to 64 capsules each tile
+    // needs two 32-bit words; the second block starts after the first 144 vec4s.
+    tiles: array<vec4<u32>, 288>,
 }
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -303,12 +304,18 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     var ci = -1;
     let tile = min(vec2<u32>(uv * vec2<f32>(32.0, 18.0)), vec2<u32>(31u, 17u));
     let tile_i = tile.y * 32u + tile.x;
-    var mask = u.tiles[tile_i >> 2u][tile_i & 3u];
-    while (mask != 0u) {
-        let i = i32(firstTrailingBit(mask));
-        mask = mask & (mask - 1u);   // clear the lowest set bit
-        let h = cap_hit(ro, rd, u.caps[i].a.xyz, u.caps[i].b.xyz, u.caps[i].a.w, u.caps[i].b.w);
-        if (h > 0.0 && h < tc) { tc = h; ci = i; }
+    let lane = tile_i & 3u;
+    let group = tile_i >> 2u;
+    // Two words: capsules 0..31, then 32..63. The second word starts after the
+    // 144 vec4s of the first block (see `tile_masks` in renderer.rs).
+    for (var w = 0u; w < 2u; w += 1u) {
+        var mask = u.tiles[group + w * 144u][lane];
+        while (mask != 0u) {
+            let i = i32(firstTrailingBit(mask)) + i32(w * 32u);
+            mask = mask & (mask - 1u);   // clear the lowest set bit
+            let h = cap_hit(ro, rd, u.caps[i].a.xyz, u.caps[i].b.xyz, u.caps[i].a.w, u.caps[i].b.w);
+            if (h > 0.0 && h < tc) { tc = h; ci = i; }
+        }
     }
     var t = 400.0;
     var n = vec3<f32>(0.0);
@@ -518,10 +525,14 @@ mod tests {
     #[test]
     fn shader_constants_match_the_renderer() {
         assert!(COMMON_UNIFORMS.contains(&format!("array<Capsule, {MAX_CAPSULES}>")));
-        assert!(COMMON_UNIFORMS.contains(&format!("array<vec4<u32>, {}>", TILES_X * TILES_Y / 4)));
+        assert!(COMMON_UNIFORMS.contains(&format!(
+            "array<vec4<u32>, {}>",
+            2 * TILES_X * TILES_Y / 4
+        )));
         assert!(MARCH.contains(&format!("vec2<f32>({TILES_X}.0, {TILES_Y}.0)")));
         assert!(MARCH.contains(&format!("vec2<u32>({}u, {}u)", TILES_X - 1, TILES_Y - 1)));
         assert!(MARCH.contains(&format!("tile.y * {TILES_X}u")));
-        assert!(MAX_CAPSULES <= 32, "the tile mask has one bit per capsule in a u32");
+        assert!(MARCH.contains(&format!("w * {}u", TILES_X * TILES_Y / 4)));
+        assert!(MAX_CAPSULES <= 64, "two 32-bit words cover the tile mask");
     }
 }
