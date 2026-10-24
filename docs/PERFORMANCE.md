@@ -270,10 +270,14 @@ every few ticks). Measured first, release build, the bare sim (`sdf` bench):
 
 | Edit | Cost |
 |---|---|
-| carve r = 1.5 m (a dig) | 0.12 ms |
+| carve r = 1.5 m sphere (the old dig) | 0.12 ms |
 | carve r = 3 m (a rocket) | 0.46 ms |
 | carve r = 8 m (a Nova) | 4.2 ms |
 | smooth add r = 0.8 m (a tractor lump) | 0.11 ms |
+
+A dig now carves a 2.5 m capsule of radius 1.5 m (see PLAN: spheres left cusps
+between bites). A same-run comparison put the capsule at about the sphere's
+cost, so the table stands.
 
 and in the viewer (`--bench`, CPU edit + texture upload): r = 3 m 0.7 + 1.5 ms,
 r = 8 m 8.8 + 2.2 ms (the Nova craters overlap there, 9 m apart). Only the Nova

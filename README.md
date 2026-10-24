@@ -41,10 +41,10 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 |---|---|
 | W A S D, mouse | run (the body turns; the mouse aims), look |
 | Space | jump (hold for height); press again in mid-air to double jump |
-| hold W into a wall | climb it; S climbs down; Space kicks off the wall |
+| hold W into a wall | climb it; S climbs down; Space kicks off the wall. Low ledges and crater rims (up to ~1 m) are climbed automatically |
 | left mouse (hold) | fire the current weapon |
 | 1 2 3 4 5 6 7 8 9 0 -, mouse wheel | pick a weapon: Blaster, Rocket, Railgun, Bouncer, Bomb, Cluster, Swarm, Teleport, Nova, Block, Tractor |
-| Left Shift (hold) | dig: a 1.5 m hole where you look (up to 4 m away), five a second |
+| Left Shift (hold) | dig: a smooth 3 m tunnel where you look (up to 4 m away), five bites a second |
 | right mouse | shoot the ninja rope at what you look at; press again to let go |
 | E / Q | reel the rope in / out. Reeling in *pulls* you (up to 20 m/s), so you can launch yourself out of a hole |
 | Space on the rope | let go with an upward kick |
@@ -109,7 +109,10 @@ over the network.
   action and velocity. Projectiles and the fireballs the sim's events start are
   capsules too. The camera sits over the worm's shoulder, so the worm never
   covers the crosshair; the sim is told to aim from the eye at the point under
-  the reticle, which keeps shots, rope and digging on target despite the offset.
+  the reticle, which keeps shots and the rope on target despite the offset.
+  Digging instead goes straight out of the worm's face along the look angles:
+  the crosshair ray is a shoulder to the side, and a tunnel centred there would
+  be one the worm could not walk into.
   It runs the sim at a fixed 60 Hz and
   draws between ticks. Read it in this order: `main.rs` (window, input, game
   loop), `worms.rs`, `effects.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),

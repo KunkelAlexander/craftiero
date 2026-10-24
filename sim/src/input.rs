@@ -36,8 +36,12 @@ pub struct Input {
     /// (the crosshair) is not the eye ray: aiming along `yaw`/`pitch` would put
     /// every shot a shoulder-width to one side of the reticle. The viewer
     /// instead passes the direction from the eye to the point under the
-    /// crosshair, so shots, rope and digging all follow the reticle while
-    /// movement still uses `yaw` as the camera frame.
+    /// crosshair, so shots and the rope follow the reticle while movement still
+    /// uses `yaw` as the camera frame.
+    ///
+    /// Digging does *not* use this: the mouth digs along `yaw`/`pitch` from the
+    /// eye (see `dig_target`), so the tunnel is centred where the worm walks
+    /// instead of a shoulder to the right of it.
     ///
     /// Like every other field this comes from outside: the sim normalises it
     /// and ignores a zero or non-finite one.

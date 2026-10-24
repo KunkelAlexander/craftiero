@@ -37,11 +37,13 @@ const HAND_HEIGHT: f32 = 1.1;
 /// overlap and leave no gap a thin ledge could slip through.
 const BODY_SPHERES: [f32; 3] = [WORM_RADIUS, WORM_HEIGHT * 0.5, WORM_HEIGHT - WORM_RADIUS];
 
-/// A surface counts as ground when its normal is within ~41 degrees of up.
+/// A surface counts as ground when its normal is within ~70 degrees of up.
 /// Steeper is a wall: the worm slides along it instead of standing on it.
-/// (Not 45: at a wall-floor crease the foot sphere's blended normal is exactly
-/// 45 degrees, and a threshold there makes the answer flip from tick to tick.)
-pub(crate) const GROUND_COS: f32 = 0.75;
+/// (This used to be 41 degrees. Craters are bowls whose rims approach vertical,
+/// and at 41 the worm could not climb more than a metre up the wall before it
+/// became "a wall" and stopped. 70 lets it crawl out of its own blast holes;
+/// only near-vertical walls still need the climb move.)
+pub(crate) const GROUND_COS: f32 = 0.35;
 /// Still "standing" when the feet are this far above the surface, and then the
 /// worm is pulled down onto it. It keeps the worm grounded while walking over
 /// bumps and down slopes, where each tick would otherwise be a tiny fall.
@@ -49,8 +51,19 @@ const GROUND_SKIN: f32 = 0.1;
 /// A worm that was walking sticks to ground up to this far below it (crests of
 /// bumps, steps down), instead of launching off every crest like a ball.
 const STICK_DISTANCE: f32 = 0.3;
-/// Highest ledge the worm walks up without jumping.
-const STEP_UP: f32 = 0.5;
+/// Highest ledge the worm walks up without jumping. Deliberately generous: the
+/// craters the weapons leave are a metre or two deep, with scalloped lips that
+/// used to stop the worm dead. The dedicated climb move is for walls taller
+/// than this.
+const STEP_UP: f32 = 0.9;
+/// How far forward a step-up carries the worm. A tick of walking is only ~0.2 m,
+/// less than the body radius, so the foot would still be against the face; the
+/// mantle has to place the body on top of the lip in one go.
+const MANTLE_REACH: f32 = 0.6;
+/// A mantle only lands on a roughly flat top (cos 32 degrees). Otherwise the
+/// long forward step would let the worm skate up any steep slope in 0.6 m
+/// leaps instead of walking it.
+const MANTLE_FLAT: f32 = 0.85;
 /// Largest move between collision checks. The distance field is only valid in a
 /// 1 m band, and a fast worm could otherwise end a tick deeper in rock than the
 /// field can say which way is out.
@@ -65,17 +78,18 @@ const PITCH_LIMIT: f32 = 1.553; // 89 degrees
 // --- digging --------------------------------------------------------------
 /// How far the worm can reach (from the eye to the rock).
 const DIG_REACH: f32 = 4.0;
-/// Radius of the hole, centred on the surface point the worm looks at.
-///
-/// Why this size: a tunnel is a row of overlapping bites, and where two bites
-/// meet the roof dips into a cusp. Bites one radius apart leave a cusp of
-/// 2 * sqrt(r^2 - (r/2)^2) = 1.73 r, which has to be taller than the worm
-/// (1.8 m), or the tunnel pinches it at every joint. 1.5 m gives 2.6 m, which
-/// also leaves room to walk over the bumps the bites leave in the floor.
+/// Radius of the hole. Wide enough for the worm (1.8 m tall) with room to
+/// spare; the capsule joins below keep the width smooth, so this no longer has
+/// to be derived from a cusp angle.
 pub const DIG_RADIUS: f32 = 1.5;
-/// Ticks between digs while the button is held: 5 a second. Each dig advances
-/// about one radius (1.5 m), so digging forward goes at about walking speed.
+/// Ticks between digs while the button is held: 5 a second.
 const DIG_INTERVAL: u8 = 12;
+/// How far the tunnel front moves per bite. This must beat the run: a bite
+/// every 12 ticks and a run of 11.8 m/s cover 2.36 m per bite, so with a
+/// 1.5 m advance the worm caught the rounded end of its own tunnel, got
+/// pushed up its curve, and the next bite then followed the raised eye — the
+/// tunnel slowly climbed into the rock. 2.5 m keeps the worm behind the front.
+const DIG_ADVANCE: f32 = 2.5;
 
 // --- rope -----------------------------------------------------------------
 // The speed constants and the anchor rule live in `movement.rs`; the rope's
@@ -411,17 +425,39 @@ fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, events: &mut Vec<E
     worm.digging = target.is_some();
     if let Some(centre) = target {
         if worm.dig_cooldown == 0 {
-            let shape = Shape::Sphere { center: centre, radius: DIG_RADIUS };
+            // A capsule, not a sphere: each bite sweeps back along the look ray
+            // to where the last one ended and forward to the next front, so the
+            // tunnel is one smooth pipe. Spheres one radius apart leave a 0.2 m
+            // cusp at every joint, and the worm bumps over each one.
+            //
+            // The forward end is `DIG_ADVANCE` past the current surface and the
+            // tail is a radius behind it. Those are the same point on the next
+            // bite, so consecutive capsules share an end (a smooth join) and
+            // the front outruns the worm. The tail is always in air (the look
+            // ray is air up to `centre`), so it cannot eat rock behind.
+            let eye = worm.eye();
+            let dir = look_dir(worm.yaw, worm.pitch);
+            let back = DIG_RADIUS.min((centre - eye).length());
+            let ahead = (DIG_ADVANCE - DIG_RADIUS).max(0.0);
+            let shape = Shape::Capsule { a: centre - dir * back, b: centre + dir * ahead, radius: DIG_RADIUS };
             grid.apply(shape, Op::Carve);
             events.push(Event::Edit { shape, op: Op::Carve });
             worm.dig_cooldown = DIG_INTERVAL;
         }
     }
 }
-/// Where a dig would be centred: the first rock the worm looks at within reach.
-/// The viewer uses this too, to preview the hole.
+/// Where a dig would start: the first rock the worm looks at within reach.
+/// The viewer uses this to preview the hole. The carve is a capsule from a
+/// radius behind this point to `DIG_ADVANCE` past it, so the bite is a smooth
+/// 2.5 m advance rather than a sphere dropped on the surface.
+///
+/// Straight out of the worm's face along the look angles, *not* along
+/// `Worm::aim_dir`. The viewer's camera sits over the shoulder, so the crosshair
+/// ray is a shoulder to the right and half a metre above the eye; a hole centred
+/// on it would sit beside the worm (and, at point-blank range, above its head)
+/// where the worm cannot walk into it. The mouth digs where the worm is going.
 pub fn dig_target(grid: &Grid, worm: &Worm) -> Option<Vec3> {
-    let dir = worm.aim_dir();
+    let dir = look_dir(worm.yaw, worm.pitch);
     grid.raycast(worm.eye(), dir, DIG_REACH).map(|t| worm.eye() + dir * t)
 }
 
@@ -513,22 +549,27 @@ pub(crate) fn slide(grid: &Grid, worm: &mut Worm, disp: Vec3) -> Collision {
 }
 
 /// A worm walking into a ledge is stopped by the rounded foot touching its edge.
-/// If the walk made less than a quarter of the horizontal distance it meant to
-/// (`intended`), try a full tick of walking (`want`) from `STEP_UP` higher, then
-/// lower the worm onto whatever is there. Keeps the result only if it got
-/// further. `want` is not the real velocity because the wall has just cancelled
-/// that (and a worm starting to walk has not got up to speed either).
+/// If the walk made less than half the horizontal distance it meant to
+/// (`intended`), try a mantle from `STEP_UP` higher, `MANTLE_REACH` forward, then
+/// lower the worm onto whatever is there. Keep the result only if it ends on a
+/// flat top and got further. `want` is not the real velocity because the wall has
+/// just cancelled that (and a worm starting to walk has not got up to speed
+/// either).
 pub(crate) fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f32, want: Vec3) -> Collision {
     let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).length();
     let got = flat(worm.pos - start);
-    if got >= intended * 0.25 {
-        return Collision::default(); // not blocked
+    if got >= intended * 0.5 {
+        return Collision::default(); // not blocked enough to need help
     }
     let (blocked_pos, blocked_vel) = (worm.pos, worm.vel);
     worm.pos = start + Vec3::Y * STEP_UP;
     let fits = BODY_SPHERES.iter().all(|&h| grid.sample(worm.pos + Vec3::Y * h) >= WORM_RADIUS * 0.99);
     if fits {
-        let mut hit = slide(grid, worm, want);
+        // A step-up is a mantle, not a walk: move at least `MANTLE_REACH` so the
+        // worm ends up on top of the lip instead of with its foot still against
+        // the face (a tick's walk is only ~0.2 m, half a radius).
+        let step = want.normalize_or_zero() * want.length().max(MANTLE_REACH);
+        let mut hit = slide(grid, worm, step);
         // Lower the worm until its foot touches something, a little at a time. (Dropping
         // it the whole way and pushing it out again would shove it back off the
         // ledge's corner by as much as it had just moved forward.)
@@ -542,7 +583,13 @@ pub(crate) fn try_step_up(grid: &Grid, worm: &mut Worm, start: Vec3, intended: f
         if landed.wall.is_some() {
             hit.wall = landed.wall;
         }
-        if flat(worm.pos - start) > got + 0.02 {
+        // Only a mantle that ends on the ground is progress; stepping forward
+        // over a drop is a fall, and the normal move already handles it. And
+        // only onto a roughly flat top: otherwise the worm could use the long
+        // mantle step to skate up any steep slope in 0.6 m leaps.
+        let supported = grid.sample(worm.pos + Vec3::Y * WORM_RADIUS) <= WORM_RADIUS + 0.06;
+        let onto_a_ledge = grid.gradient(worm.pos).y >= MANTLE_FLAT;
+        if supported && onto_a_ledge && flat(worm.pos - start) > got + 0.02 {
             worm.vel = Vec3::new(want.x / DT, worm.vel.y, want.z / DT);
             return hit;
         }
@@ -1065,13 +1112,9 @@ mod tests {
         // The viewer's camera sits over the shoulder, so it sends the crosshair
         // direction separately from `yaw` (which stays the movement frame).
         let mut w = settled(walled, (17.5, 16.0));
-        let eye = w.worms[0].eye();
-        assert!(w.grid.sample(Vec3::new(20.5, eye.y, 16.0)) < 0.0, "rock to the +x side");
-        // Looking along +z, but aiming at the wall along +x.
-        let aim = Input { yaw: 0.0, aim: Some(Vec3::X), dig: true, ..Input::default() };
+        // Looking along +z, aiming at the wall along +x.
+        let aim = Input { yaw: 0.0, aim: Some(Vec3::X), ..Input::default() };
         w.step(&[aim]);
-        assert!(w.grid.sample(Vec3::new(20.5, eye.y, 16.0)) > 0.0, "dug where it aimed");
-        assert!(w.worms[0].digging);
         assert!((w.worms[0].aim_dir() - Vec3::X).length() < 1.0e-6);
         assert!(w.worms[0].yaw.abs() < 1.0e-6, "the camera frame did not turn");
 
@@ -1084,6 +1127,21 @@ mod tests {
             w.step(&[Input { yaw: 0.0, aim: Some(bad), ..Input::default() }]);
             assert!((w.worms[0].aim_dir() - Vec3::Z).length() < 1.0e-6, "{bad:?} falls back to yaw");
         }
+    }
+
+    #[test]
+    fn digging_follows_the_face_not_the_crosshair() {
+        // The shoulder offset means the crosshair is not the eye ray. Shots
+        // follow the crosshair (see above); the mouth digs where the body is
+        // going, so the tunnel is one the worm can walk down.
+        let mut w = settled(walled, (17.5, 16.0));
+        let eye = w.worms[0].eye();
+        assert!(w.grid.sample(Vec3::new(20.5, eye.y, 16.0)) < 0.0, "rock to the +x side");
+        let input = Input { yaw: FRAC_PI_2, aim: Some(Vec3::Z), dig: true, ..Input::default() };
+        w.step(&[input]);
+        assert!(w.grid.sample(Vec3::new(20.5, eye.y, 16.0)) > 0.0, "dug straight ahead");
+        assert!(w.worms[0].digging);
+        assert!((w.worms[0].aim_dir() - Vec3::Z).length() < 1.0e-6, "the shot still follows the aim");
     }
 
     #[test]
@@ -1176,10 +1234,13 @@ mod tests {
 
     #[test]
     fn a_worm_walks_up_a_low_ledge_but_not_a_high_wall() {
-        // The ground plus a block for x > 18, 0.4 m and 1.2 m high.
+        // The ground plus a block for x > 18 at 0.4 m, 0.8 m and 1.2 m.
         // (`Grid::from_fn` wants a plain fn pointer, so no closure over the height.)
         fn low(p: Vec3) -> f32 {
             (p.y - 4.0).min((p.y - 4.4).max(18.0 - p.x))
+        }
+        fn bump(p: Vec3) -> f32 {
+            (p.y - 4.0).min((p.y - 4.8).max(18.0 - p.x))
         }
         fn high(p: Vec3) -> f32 {
             (p.y - 4.0).min((p.y - 5.2).max(18.0 - p.x))
@@ -1192,12 +1253,17 @@ mod tests {
         // within half a voxel of 4.4. What matters is that it is UP there.
         assert!(worm.pos.y > 4.3 && worm.pos.y < 4.7 && worm.on_ground, "stands on it: y = {}", worm.pos.y);
 
+        // A knee-high step from a weapon crater: the mantle has to carry the
+        // body forward as well as up, or the foot stays against the face.
+        let mut w = settled(bump, (16.0, 16.0));
+        run(&mut w, 60, walk(FRAC_PI_2));
+        let worm = &w.worms[0];
+        assert!(worm.pos.x > 19.0 && worm.pos.y > 4.7, "got over the 0.8 m bump: {:?}", worm.pos);
+
         let mut w = settled(high, (16.0, 16.0));
         run(&mut w, 60, walk(FRAC_PI_2));
         assert!(w.worms[0].pos.x < 18.0 - WORM_RADIUS + 0.05, "a 1.2 m wall stops it: x = {}", w.worms[0].pos.x);
     }
-
-
 
     /// A pit 10 m deep and 6 m wide in ground at y = 10, centred on (16, 16).
     fn pit(p: Vec3) -> f32 {
@@ -1355,5 +1421,68 @@ mod tests {
         };
         assert_eq!(bits(&a), bits(&b));
         assert_ne!(a.grid.checksum(), world(walled, (17.0, 16.0)).grid.checksum(), "the script did dig");
+    }
+
+    #[test]
+    fn the_shoulder_offset_does_not_stop_the_worm_walking_into_its_tunnel() {
+        // Mirrors the viewer's rig: the camera is 5 m back, 0.75 m to the right
+        // and 0.55 m above the target, and `Input::aim` points from the eye at
+        // whatever the camera's centre ray hits. Before the dig stopped using
+        // the aim, the worm dug a hole beside and above itself, drifted into
+        // the wall and got stuck 2 m in.
+        let mut w = settled(walled, (17.5, 16.0));
+        for _ in 0..300 {
+            let worm = &w.worms[0];
+            let eye = worm.eye();
+            let forward = Vec3::X;
+            let right = forward.cross(Vec3::Y);
+            let cam = worm.pos + Vec3::Y * (EYE_HEIGHT + 0.2 + 0.35) + right * 0.75 - forward * 5.0;
+            let aim = w.grid.raycast(cam, forward, 100.0).map(|t| (cam + forward * t - eye).normalize());
+            w.step(&[Input {
+                yaw: FRAC_PI_2,
+                aim,
+                dig: true,
+                move_dir: Vec2::new(0.0, 1.0),
+                ..Input::default()
+            }]);
+        }
+        let worm = &w.worms[0];
+        assert!(worm.pos.x > 28.0, "walked into its tunnel, x = {}", worm.pos.x);
+        assert!((worm.pos.z - 16.0).abs() < 0.5, "and straight, z = {}", worm.pos.z);
+    }
+
+    #[test]
+    fn digging_does_not_bob_the_worm() {
+        // A straight tunnel through a hill. The old spheres left a 0.2 m cusp
+        // at every joint: the worm bumped over them, the next bite followed its
+        // raised eye, and the tunnel climbed away from the floor.
+        let mut w = World::new(Grid::from_fn(IVec3::new(24, 4, 8), walled), &[(17.5, 16.0)], 1);
+        w.worms[0].pos.y = 4.05;
+        run(&mut w, 60, Input::default());
+        let dig_in = Input { yaw: FRAC_PI_2, dig: true, move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
+        run(&mut w, 120, dig_in); // inside the rock and up to speed
+        let start = w.worms[0].pos;
+        run(&mut w, 180, dig_in);
+        let end = w.worms[0].pos;
+        assert!(end.x - start.x > 30.0, "kept walking while digging: {:.1} -> {:.1}", start.x, end.x);
+        assert!((end.y - start.y).abs() < 0.2, "the tunnel floor stays level: {:.3} -> {:.3}", start.y, end.y);
+    }
+
+    #[test]
+    fn weapon_craters_do_not_trap_the_worm() {
+        // Three overlapping blast holes in flat ground: a shallow bowl whose
+        // scalloped rim used to stop the worm dead. It should walk up the
+        // steep wall and mantle the lip.
+        let mut grid = Grid::from_fn(IVec3::new(8, 4, 8), flat);
+        for x in [14.0, 17.0, 20.0] {
+            grid.apply(Shape::Sphere { center: Vec3::new(x, 4.0, 16.0), radius: 3.0 }, Op::Carve);
+        }
+        let mut w = World::new(grid, &[(17.0, 16.0)], 1);
+        run(&mut w, 90, Input::default()); // fall in
+        assert!(w.worms[0].pos.y < 2.5, "starts at the bottom: {}", w.worms[0].pos.y);
+        run(&mut w, 300, walk(FRAC_PI_2));
+        let worm = &w.worms[0];
+        assert!(worm.pos.y > 3.8, "climbed out: y = {}", worm.pos.y);
+        assert!(worm.pos.x > 24.0, "and kept going: x = {}", worm.pos.x);
     }
 }

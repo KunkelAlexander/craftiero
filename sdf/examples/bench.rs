@@ -115,6 +115,16 @@ fn main() {
     println!("edit only, tractor blob r=0.8 m smooth: {:.3} ms/tick", ms(t) / 60.0);
     grid.take_dirty();
 
+    // A dig: a 2.5 m capsule of radius 1.5 m.
+    let n = 100;
+    let t = Instant::now();
+    for _ in 0..n {
+        let a = Vec3::new(10.0 + rng.next() * 108.0, 30.0, 10.0 + rng.next() * 108.0);
+        grid.apply(Shape::Capsule { a, b: a + Vec3::X * 2.5, radius: 1.5 }, Op::Carve);
+    }
+    println!("edit only, dig capsule r=1.5 m x 2.5 m: {:.3} ms", ms(t) / n as f64);
+    grid.take_dirty();
+
     // Collision-style queries.
     let t = Instant::now();
     let mut acc = 0.0;

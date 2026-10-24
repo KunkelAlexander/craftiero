@@ -14,6 +14,8 @@
 //!     the air cannot push you past running speed, so hopping is never a
 //!     faster way to travel than running;
 //!   * a jump cut is gravity, not a velocity clamp;
+//!   * small ledges are mantled (up to 0.9 m) and steep crater walls are
+//!     walked up to about 70 degrees, so blast holes do not trap the worm;
 //!   * walls are climbed by holding into them, and kicked off with jump.
 //!
 //! The ramp, brake and turn rates are tuned for a 1.8 m character close to the
@@ -292,7 +294,7 @@ fn step_ground(
     let start = worm.pos;
     let disp = worm.vel * DT;
     let mut hit = slide(grid, worm, disp);
-    // Walking into a knee-high ledge: try the same step from half a metre up.
+    // Walking into a ledge or a crater lip: try a mantle from STEP_UP higher.
     if worm.forward_vel.abs() > 0.1 {
         let want = f * (worm.forward_vel * DT);
         let stepped = try_step_up(grid, worm, start, flat(disp).length(), want);
