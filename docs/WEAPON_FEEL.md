@@ -124,10 +124,10 @@ at 2 must stay quiet even when it is the newest thing in the game.
 | 8 | Nova | the cavern eraser | a 1.2 s charge: the view narrows, a ring of light gathers and spins | white-out, a fireball that fills the crater, the ground rolling | a 3 s smoke column and a crater rim glowing orange, cooling to black | **5** |
 | 9 | Block | the wall | none: it is instant | the rock *slams* into place, a dust ring, one hard thud | dust settling off the new face | **2** |
 | 10 | Tractor | the bridge | a grinding hum while held | a continuous stream of lumps, each with a small impact | the new span, still dusty | **2** |
-| 11 | Plasma Whip | the scar | a 0.3 s draw-back: the lash is carried, cocked over the shoulder, the plasma brightens | the crack, a sine-wave scar, sparks along the arc | the groove cooling white → red → black over ~2 s | **3** |
+| 11 | Plasma Whip | the scar | a 0.14 s coil: the carried lash tightens and brightens, the arm draws back | the crack, a fourteen-metre horizontal sweep, a white starburst at the rock, motion ghosts | a long groove cooling orange → red → dark over ~2 s | **3** |
 Two of these are already the best in the game and should be the template: the
-**Whip** (its scar is shaped by the weapon: a sine wave burned into the rock)
-and the **Nova's aim ring** (the choice is heavy before the shot).
+**Whip** (its scar is shaped by the weapon: a horizontal groove burned by the
+sweep) and the **Nova's aim ring** (the choice is heavy before the shot).
 
 ## 6. The systems the feel needs
 
@@ -255,7 +255,8 @@ Enforce the Loudness column. Concretely:
   of the mix.
 - **Mute the world, not the actors.** The terrain, sky and arena wall are pulled
   a third of the way to grey (`U.fx.y` in the march shader, `C` toggles it); the
-  capsules (worms, guns, blood, health pips) are not. One constant in `main.rs`
+  capsules (worms, guns, blood droplets, health pips) are not. Stains are paint
+  on the ground, so they mute with it. One constant in `main.rs`
   (`WORLD_GRADE`) sets the amount. This is the cheapest contrast win available:
   it costs two arithmetic operations on environment pixels and makes every
   coloured effect read from twice as far.
@@ -267,11 +268,13 @@ Enforce the Loudness column. Concretely:
   consumer. Hitstop and any time scaling are viewer-only.
 - **Capsule budgets.** Gameplay gets 256 slots (`MAX_CAPSULES`): worms, the aim
   aid, projectiles, then bursts, dust and trails, so a busy fight trims the
-  newest smoke first. Blood gets its own 128 slots (`MAX_BLOOD_CAPSULES`) and is
-  packed after the gameplay pool; the renderer truncates each pool on its own,
-  so cosmetic spray can never evict a rocket and a crowded fight can never erase
-  a wound. The shader's total array is 384 primitives (12 tile-mask words), still
-  inside the 64 KB uniform limit. Within each pool, prefer fewer, bigger,
+  newest smoke first. The blood droplets get their own 128 slots
+  (`MAX_BLOOD_CAPSULES`) and are packed after the gameplay pool; the renderer
+  truncates each pool on its own, so cosmetic spray can never evict a rocket.
+  The stains they leave are a separate 48-slot paint pool in the march shader
+  (`MAX_STAINS`), so a crowded fight cannot erase a wound either. The shader's
+  total capsule array is 384 primitives (12 tile-mask words), still inside the
+  64 KB uniform limit. Within each pool, prefer fewer, bigger,
   longer-lived primitives over many small ones.
 - **Frame cost.** The march pass is already ~16 ms on the target laptop. New
   effects must be cheap capsules and particles; no per-pixel work per explosion.
@@ -311,8 +314,10 @@ The effects themselves are now billboards, not SDF solids: the inked picture is
 HDR, a half-resolution bloom chain adds the light of every self-lit pixel, and a
 filmic tone-map rolls the cores off to white. Fire, smoke, sparks and shockwaves
 are camera-facing quads; the terrain, worms and guns are lit by up to eight
-dynamic point lights from blasts and plasma. Blood stains are decals; crater
-scorch is a **soot sphere** in the march shader, so the burn follows the curved
+dynamic point lights from blasts and plasma. Blood stains are painted into the
+terrain's own albedo in the march shader (a **stain disc**, see `Stain` in
+`renderer.rs`), so the ground carries the colour and cannot hide it; crater
+scorch is a **soot sphere** in the same shader, so the burn follows the curved
 bowl a blast carves instead of needing a flat plane. A shot that ends on rock
 emits `Event::Impact`, so a missed shot still sparks, scorches and ticks.
 
@@ -330,13 +335,19 @@ view. And the per-weapon camera recoil (phase 4, partly): a shot now shoves the
 view up, climbs the muzzle and punches the lens, instead of the old slide
 straight back along the aim — a dolly, which is why the recoil was invisible.
 
-The Plasma Whip now carries its lash (phase 6, the ritual): the lash is part of
-the worm's own model, hangs from the hand at rest as a glowing violet cable,
-is cocked over the shoulder for 0.3 s, and then cracks out to its full 12 m
-reach over a 0.32 s swing that the whole body follows. The plasma is drawn as a
-thick glowing core plus a chain of additive halo billboards, and the swing
-replays its tip as a fading crescent, so the reach is visible even from the
-shoulder camera.
+The Plasma Whip is now a carried melee weapon, not a gun (phase 6, the ritual).
+Its lash is part of the worm's own model and is never put away: at rest it
+reaches about six metres forward, arcing and rippling like a live cable. The
+wind-up only coils it for 0.14 s; the strike extends it to fourteen metres and
+sweeps it flat across the front, then eases it back to the carried pose. It has
+no magazine and holding fire keeps it swinging. The plasma is a thick glowing
+core with an ink-dark edge, dark electric knots and additive halo billboards;
+the sweep leaves fading motion ghosts, and a crack against rock throws a white
+starburst. Where the sweep crosses rock, the sim samples the whole arc, stops
+the lash at the first surface (no tunnelling), carves a shallow groove and emits
+`Event::Scar`; the viewer cools that groove from orange through red to dark over
+two seconds. The old crescent of tip puffs is gone: the lash is drawn from the
+same `whip_path` curve the sim hits and scars.
 
 Hits now react (phase 3, mostly): the victim flashes white, flinches off its
 axis, sprays Liero-red blood that arcs out and stains the floor and walls, and a

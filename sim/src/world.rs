@@ -363,6 +363,10 @@ pub enum Event {
     /// The worm itself carries the lash every frame, so this event is what
     /// starts the swing animation, not what makes the weapon appear.
     Whip { worm: u8, from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
+    /// A segment of the groove a plasma-whip sweep burned into the rock. The
+    /// terrain edit is already in the grid; this is the visible heat that cools
+    /// from white to red to dark over a couple of seconds.
+    Scar { from: Vec3, to: Vec3, normal: Vec3 },
     /// `weapon` made the blast: the viewer, the audio and the camera each have
     /// their own signature for it (see `docs/WEAPON_FEEL.md`). `radius` is the
     /// damage reach, not the size of the fireball. `normal` is the surface the

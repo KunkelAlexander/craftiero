@@ -13,8 +13,9 @@ the networking concepts where they appear.
 world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
 integrated laptop GPU, and now fight: twelve weapons (rockets, a railgun, bombs,
 homing swarms, a teleport gun, a Nova that charges for a beat and then clears a
-cavern, a plasma whip that draws back and cracks across a nine-metre arc or
-smashes down after a double jump, a wall-thrower and a forming beam). Explosions carve the terrain,
+cavern, a plasma whip whose living lash is always carried and cracks across a
+fourteen-metre horizontal arc before it smashes down after a double jump, a
+wall-thrower and a forming beam). Explosions carve the terrain,
 rock is cover, and a dead worm comes back
 after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
 arc to the point it will land on, a ricochet marks its first bounce, and a big
@@ -29,8 +30,10 @@ Hits are loud in the Liero sense:
 the victim flashes white and flinches, blood arcs out and stains the rock, and
 a wounded worm carries a five-pip health bar over its head. Blasts and taking a
 hit flash the whole frame white for a blink, with a slight chromatic split. The
-world is graded a third towards grey by default, so the guns, blood and health
-pips are the only strong colour on screen (`C` A/Bs the grade). Sounds are panned
+world is graded a third towards grey by default, so the guns, blood droplets and
+health pips are the only strong colour on screen (`C` A/Bs the grade). Blood that
+lands is mixed into the terrain's own albedo, so the rock carries the stain
+instead of a sprite floating over it. Sounds are panned
 and muffled by distance. The rules run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
@@ -51,6 +54,8 @@ sockets, a cut grin, a curling tail and two arms holding the gun. There are no
 seams between parts, so it gets one ink outline and the belly is painted as a
 material instead of being a second capsule stuck to the chest. The development
 sheet renders eight yaws at gameplay size, then the same silhouettes at 60 px.
+The sheet and the game compile the same `WORM_SCULPT` chunk, so the preview
+cannot drift from the body that ships.
 
 | | |
 |---|---|
@@ -114,8 +119,9 @@ cargo test -p sdf -p sim -p viewer
 `--fire id[,ticks]` fires that weapon and takes the picture `ticks` later (so
 projectiles and blasts are in the air); `--weapon id` just holds it, with no
 shot, which is the way to look at a gun. The Nova's wind-up takes 72 ticks and
-the whip's takes 18, so `--fire 8,40` catches the Nova charging, `--fire 8,110`
-catches the blast, and `--fire 11,28` catches the whip at full crack.
+the whip's coil takes 8, so `--fire 8,40` catches the Nova charging, `--fire 8,110`
+catches the blast, and `--fire 11,13` catches the whip fully extended at the
+start of its sweep.
 
 `--no-brush` hides the orange dig ring that otherwise sits on the terrain behind
 the character, and `--no-aim` hides the weapon aim aid: lobbed arcs, blast rings

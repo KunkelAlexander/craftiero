@@ -69,8 +69,8 @@ pub struct FrameParams<'a> {
     /// The worm bodies, one SDF each (up to `MAX_WORMS`). Their shadow proxies
     /// live in `capsules`; the bodies themselves are traced in the shader.
     pub worms: &'a [WormSdf],
-    /// Cosmetic blood droplets and stains, in their own `MAX_BLOOD_CAPSULES`
-    /// pool. They can never push a gameplay primitive out.
+    /// Cosmetic blood droplets, in their own `MAX_BLOOD_CAPSULES` pool. They
+    /// can never push a gameplay primitive out.
     pub blood: &'a [DrawPrim],
     /// Soft billboards drawn with additive blending: muzzle flash, fire, sparks,
     /// embers, hot cores. Layered over the inked picture, not ray-marched.
@@ -78,8 +78,8 @@ pub struct FrameParams<'a> {
     /// Soft billboards drawn with alpha blending: smoke, dust, blood mist.
     /// Sorted back-to-front by the caller.
     pub smoke: &'a [Sprite],
-    /// Surface marks (blood stains, scorch marks) painted onto the terrain
-    /// using the G-buffer, so they lie flat on the rock instead of floating.
+    /// Surface marks (scorch marks) painted onto the terrain using the
+    /// G-buffer, so they lie flat on the rock instead of floating.
     pub decals: &'a [Sprite],
     /// Dynamic point lights: blasts, muzzle flashes, plasma. They add to the
     /// shaded terrain and worms, so an explosion visibly lights the cave around
@@ -88,6 +88,10 @@ pub struct FrameParams<'a> {
     /// Spheres of soot left by blasts. The shader darkens the rock inside them,
     /// which is the only way a scorch can follow a curved crater wall.
     pub soot: &'a [Soot],
+    /// Blood marks painted into the terrain's own albedo. Unlike a decal they
+    /// are part of the ground: the march shader colours the rock itself, so no
+    /// depth test and no bump can hide them.
+    pub stains: &'a [Stain],
     /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
     pub brush: Option<(Vec3, f32)>,
     pub time: f32,
@@ -97,8 +101,9 @@ pub struct FrameParams<'a> {
     /// Screen flash, 0..1. A blast or a hit fills a frame with hot white and
     /// splits the lens for a blink.
     pub flash: f32,
-    /// How far the environment is pulled towards grey, 0..1. Characters,
-    /// weapons and blood are not affected: they are the only colour left.
+    /// How far the environment is pulled towards grey, 0..1. Characters and
+    /// weapons are not affected: they are the only colour left. Blood is part
+    /// of the terrain now, so it is muted with the ground it lies on.
     pub grade: f32,
 }
 
@@ -107,10 +112,10 @@ pub struct FrameParams<'a> {
 /// so 256 leaves room for a busy fight.
 pub const MAX_CAPSULES: usize = 256;
 
-/// A separate pool for blood droplets and stains. Cosmetic, so it must never
-/// evict a worm or a rocket, and a crowded fight must never erase a wound.
-/// The two pools are packed back-to-back in the shader's uniform array; the
-/// renderer truncates each on its own.
+/// A separate pool for blood droplets. Cosmetic, so it must never evict a worm
+/// or a rocket, and a crowded fight must never erase a wound. The two pools are
+/// packed back-to-back in the shader's uniform array; the renderer truncates
+/// each on its own. The stains the droplets leave are terrain paint, not here.
 pub const MAX_BLOOD_CAPSULES: usize = 128;
 
 /// The total uniform array. MUST stay a multiple of 32 (one tile-mask word per
@@ -228,6 +233,38 @@ pub struct Soot {
 impl Soot {
     pub fn new(at: Vec3, radius: f32, strength: f32) -> Soot {
         Soot { a: [at.x, at.y, at.z, radius.max(0.05)], b: [strength.clamp(0.0, 1.0), 0.0, 0.0, 0.0] }
+    }
+}
+
+/// A splat of blood painted into the terrain's albedo. `a.w` is the radius on
+/// the surface, `b.rgb` the colour (sRGB), `b.w` the strength (0..1) and
+/// `c.xyz` the surface normal. Must match `Stain` in shaders.rs.
+///
+/// Why not a decal sprite? A decal is drawn from the G-buffer: a nearer bump
+/// hides the patch, and a stain whose centre sank a few centimetres into the
+/// rock only showed the sliver that poked out. Painting the terrain itself
+/// makes the mark follow the ground exactly, at every angle.
+pub const MAX_STAINS: usize = 48;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Stain {
+    /// xyz: centre on the surface, w: radius in metres.
+    pub a: [f32; 4],
+    /// rgb: colour (sRGB), w: strength 0..1.
+    pub b: [f32; 4],
+    /// xyz: unit surface normal, w: noise seed.
+    pub c: [f32; 4],
+}
+
+impl Stain {
+    pub fn new(at: Vec3, normal: Vec3, radius: f32, colour: Vec3, strength: f32, seed: f32) -> Stain {
+        let n = normal.normalize_or_zero();
+        Stain {
+            a: [at.x, at.y, at.z, radius.max(0.05)],
+            b: [colour.x, colour.y, colour.z, strength.clamp(0.0, 1.0)],
+            c: [n.x, n.y, n.z, seed],
+        }
     }
 }
 
@@ -446,11 +483,12 @@ struct Uniforms {
     brush: [f32; 4],
     flags: [f32; 4],
     size: [f32; 4],
-    counts: [f32; 4], // x: number of primitives in use, y: shadow casters (the first y)
+    counts: [f32; 4], // x: primitives in use, y: shadow casters (the first y), z: stains
     /// x: screen flash 0..1, y: environment desaturation 0..1. zw reserved.
     fx: [f32; 4],
     lights: [Light; MAX_LIGHTS],
     soot: [Soot; MAX_SOOT],
+    stains: [Stain; MAX_STAINS],
     worms: [GpuWorm; MAX_WORMS],
     capsules: [GpuPrim; MAX_PRIMS],
     tiles: [[u32; 4]; TILE_WORDS * TILES_X * TILES_Y / 4],
@@ -1055,7 +1093,7 @@ impl Renderer {
             brush: brush_pos.extend(brush_r).to_array(),
             flags: [f.time, flag(f.shadows), flag(f.ao), flag(f.outlines)],
             size: [self.gbuf.0 as f32, self.gbuf.1 as f32, self.screen.0 as f32, self.screen.1 as f32],
-            counts: [used as f32, casters as f32, 0.0, 0.0],
+            counts: [used as f32, casters as f32, f.stains.len().min(MAX_STAINS) as f32, 0.0],
             fx: [f.flash.clamp(0.0, 1.0), f.grade.clamp(0.0, 1.0), 0.0, 0.0],
             lights: {
                 let mut l = [Light::zeroed(); MAX_LIGHTS];
@@ -1067,6 +1105,13 @@ impl Renderer {
             soot: {
                 let mut s = [Soot::zeroed(); MAX_SOOT];
                 for (slot, src) in s.iter_mut().zip(f.soot.iter().take(MAX_SOOT)) {
+                    *slot = *src;
+                }
+                s
+            },
+            stains: {
+                let mut s = [Stain::zeroed(); MAX_STAINS];
+                for (slot, src) in s.iter_mut().zip(f.stains.iter().take(MAX_STAINS)) {
                     *slot = *src;
                 }
                 s

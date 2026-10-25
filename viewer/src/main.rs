@@ -48,8 +48,9 @@ Controls
   left mouse        fire (hold)              right mouse  shoot the rope / let go
   1-9 0 - =         pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
                     Bomb Cluster Swarm Teleport Nova Block Tractor Plasma Whip
-                    (the Nova charges for 1.2 s and the whip draws back for
-                    0.3 s before they fire; a swap cancels either)
+                    (the Nova charges for 1.2 s and the whip coils for 0.14 s
+                    before they fire; a swap cancels either. The whip is melee:
+                    hold fire to keep swinging)
   hold W into a wall  climb it; S climbs down; Space kicks off the wall
                      (low ledges and crater rims are climbed automatically;
                      a jump that reaches a higher lip grabs it)
@@ -461,7 +462,7 @@ fn run_shot(cfg: &Config, path: &str) {
     // The aim aid worm 0's weapon calls for, if it calls for one.
     if cfg.aim {
         if let Some(path) = world.aim_path(0) {
-            capsules.extend(effects::trajectory(&path));
+            capsules.extend(effects::trajectory(&path, &world.grid));
         }
     }
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
@@ -480,6 +481,7 @@ fn run_shot(cfg: &Config, path: &str) {
         decals: &sprites.decals,
         lights: &sprites.lights,
         soot: &sprites.soot,
+        stains: &sprites.stains,
         brush: if cfg.brush { aim_point(&world.grid, &cam).map(|p| (p, 3.0)) } else { None },
         time: 0.0,
         shadows: cfg.shadows,
@@ -598,6 +600,7 @@ fn run_bench(cfg: &Config) {
                 decals: &[],
                 lights: &[],
                 soot: &[],
+                stains: &[],
                 brush: None,
                 time: 0.0,
                 shadows,
@@ -634,6 +637,7 @@ fn run_bench(cfg: &Config) {
         decals: &[],
         lights: &[],
         soot: &[],
+        stains: &[],
         brush: None,
         time: 0.0,
         shadows: true,
@@ -668,6 +672,7 @@ fn run_bench(cfg: &Config) {
         decals: &[],
         lights: &[],
         soot: &[],
+        stains: &[],
         brush: None,
         time: 0.0,
         shadows: true,
@@ -1122,11 +1127,19 @@ impl Viewer {
                         self.feel.kick(&self.camera, shot_kick(weapon));
                     }
                 }
-                Event::Whip { worm, phase, style, .. } => {
+                Event::Whip { worm, from, phase, style, .. } => {
                     // The lash is part of the worm's model, so the strike is an
-                    // animation cue, not a spawned effect.
+                    // animation cue, not a spawned effect. The camera answers
+                    // the crack, not a muzzle flash: a lateral shove with a
+                    // small lens punch, timed to the swing.
                     if let Some(anim) = self.anims.get_mut(worm as usize) {
                         anim.struck(style, phase);
+                    }
+                    if worm == 0 {
+                        let away = (from - self.camera.pos).length();
+                        let falloff = (1.0 - away / 24.0).clamp(0.0, 1.0);
+                        self.feel.kick(&self.camera, shot_kick(WHIP));
+                        self.feel.shake(0.026 * falloff);
                     }
                 }
                 Event::Hit { victim, weapon, pos, damage, dir } => {
@@ -1333,7 +1346,7 @@ impl Viewer {
         // sparks, not the marker the player is looking at.
         if !self.fly {
             if let Some(path) = self.world.aim_path(0) {
-                capsules.extend(effects::trajectory(&path));
+                capsules.extend(effects::trajectory(&path, &self.world.grid));
             }
         }
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
@@ -1378,6 +1391,7 @@ impl Viewer {
             decals: &sprites.decals,
             lights: &sprites.lights,
             soot: &sprites.soot,
+            stains: &sprites.stains,
             brush,
             time: (now - self.started).as_secs_f32(),
             shadows: self.shadows,
@@ -1412,6 +1426,8 @@ impl Viewer {
             let def = &WEAPONS[gun.id as usize];
             let ammo = if !me.alive {
                 format!("dead, back in {:.0} s", me.respawn_timer.max(0.0))
+            } else if def.kind == sim::weapons::Kind::Whip {
+                "melee".to_string()
             } else if gun.reload > 0.0 {
                 format!("reloading {:.1} s", gun.reload)
             } else {

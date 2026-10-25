@@ -9,11 +9,11 @@
 
 use crate::feel;
 use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA, PLASMA_HOT, SMOKE, VIOLET};
-use crate::renderer::{DrawPrim, Light, Soot, Sprite};
+use crate::renderer::{DrawPrim, Light, Soot, Stain, Sprite};
 use glam::Vec3;
 use sdf::Grid;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
-use sim::{whip_path, AimPath, Event, Projectile, Worm, DT, WHIP_POINTS, WHIP_SWEEP};
+use sim::{whip_path, AimPath, Event, Projectile, WhipPose, Worm, DT, WHIP_POINTS};
 use std::f32::consts::TAU;
 
 /// Gameplay effects share the renderer's 256-slot core pool with the worms,
@@ -24,12 +24,12 @@ const MAX_DUST: usize = 96;
 /// Air traces. They are the first thing to drop when a fight is busy, because
 /// they are the least important: the shot itself still has to be drawn.
 const MAX_TRAILS: usize = 24;
-/// Blood has its own 128-slot renderer pool, which gameplay cannot evict. These
-/// two lists feed it: stains are queued first, so a full pool loses droplets,
-/// never the marks on the floor.
+/// Blood droplets have their own 128-slot renderer pool, which gameplay cannot
+/// evict. The stains they leave are terrain paint and live in `splats`, so a
+/// full droplet pool loses spray, never the marks on the floor.
 const MAX_BLOOD: usize = 128;
-/// Surface decals (blood stains and scorch marks) are cheap sprites, not SDF
-/// primitives, so the floor can hold a lot of them.
+/// Surface marks. Blood is painted into the terrain's albedo (`Stain`), scorch
+/// is a decal sprite; both are cheap, so the floor can hold a lot of them.
 const MAX_SPLATS: usize = 192;
 
 const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
@@ -154,10 +154,13 @@ fn ammo(weapon: u8, at: Vec3, vel: Vec3, out: &mut Vec<DrawPrim>) {
     let ball = |p: Vec3, r: f32, col: Vec3| DrawPrim::capsule(p, p + up * 0.004, r, col, false);
     match weapon {
         BLASTER => {
-            // A plasma bolt: a hot head with a tail so its speed reads, sized up
-            // so the ammunition is a thing you can actually track in flight.
-            out.push(DrawPrim::cylinder(back(0.52), at, 0.05, CYAN, false));
-            out.push(ball(at, 0.16, HOT).glowing());
+            // A plasma bolt: a hot head with a long, thin tail so its speed
+            // reads. The head is deliberately larger and warmer than the trail
+            // puffs; when they were the same size the bolt disappeared inside
+            // its own wake.
+            out.push(DrawPrim::cylinder(back(0.75), back(0.10), 0.045, CYAN, false));
+            out.push(ball(at, 0.22, HOT).glowing());
+            out.push(ball(at, 0.12, Vec3::ONE).glowing());
         }
         ROCKET => {
             // A real rocket: body, nose, and a flame where the exhaust is.
@@ -234,11 +237,31 @@ fn trail(weapon: u8) -> Option<(Vec3, f32, u32, bool)> {
     }
 }
 
+/// Push `p` out to `clearance` from the rock along the surface normal. Markers
+/// are capsules centred on their own position, so one placed exactly on the
+/// surface has its lower half buried and reads as broken dashes rather than a
+/// ring or a dot. The aim aid is the one thing that must never disappear into
+/// the ground it is describing.
+fn clear_of_rock(p: Vec3, clearance: f32, grid: &Grid) -> Vec3 {
+    let d = grid.sample(p);
+    if d >= clearance {
+        return p;
+    }
+    let mut n = grid.gradient(p);
+    if n.length_squared() < 1.0e-6 {
+        n = Vec3::Y;
+    }
+    p + n * (clearance - d)
+}
+
 /// The aim aid a weapon draws: a dotted arc for a lob, a ring on the rock where
 /// the shot will land, a blast footprint, and/or a short stub leaving a
 /// ricochet. `AimPath` comes from the sim, so everything sits on the rock the
 /// shot will really hit. `World::aim_path` decides which weapons get which.
-pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
+/// `grid` is used only to lift the markers clear of the surface: a capsule that
+/// is half inside the rock is invisible, which turned the landing ring into a
+/// few disconnected yellow flecks.
+pub fn trajectory(path: &AimPath, grid: &Grid) -> Vec<DrawPrim> {
     let mut out = Vec::with_capacity(32);
     let n = path.points.len();
     if n > 0 {
@@ -250,9 +273,12 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
             // Big enough that the ink outline cannot swallow the bright middle:
             // a 5 cm dot 20 m away is all outline and reads as a stone.
             let radius = 0.150 - 0.045 * t;
+            // The landing dot is on the surface; lift it (and any dot that
+            // skims a slope) so the whole bead shows.
+            let p = clear_of_rock(*p, radius * 0.85, grid);
             // A tiny stub makes a sphere: the raymarcher has no point primitive.
             out.push(
-                DrawPrim::capsule(*p, *p + Vec3::Y * 0.004, radius, HINT, false)
+                DrawPrim::capsule(p, p + Vec3::Y * 0.004, radius, HINT, false)
                     .glowing()
                     .inkless(),
             );
@@ -278,12 +304,17 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
         // 8 m Nova does not read as a hairline scribble at range.
         let radius = if path.blast > 0.0 { path.blast } else { 0.70 };
         let width = 0.050 + 0.004 * path.blast;
+        // Stand the line off the surface by its own radius, and lift any vertex
+        // that the slope has buried, so a wide blast footprint hugs the rock
+        // without cutting into it on the uphill side.
+        let clearance = width + 0.035;
+        let project = |p: Vec3| clear_of_rock(p, clearance, grid);
         let segments = 12;
         for k in 0..segments {
             let a0 = k as f32 * TAU / segments as f32;
             let a1 = (k + 1) as f32 * TAU / segments as f32;
-            let p0 = hit + (side * a0.cos() + up * a0.sin()) * radius;
-            let p1 = hit + (side * a1.cos() + up * a1.sin()) * radius;
+            let p0 = project(hit + (side * a0.cos() + up * a0.sin()) * radius);
+            let p1 = project(hit + (side * a1.cos() + up * a1.sin()) * radius);
             // A thin continuous ring: inkless, so it stays a circle instead of
             // turning into a row of dark pebbles at a distance.
             out.push(
@@ -294,8 +325,9 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
         }
         // A big dot in the middle, so the mark still reads where the ring is
         // edge-on to the camera.
+        let centre = clear_of_rock(hit, 0.12, grid);
         out.push(
-            DrawPrim::capsule(hit, hit + normal * 0.01, 0.160, HINT, false)
+            DrawPrim::capsule(centre, centre + normal * 0.01, 0.160, HINT, false)
                 .glowing()
                 .inkless(),
         );
@@ -309,8 +341,10 @@ pub fn trajectory(path: &AimPath) -> Vec<DrawPrim> {
             for k in 0..3 {
                 let a = from + dir * (0.25 + 0.55 * k as f32);
                 let b = from + dir * (0.75 + 0.55 * k as f32);
+                let r = 0.060 - 0.012 * k as f32;
+                let a = clear_of_rock(a, r, grid);
                 out.push(
-                    DrawPrim::capsule(a, b, 0.060 - 0.012 * k as f32, HINT, false)
+                    DrawPrim::capsule(a, b, r, HINT, false)
                         .glowing()
                         .inkless(),
                 );
@@ -329,6 +363,8 @@ enum Shape {
     Ring { at: Vec3, normal: Vec3, radius: f32 },
     /// A blood splat lying on the rock: one flattened lozenge on `normal`.
     Splat { at: Vec3, normal: Vec3, radius: f32 },
+    /// A hot segment of a plasma scar, cooling from white through red to dark.
+    Scar { from: Vec3, to: Vec3 },
     /// A lump of rock thrown by a blast. Drawn as a solid capsule (with ink,
     /// shadow and shading), because flying rubble is what makes a crater look
     /// like it was torn open rather than painted on.
@@ -355,6 +391,9 @@ struct Effect {
     /// Skip the ink outline (soft smoke, the aim aid). Without this a small
     /// primitive far away is all outline and reads as a dark pebble.
     inkless: bool,
+    /// Paint it into the terrain's albedo (`Stain`) instead of drawing a decal
+    /// sprite over the G-buffer. Blood uses this; a scorch still uses a decal.
+    paint: bool,
     /// Draw in front of the scene, with no depth fade. A muzzle flash sits
     /// inside the drawn barrel and an impact flash is half-buried in the rock;
     /// both would otherwise be erased by the very geometry that made them.
@@ -374,6 +413,7 @@ impl Effect {
             width: 0.12,
             hot: false,
             inkless: false,
+            paint: false,
             front: false,
         }
     }
@@ -412,6 +452,7 @@ impl Effect {
             width: 0.0,
             hot: false,
             inkless: false,
+            paint: false,
             front: false,
         }
     }
@@ -434,6 +475,8 @@ impl Effect {
             hot: false,
             // A decal has no side; an ink rim would draw a 3D tube around it.
             inkless: true,
+            // Blood belongs to the rock, not to a screen-space sprite layer.
+            paint: true,
             front: false,
         }
     }
@@ -452,6 +495,26 @@ impl Effect {
             width: 0.0,
             hot: true,
             inkless: true,
+            paint: false,
+            front: false,
+        }
+    }
+
+    /// A hot segment of the groove the sweep carved. It has no motion: it just
+    /// cools in place for a couple of seconds.
+    fn scar(from: Vec3, to: Vec3) -> Effect {
+        Effect {
+            shape: Shape::Scar { from, to },
+            colour: Vec3::ONE,
+            vel: Vec3::ZERO,
+            gravity: 0.0,
+            age: 0.0,
+            life: 2.0,
+            burst: false,
+            width: 0.0,
+            hot: true,
+            inkless: true,
+            paint: false,
             front: false,
         }
     }
@@ -522,6 +585,25 @@ fn draw_effects<'a>(iter: impl Iterator<Item = &'a Effect>, out: &mut Vec<DrawPr
                     DrawPrim::capsule(a, b, *radius * 0.80 * dry.max(0.35), colour, false),
                     e,
                 ));
+            }
+            Shape::Scar { from, to } => {
+                // Orange-hot, then red, then a dark cooling line. White is
+                // reserved for the crack itself; a full white groove reads as a
+                // laser drawn over the rock.
+                let hot = Vec3::new(0.88, 0.50, 0.28);
+                let colour = if u < 0.04 {
+                    hot
+                } else if u < 0.24 {
+                    hot.lerp(EMBER, (u - 0.04) / 0.20)
+                } else {
+                    EMBER.lerp(Vec3::new(0.12, 0.030, 0.075), ((u - 0.24) / 0.76).clamp(0.0, 1.0))
+                };
+                let width = 0.006 + 0.020 * (1.0 - u).powf(0.75);
+                out.push(
+                    DrawPrim::capsule(*from, *to, width, colour, false)
+                        .glowing()
+                        .inkless(),
+                );
             }
             Shape::Rock { at, radius } => {
                 // A lump, not a sphere: the two ends differ a little so the
@@ -613,44 +695,33 @@ impl Effects {
                 self.push_burst(Effect::burst(Shape::Ball { at: to, radius: 0.55 }, BEAM, 0.16).glow());
             }
             Event::Whip { from, dir, side, phase, length, style, .. } => {
-                // The lash itself is carried by the worm (see `worms.rs`), so
-                // the strike only needs to mark the crack: a hot flash at the
-                // tip and a few sparks thrown off the rock or the body it hit.
-                let points = whip_path(from, dir, side, phase, length, style);
+                // The lash itself is carried by the worm (see `worms.rs`). The
+                // event only marks the crack: a hot tip, a light and a handful
+                // of sparks. The ghosts and the sweep live in the worm's own
+                // animation, so they stay in step with the drawn lash.
+                let pose = WhipPose { dir, side, phase, length, sweep: 0.0, curl: 0.0, arch: 0.0, style };
+                let points = whip_path(from, pose);
                 let tip = points[WHIP_POINTS - 1];
-                self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.30, PLASMA_HOT, 0.15, 0.0).glow());
+                self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.24, PLASMA_HOT, 0.15, 0.0).glow());
                 self.push_light(tip, PLASMA, 9.0, 5.0, 0.28);
-                // The swing, drawn as a crescent of fading plasma. The sim only
-                // reports the pose at the end; replaying the sweep at a handful
-                // of bearings is what lets the player see the lash's reach.
-                for k in 0..11 {
-                    let s = k as f32 / 10.0;
-                    let ang = WHIP_SWEEP * (1.0 - 2.0 * s);
-                    let rot = glam::Quat::from_rotation_y(ang);
-                    let d = rot * dir;
-                    let sd = rot * side;
-                    let trail = whip_path(from, d, sd, phase, length, style);
-                    let t = trail[WHIP_POINTS - 1];
-                    let life = 0.38 - 0.16 * s;
-                    self.push_burst(
-                        Effect::puff(t, Vec3::ZERO, 0.13 + 0.04 * (1.0 - s), PLASMA, life, 0.0).glow(),
-                    );
-                    let mid = trail[WHIP_POINTS * 2 / 3];
-                    self.push_burst(
-                        Effect::puff(mid, Vec3::ZERO, 0.09, PLASMA, life * 0.8, 0.0).glow(),
-                    );
-                }
-                for i in 0..5 {                    let a = i as f32 * 2.399 + phase;
+                for i in 0..7 {
+                    let a = i as f32 * 2.399 + phase;
                     let spark = Vec3::new(a.cos(), 0.35 + 0.4 * (a * 1.7).sin().abs(), a.sin());
                     self.push_burst(Effect::puff(
                         tip,
-                        spark.normalize_or_zero() * (2.5 + i as f32 * 0.4),
-                        0.05,
+                        spark.normalize_or_zero() * (3.0 + i as f32 * 0.5),
+                        0.045,
                         PLASMA_HOT,
                         0.16,
                         9.0,
                     ).glow());
                 }
+            }
+            Event::Scar { from, to, .. } => {
+                // One short-lived hot segment per piece of the groove. They are
+                // core capsules, not sprites, so the heat follows the rock
+                // instead of floating in front of it.
+                self.push_burst(Effect::scar(from, to));
             }
             Event::Shot { weapon, pos, .. } => {
                 // A hot flash at the muzzle in the weapon's own colour (the
@@ -682,7 +753,11 @@ impl Effects {
             Event::Impact { weapon, pos, normal } => {
                 // A shot stopped against rock: sparks, a flash and a scorch.
                 // Most missed shots would otherwise be silent and invisible.
-                self.impact(weapon, pos, normal);
+                if weapon == WHIP {
+                    self.whip_crack(pos, normal);
+                } else {
+                    self.impact(weapon, pos, normal);
+                }
             }
             Event::Died { pos, .. } => {
                 self.push_burst(
@@ -915,6 +990,42 @@ impl Effects {
         }
     }
 
+    /// The plasma whip finding rock: not a muzzle flash but a crack. A white
+    /// core, a fan of straight rays in the surface plane, a shock ring and
+    /// sparks thrown along the wall. This is the reference's starburst.
+    fn whip_crack(&mut self, at: Vec3, normal: Vec3) {
+        let n = if normal.length_squared() > 1.0e-6 { normal.normalize() } else { Vec3::Y };
+        let (side, up) = plane_tangents(n);
+        let base = at + n * 0.06;
+        self.push_burst(Effect::puff(base, Vec3::ZERO, 0.62, Vec3::ONE, 0.16, 0.0).glow().front());
+        self.push_burst(Effect::puff(base, Vec3::ZERO, 0.30, PLASMA_HOT, 0.34, 0.0).glow().front());
+        self.push_light(base, PLASMA_HOT, 7.0, 7.0, 0.34);
+        let mut ring = Effect::ring(base, n, 1.6, PLASMA_HOT, 0.30);
+        ring.width = 0.9;
+        self.push_burst(ring);
+        for i in 0..10 {
+            let a = i as f32 * TAU / 10.0 + at.x * 0.7;
+            let dir = (side * a.cos() + up * a.sin()).normalize_or_zero();
+            let len = 0.55 + 0.55 * (i as f32 * 1.7).sin().abs();
+            let mut ray = Effect::burst(Shape::Line { from: base, to: base + dir * len }, PLASMA_HOT, 0.18);
+            ray.width = 0.020 + 0.012 * (i as f32 % 3.0);
+            self.push_burst(ray.glow());
+        }
+        for i in 0..12 {
+            let a = i as f32 * 2.399 + at.z;
+            let dir = (side * a.cos() + up * a.sin() + n * 0.5).normalize_or_zero();
+            self.push_burst(Effect::puff(
+                at + n * 0.03,
+                dir * (4.0 + i as f32 * 0.5),
+                0.035,
+                PLASMA_HOT,
+                0.13 + i as f32 * 0.012,
+                14.0,
+            ).glow());
+        }
+        self.scorch(at, n, 0.35, 0.85);
+    }
+
     /// A projectile ending on rock: a brief flash at the point of contact, a fan
     /// of sparks thrown along the surface, and a scorch mark left behind. The
     /// same signature as a body hit, so a blaster tick stays a tick.
@@ -956,6 +1067,9 @@ impl Effects {
             width: strength.clamp(0.0, 1.0),
             hot: false,
             inkless: true,
+            // A scorch stays a decal: soot already darkens blast craters, and
+            // only blood needs to be part of the ground.
+            paint: false,
             front: false,
         };
         self.push_splat(e);
@@ -1106,6 +1220,7 @@ impl Effects {
                 width: 0.0,
                 hot: false,
                 inkless: false,
+                paint: false,
                 front: false,
             });
         }
@@ -1226,14 +1341,16 @@ impl Effects {
     pub fn core_capsules(&self) -> Vec<DrawPrim> {
         let mut out = Vec::new();
         draw_effects(
-            self.list.iter().filter(|e| matches!(&e.shape, Shape::Line { .. } | Shape::Rock { .. })),
+            self.list.iter().filter(|e| {
+                matches!(&e.shape, Shape::Line { .. } | Shape::Rock { .. } | Shape::Scar { .. })
+            }),
             &mut out,
         );
         out
     }
 
     /// The cosmetic pool: the in-flight blood droplets (solid red beads). The
-    /// stains that land are now surface decals, not SDF lozenges.
+    /// stains that land are terrain paint (`Stain`), not capsules or sprites.
     pub fn blood_capsules(&self) -> Vec<DrawPrim> {
         let mut out = Vec::with_capacity(self.blood.len());
         draw_effects(self.blood.iter(), &mut out);
@@ -1275,10 +1392,20 @@ impl Effects {
             }
         }
         let mut decals = Vec::new();
+        let mut stains = Vec::new();
         for e in &self.splats {
-            if let Some(d) = decal_sprite(e) {
+            if e.paint {
+                if let Some(s) = stain(e) {
+                    stains.push(s);
+                }
+            } else if let Some(d) = decal_sprite(e) {
                 decals.push(d);
             }
+        }
+        // Newest wins when the paint pool is full: a hit's fresh wound matters
+        // more than the oldest mark on the floor.
+        if stains.len() > crate::renderer::MAX_STAINS {
+            stains.drain(..stains.len() - crate::renderer::MAX_STAINS);
         }
         // The eight strongest lights. A busy fight can have more events than
         // the shader has slots; the biggest blasts win, which is what the eye
@@ -1298,7 +1425,7 @@ impl Effects {
             .filter(|s| s.now() > 0.01)
             .map(|s| Soot::new(s.at, s.radius, s.now()))
             .collect();
-        Sprites { glow, smoke, decals, lights, soot }
+        Sprites { glow, smoke, decals, stains, lights, soot }
     }
 
     /// Everything, for tests that do not care about the pools.
@@ -1361,6 +1488,7 @@ pub struct Sprites {
     pub glow: Vec<Sprite>,
     pub smoke: Vec<Sprite>,
     pub decals: Vec<Sprite>,
+    pub stains: Vec<Stain>,
     pub lights: Vec<Light>,
     pub soot: Vec<Soot>,
 }
@@ -1424,7 +1552,14 @@ fn ball_sprite(e: &Effect, glow: bool) -> Option<Sprite> {
 fn line_sprite(e: &Effect) -> Option<Sprite> {
     let Shape::Line { from, to } = &e.shape else { return None };
     let mid = (*from + *to) * 0.5;
-    let radius = (e.width + (*to - *from).length() * 0.5).max(0.08);
+    // A hot trail is a thin comet tail. This sprite is a round blob, so its
+    // size has to come from the trail's thickness, not from how far the
+    // projectile moved this tick: adding half the segment length made a fast
+    // bolt's wake a ~2 m bubble that swallowed the bolt itself, and the player
+    // saw a soft lamp hanging at the crosshair instead of a shot leaving the
+    // gun. Smoke is different: it billows, so a big fast puff is right.
+    let span = (*to - *from).length();
+    let radius = if e.hot { (e.width * 2.2).max(0.08) } else { (e.width + span * 0.5).max(0.08) };
     let u = (e.age / e.life).clamp(0.0, 1.0);
     let alpha = if e.hot { (1.0 - u).powf(1.5) } else { (1.0 - u).powf(1.6) * 0.55 };
     if alpha <= 0.01 {
@@ -1454,8 +1589,23 @@ fn ring_sprite(e: &Effect) -> Option<Sprite> {
 }
 
 
-/// A stain lying on a surface: blood or a scorch mark. It holds full strength
-/// for most of its life, then dries out (fades) at the end.
+/// A blood stain as paint for the terrain's albedo. It holds full strength for
+/// most of its life, then dries out (fades) at the end, like the old decal.
+fn stain(e: &Effect) -> Option<Stain> {
+    let Shape::Splat { at, normal, radius } = &e.shape else { return None };
+    let u = (e.age / e.life).clamp(0.0, 1.0);
+    let strength = (1.0 - ((u - 0.7) / 0.3).clamp(0.0, 1.0)).clamp(0.0, 1.0) * 0.95 * e.width.clamp(0.0, 1.0);
+    if strength <= 0.01 {
+        return None;
+    }
+    let seed = at.x * 2.3 + at.z * 1.7 + normal.y * 3.1;
+    // Fresh blood is bright red; it dries to a darker maroon as it ages.
+    let colour = e.colour.lerp(BLOOD_DARK, u * 0.65);
+    Some(Stain::new(*at, *normal, *radius, colour, strength, seed))
+}
+
+/// A scorch mark lying on a surface. It holds full strength for most of its
+/// life, then dries out (fades) at the end.
 fn decal_sprite(e: &Effect) -> Option<Sprite> {
     let Shape::Splat { at, normal, radius } = &e.shape else { return None };
     let u = (e.age / e.life).clamp(0.0, 1.0);
@@ -1489,12 +1639,25 @@ mod tests {
         e.sprites().decals.len()
     }
 
-    /// The `a` endpoint of a puff (all effect primitives are capsules).
-    fn a_of(c: &DrawPrim) -> Vec3 {
-        match *c {
-            DrawPrim::Capsule { a, .. } | DrawPrim::Cylinder { a, .. } => a,
-            DrawPrim::Cuboid { centre, .. } => centre,
-        }
+    fn stain_count(e: &Effects) -> usize {
+        e.sprites().stains.len()
+    }
+
+    #[test]
+    fn a_fast_trail_stays_narrower_than_the_bolt_it_follows() {
+        // Regression: a trail sprite used to take half the distance flown in
+        // one tick as its radius. A blaster bolt moves 1.4 m a tick, so each
+        // puff became a ~1 m glowing bubble that swallowed the projectile and
+        // read as a lamp hanging at the crosshair.
+        let mut e = Effect::burst(
+            Shape::Line { from: Vec3::ZERO, to: Vec3::Z * 1.8 },
+            CYAN,
+            0.6,
+        );
+        e.width = 0.055;
+        e.hot = true;
+        let sprite = line_sprite(&e).expect("a trail sprite");
+        assert!(sprite.a[3] < 0.25, "the wake is a thin streak, not a bubble: {}", sprite.a[3]);
     }
 
     #[test]
@@ -1549,7 +1712,8 @@ mod tests {
         e.update(1.2);
         assert!(e.blood.is_empty(), "the droplets have fallen");
         assert!(!e.splats.is_empty(), "the stains remain");
-        assert!(decal_count(&e) >= 10, "the stains are painted as decals: {}", decal_count(&e));
+        assert!(stain_count(&e) >= 10, "the stains paint the rock: {}", stain_count(&e));
+        assert_eq!(decal_count(&e), 0, "blood is terrain paint, not a decal sprite");
     }
 
     #[test]
@@ -1574,6 +1738,7 @@ mod tests {
         }
         assert!(e.blood.len() <= MAX_BLOOD, "droplets are capped: {}", e.blood.len());
         assert!(e.splats.len() <= MAX_SPLATS, "stains are capped: {}", e.splats.len());
+        assert!(stain_count(&e) <= crate::renderer::MAX_STAINS, "paint is capped: {}", stain_count(&e));
     }
 
     #[test]
@@ -1654,12 +1819,13 @@ mod tests {
     #[test]
     fn the_aim_aid_draws_dots_and_a_landing_ring() {
         let path = AimPath {
-            points: (0..10).map(|k| Vec3::new(0.0, 2.0 - k as f32 * 0.2, k as f32 * 1.5)).collect(),
-            hit: Some(Vec3::new(0.0, 0.0, 13.5)),
+            points: (0..10).map(|k| Vec3::new(0.0, 4.0 - k as f32 * 0.2, k as f32 * 1.5)).collect(),
+            hit: Some(Vec3::new(0.0, 2.0, 13.5)),
             normal: Vec3::Y,
             ..Default::default()
         };
-        let prims = trajectory(&path);
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
+        let prims = trajectory(&path, &grid);
         assert!(prims.len() >= 12, "dots plus a ring: {}", prims.len());
         for p in &prims {
             match *p {
@@ -1672,10 +1838,28 @@ mod tests {
     }
 
     #[test]
+    fn the_aim_aid_sits_proud_of_the_rock() {
+        // Regression: markers placed exactly on the surface had their lower half
+        // inside it, so the landing ring read as a few disconnected flecks.
+        let at = Vec3::new(0.0, 2.0, 10.0);
+        let blast = AimPath { hit: Some(at), normal: Vec3::Y, blast: 3.0, ..Default::default() };
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
+        let prims = trajectory(&blast, &grid);
+        let mut lowest = f32::INFINITY;
+        for p in &prims {
+            if let DrawPrim::Capsule { a, .. } = *p {
+                lowest = lowest.min(a.y);
+            }
+        }
+        assert!(lowest > 2.0, "nothing is buried in the ground: {lowest}");
+    }
+
+    #[test]
     fn the_aim_aid_scales_the_ring_to_the_blast_and_draws_a_bounce_stub() {
-        let at = Vec3::new(0.0, 0.0, 10.0);
+        let at = Vec3::new(0.0, 2.0, 10.0);
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
         let blast = AimPath { hit: Some(at), normal: Vec3::Y, blast: 8.0, ..Default::default() };
-        let prims = trajectory(&blast);
+        let prims = trajectory(&blast, &grid);
         assert_eq!(prims.len(), 13, "a ring and its centre dot, no arc");
         let far = prims
             .iter()
@@ -1692,8 +1876,23 @@ mod tests {
             bounce: Some((at, at + Vec3::Z * 2.0)),
             ..Default::default()
         };
-        let prims = trajectory(&bounce);
+        let prims = trajectory(&bounce, &grid);
         assert!(prims.len() >= 15, "a ring and a 2 m stub: {}", prims.len());
+    }
+
+    #[test]
+    fn a_plasma_scar_burns_then_cools_away() {
+        let mut e = Effects::default();
+        e.add(&Event::Scar {
+            from: Vec3::new(-2.0, 2.0, 0.0),
+            to: Vec3::new(2.0, 2.0, 0.0),
+            normal: Vec3::Y,
+        });
+        assert!(!e.capsules().is_empty(), "the groove glows at first");
+        e.update(1.0);
+        assert!(!e.capsules().is_empty(), "and is still cooling a second later");
+        e.update(1.2);
+        assert!(e.capsules().is_empty(), "then the heat is gone");
     }
 
     #[test]

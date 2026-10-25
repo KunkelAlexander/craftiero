@@ -14,6 +14,10 @@ fn f(x: f32) -> String {
     format!("{x:?}") // {:?} keeps the ".0" that WGSL needs on float literals
 }
 
+fn vec3(v: glam::Vec3) -> String {
+    format!("vec3<f32>({}, {}, {})", f(v.x), f(v.y), f(v.z))
+}
+
 /// The uniform block with the capsule/tile counts pasted in from the renderer,
 /// so the WGSL can never disagree with the CPU about how many there are.
 fn uniforms() -> String {
@@ -21,15 +25,25 @@ fn uniforms() -> String {
     COMMON_UNIFORMS
         .replace("$WORMS", &crate::renderer::MAX_WORMS.to_string())
         .replace("$CAPS", &MAX_PRIMS.to_string())
+        .replace("$STAINS", &crate::renderer::MAX_STAINS.to_string())
         .replace("$TILES", &(crate::renderer::TILE_WORDS * groups).to_string())
         .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
         .replace("$GROUPS", &groups.to_string())
 }
 
+/// The shared worm sculpt with its rest-pose hands pasted in. The hand numbers
+/// live in `worms.rs`, where the animation and the gun use them, so the sheet
+/// and the game cannot disagree.
+pub fn sculpt() -> String {
+    WORM_SCULPT
+        .replace("$HAND_R", &vec3(crate::worms::SDF_HAND_R))
+        .replace("$HAND_L", &vec3(crate::worms::SDF_HAND_L))
+}
+
 pub fn march(world_chunks: IVec3) -> String {
     let dims = (world_chunks * sdf::CHUNK).as_vec3();
     let metres = dims * sdf::VOX;
-    format!("{}{WORM_SDF}{MARCH}", uniforms())
+    format!("{}{}{WORM_TRACE}{MARCH}", uniforms(), sculpt())
         .replace("$VOX", &f(sdf::VOX))
         .replace("$BAND", &f(sdf::BAND))
         .replace("$CHUNK_M", &f(sdf::CHUNK as f32 * sdf::VOX))
@@ -76,6 +90,14 @@ struct Soot {
     b: vec4<f32>,           // x: strength 0..1
 }
 
+// A blood stain painted into the terrain's albedo. Must match `Stain` in
+// renderer.rs.
+struct Stain {
+    a: vec4<f32>,           // xyz: centre on the surface, w: radius
+    b: vec4<f32>,           // rgb: colour (sRGB), w: strength 0..1
+    c: vec4<f32>,           // xyz: surface normal, w: noise seed
+}
+
 // One worm body, evaluated as a signed distance field. Must match `GpuWorm`
 // in renderer.rs. The sculpt is duplicated from `worm_preview.rs`, where the
 // studio sheet is rendered; the body there is the source of truth.
@@ -99,10 +121,11 @@ struct U {
     brush: vec4<f32>,       // xyz: centre, w: radius (0 = no brush)
     flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
-    counts: vec4<f32>,      // x: number of capsules in use, y: shadow casters (the first y)
+    counts: vec4<f32>,      // x: capsules in use, y: shadow casters (the first y), z: stains
     fx: vec4<f32>,          // x: screen flash 0..1, y: world desaturation 0..1 (zw free)
     lights: array<Light, 8>,
     soot: array<Soot, 8>,
+    stains: array<Stain, $STAINS>,
     worms: array<Worm, $WORMS>,
     caps: array<Prim, $CAPS>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
@@ -146,38 +169,41 @@ fn vnoise3(p: vec3<f32>) -> f32 {
 }
 "#;
 
-const WORM_SDF: &str = r#"
-// --- the worm body ---------------------------------------------------------
-//
-// This is the game copy of the sculpt in `worm_preview.rs` (the sheet in
-// screenshots/worm_sdf_sheet.png). The local frame is the model frame: x right,
-// y up from the feet, z forward. The CPU maps it through the animation rig, so
-// the same body leans, flips, squashes and gets hit like the capsules did.
-//
-// Keep the numbers in sync with the preview: it exists so this can be judged
-// from eight angles before it is wired in.
-
-fn w_smin(a: f32, b: f32, k: f32) -> f32 {
+/// The worm's body, shared by the game's march shader and the studio sheet in
+/// `worm_preview.rs`. One signed distance field: a tapered spine, a head with a
+/// snout and a cut grin, a curling tail, and two arms around the hands. Because
+/// both shaders include this one copy, the sheet always shows the body that
+/// ships.
+///
+/// Local frame: x right, y up from the feet, z forward. The game maps it through
+/// the animation rig, so the same body leans, flips, squashes and takes a hit.
+/// The hands are parameters: the sheet passes the rest pose, the game passes the
+/// animated hands from `Worm`.
+pub const WORM_SCULPT: &str = r#"
+fn worm_smin(a: f32, b: f32, k: f32) -> f32 {
     let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-fn w_smax(a: f32, b: f32, k: f32) -> f32 {
-    return -w_smin(-a, -b, k);
+fn worm_smax(a: f32, b: f32, k: f32) -> f32 {
+    return -worm_smin(-a, -b, k);
 }
 
-fn w_sphere(p: vec3<f32>, c: vec3<f32>, r: f32) -> f32 {
+fn worm_sphere(p: vec3<f32>, c: vec3<f32>, r: f32) -> f32 {
     return length(p - c) - r;
 }
 
-fn w_ellipsoid(p: vec3<f32>, c: vec3<f32>, r: vec3<f32>) -> f32 {
+// A good approximation, not an exact distance: step under it in `w_trace`.
+fn worm_ellipsoid(p: vec3<f32>, c: vec3<f32>, r: vec3<f32>) -> f32 {
     let q = (p - c) / r;
     let k0 = length(q);
     let k1 = length(q / r);
     return k0 * (k0 - 1.0) / max(k1, 1.0e-6);
 }
 
-fn w_round_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r1: f32, r2: f32) -> f32 {
+// Inigo Quilez's exact round cone: the workhorse for every tapered limb, the
+// spine and the snout. Two radii and a segment are enough to describe a worm.
+fn worm_round_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r1: f32, r2: f32) -> f32 {
     let ba = b - a;
     let l2 = dot(ba, ba);
     let rr = r1 - r2;
@@ -195,116 +221,132 @@ fn w_round_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r1: f32, r2: f32) -> f
     return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
 }
 
-const W_EYE_L = vec3<f32>(-0.175, 1.300, 0.520);
-const W_EYE_R = vec3<f32>( 0.175, 1.300, 0.520);
-const W_EYE_RADIUS: f32 = 0.062;
-const W_NOSTRIL_L = vec3<f32>(-0.033, 1.180, 0.735);
-const W_NOSTRIL_R = vec3<f32>( 0.033, 1.180, 0.735);
+// The rest-pose hands, in model units. The game replaces them with the animated
+// hands, but the arms are built around the same pose, so the sheet and the game
+// agree. Pasted from `worms.rs`, which is where the animation uses them.
+const WORM_HAND_R = $HAND_R;
+const WORM_HAND_L = $HAND_L;
 
-fn w_mouth(p: vec3<f32>) -> f32 {
-    return w_ellipsoid(p, vec3<f32>(0.0, 1.100, 0.710), vec3<f32>(0.110, 0.040, 0.055));
+const WORM_EYE_L = vec3<f32>(-0.175, 1.300, 0.520);
+const WORM_EYE_R = vec3<f32>( 0.175, 1.300, 0.520);
+const WORM_EYE_RADIUS: f32 = 0.062;
+const WORM_NOSTRIL_L = vec3<f32>(-0.033, 1.180, 0.735);
+const WORM_NOSTRIL_R = vec3<f32>( 0.033, 1.180, 0.735);
+
+fn worm_mouth(p: vec3<f32>) -> f32 {
+    // A wide grin, cut into the snout. The lower lip below it hides the bottom
+    // of the ellipse; the tongue fills the middle.
+    return worm_ellipsoid(p, vec3<f32>(0.0, 1.100, 0.710), vec3<f32>(0.110, 0.040, 0.055));
 }
 
-fn w_tongue(p: vec3<f32>) -> f32 {
-    return w_ellipsoid(p, vec3<f32>(0.0, 1.082, 0.725), vec3<f32>(0.060, 0.018, 0.028));
+fn worm_tongue(p: vec3<f32>) -> f32 {
+    return worm_ellipsoid(p, vec3<f32>(0.0, 1.082, 0.725), vec3<f32>(0.060, 0.018, 0.028));
 }
 
-fn w_lower_lip(p: vec3<f32>) -> f32 {
-    return w_ellipsoid(p, vec3<f32>(0.0, 1.070, 0.710), vec3<f32>(0.088, 0.020, 0.038));
+fn worm_lower_lip(p: vec3<f32>) -> f32 {
+    return worm_ellipsoid(p, vec3<f32>(0.0, 1.070, 0.710), vec3<f32>(0.088, 0.020, 0.038));
 }
 
-fn w_socket(p: vec3<f32>) -> f32 {
-    var d = w_ellipsoid(p, W_EYE_L, vec3<f32>(0.078, 0.078, 0.070));
-    d = min(d, w_ellipsoid(p, W_EYE_R, vec3<f32>(0.078, 0.078, 0.070)));
+fn worm_socket(p: vec3<f32>) -> f32 {
+    var d = worm_ellipsoid(p, WORM_EYE_L, vec3<f32>(0.078, 0.078, 0.070));
+    d = min(d, worm_ellipsoid(p, WORM_EYE_R, vec3<f32>(0.078, 0.078, 0.070)));
     return d;
 }
 
-fn w_brow(p: vec3<f32>) -> f32 {
+fn worm_brow(p: vec3<f32>) -> f32 {
     // 12's grumpy brow: inner end high, outer end low.
-    var d = w_round_cone(p, vec3<f32>(-0.060, 1.365, 0.535), vec3<f32>(-0.250, 1.350, 0.485), 0.030, 0.020);
-    d = min(d, w_round_cone(p, vec3<f32>(0.060, 1.365, 0.535), vec3<f32>(0.250, 1.350, 0.485), 0.030, 0.020));
+    var d = worm_round_cone(p, vec3<f32>(-0.060, 1.365, 0.535), vec3<f32>(-0.250, 1.350, 0.485), 0.030, 0.020);
+    d = min(d, worm_round_cone(p, vec3<f32>(0.060, 1.365, 0.535), vec3<f32>(0.250, 1.350, 0.485), 0.030, 0.020));
     return d;
 }
 
-fn w_eyelid(p: vec3<f32>) -> f32 {
-    var d = w_ellipsoid(p, vec3<f32>(-0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062));
-    d = min(d, w_ellipsoid(p, vec3<f32>( 0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062)));
+fn worm_eyelid(p: vec3<f32>) -> f32 {
+    var d = worm_ellipsoid(p, vec3<f32>(-0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062));
+    d = min(d, worm_ellipsoid(p, vec3<f32>( 0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062)));
     return d;
 }
 
-fn w_arms(p: vec3<f32>, w: Worm) -> f32 {
+fn worm_arms(p: vec3<f32>, hand_r: vec3<f32>, hand_l: vec3<f32>) -> f32 {
     // The hands are the only moving parts: recoil and the whip pull the right
     // hand, and the arm follows. The left stays on the foregrip.
-    let hr = w.hand_r.xyz;
-    let hl = w.hand_l.xyz;
-    var d = w_round_cone(p, vec3<f32>(0.230, 0.980, 0.180), vec3<f32>(0.345, 0.910, 0.370), 0.098, 0.076);
-    d = w_smin(d, w_round_cone(p, vec3<f32>(0.345, 0.910, 0.370), hr + vec3<f32>(0.007, 0.007, -0.022), 0.076, 0.058), 0.018);
-    d = w_smin(d, w_sphere(p, hr, 0.086), 0.018);
+    let hr = hand_r;
+    let hl = hand_l;
+    var d = worm_round_cone(p, vec3<f32>(0.230, 0.980, 0.180), vec3<f32>(0.345, 0.910, 0.370), 0.098, 0.076);
+    d = worm_smin(d, worm_round_cone(p, vec3<f32>(0.345, 0.910, 0.370), hr + vec3<f32>(0.007, 0.007, -0.022), 0.076, 0.058), 0.018);
+    d = worm_smin(d, worm_sphere(p, hr, 0.086), 0.018);
 
-    var l = w_round_cone(p, vec3<f32>(-0.230, 0.980, 0.180), vec3<f32>(-0.335, 0.915, 0.375), 0.098, 0.076);
-    l = w_smin(l, w_round_cone(p, vec3<f32>(-0.335, 0.915, 0.375), hl + vec3<f32>(-0.015, 0.012, -0.012), 0.076, 0.055), 0.018);
-    l = w_smin(l, w_sphere(p, hl, 0.078), 0.018);
+    var l = worm_round_cone(p, vec3<f32>(-0.230, 0.980, 0.180), vec3<f32>(-0.335, 0.915, 0.375), 0.098, 0.076);
+    l = worm_smin(l, worm_round_cone(p, vec3<f32>(-0.335, 0.915, 0.375), hl + vec3<f32>(-0.015, 0.012, -0.012), 0.076, 0.055), 0.018);
+    l = worm_smin(l, worm_sphere(p, hl, 0.078), 0.018);
     return min(d, l);
 }
 
-fn w_map(p: vec3<f32>, w: Worm) -> f32 {
+fn worm_body(p: vec3<f32>, hand_r: vec3<f32>, hand_l: vec3<f32>) -> f32 {
     // Spine: hips on the ground, chest forward, head well in front. A C.
-    var d = w_round_cone(p, vec3<f32>(0.0, 0.280, -0.080), vec3<f32>(0.0, 0.520, 0.030), 0.220, 0.240);
-    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 0.520, 0.030), vec3<f32>(0.0, 0.800, 0.140), 0.240, 0.230), 0.055);
-    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 0.800, 0.140), vec3<f32>(0.0, 1.020, 0.260), 0.230, 0.180), 0.050);
-    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 1.020, 0.260), vec3<f32>(0.0, 1.120, 0.300), 0.180, 0.180), 0.035);
+    var d = worm_round_cone(p, vec3<f32>(0.0, 0.280, -0.080), vec3<f32>(0.0, 0.520, 0.030), 0.220, 0.240);
+    d = worm_smin(d, worm_round_cone(p, vec3<f32>(0.0, 0.520, 0.030), vec3<f32>(0.0, 0.800, 0.140), 0.240, 0.230), 0.055);
+    d = worm_smin(d, worm_round_cone(p, vec3<f32>(0.0, 0.800, 0.140), vec3<f32>(0.0, 1.020, 0.260), 0.230, 0.180), 0.050);
+    d = worm_smin(d, worm_round_cone(p, vec3<f32>(0.0, 1.020, 0.260), vec3<f32>(0.0, 1.120, 0.300), 0.180, 0.180), 0.035);
 
     // Skull, cheeks, snout.
-    d = w_smin(d, w_ellipsoid(p, vec3<f32>(0.0, 1.270, 0.350), vec3<f32>(0.250, 0.240, 0.240)), 0.038);
-    d = w_smin(d, w_sphere(p, vec3<f32>(-0.130, 1.210, 0.400), 0.130), 0.036);
-    d = w_smin(d, w_sphere(p, vec3<f32>( 0.130, 1.210, 0.400), 0.130), 0.036);
-    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 1.200, 0.410), vec3<f32>(0.0, 1.140, 0.640), 0.170, 0.090), 0.032);
-    d = w_smin(d, w_ellipsoid(p, vec3<f32>(0.0, 1.130, 0.680), vec3<f32>(0.090, 0.080, 0.075)), 0.022);
-    d = w_smin(d, w_ellipsoid(p, vec3<f32>(0.0, 1.020, 0.520), vec3<f32>(0.115, 0.060, 0.090)), 0.026);
-    d = w_smin(d, w_lower_lip(p), 0.015);
+    d = worm_smin(d, worm_ellipsoid(p, vec3<f32>(0.0, 1.270, 0.350), vec3<f32>(0.250, 0.240, 0.240)), 0.038);
+    d = worm_smin(d, worm_sphere(p, vec3<f32>(-0.130, 1.210, 0.400), 0.130), 0.036);
+    d = worm_smin(d, worm_sphere(p, vec3<f32>( 0.130, 1.210, 0.400), 0.130), 0.036);
+    d = worm_smin(d, worm_round_cone(p, vec3<f32>(0.0, 1.200, 0.410), vec3<f32>(0.0, 1.140, 0.640), 0.170, 0.090), 0.032);
+    d = worm_smin(d, worm_ellipsoid(p, vec3<f32>(0.0, 1.130, 0.680), vec3<f32>(0.090, 0.080, 0.075)), 0.022);
+    d = worm_smin(d, worm_ellipsoid(p, vec3<f32>(0.0, 1.020, 0.520), vec3<f32>(0.115, 0.060, 0.090)), 0.026);
+    d = worm_smin(d, worm_lower_lip(p), 0.015);
 
     // Sockets, grumpy brows, thin lids.
-    d = w_smax(d, -w_socket(p), 0.010);
-    d = w_smin(d, w_brow(p), 0.020);
-    d = w_smin(d, w_eyelid(p), 0.012);
+    d = worm_smax(d, -worm_socket(p), 0.010);
+    d = worm_smin(d, worm_brow(p), 0.020);
+    d = worm_smin(d, worm_eyelid(p), 0.012);
 
     // Cut grin with a tongue.
-    d = w_smax(d, -w_mouth(p), 0.011);
-    d = min(d, w_tongue(p));
+    d = worm_smax(d, -worm_mouth(p), 0.011);
+    d = min(d, worm_tongue(p));
 
     // Tail: lies on the ground and curls up at the tip.
-    var t = w_round_cone(p, vec3<f32>(0.0, 0.280, -0.100), vec3<f32>(0.050, 0.150, -0.320), 0.160, 0.110);
-    t = w_smin(t, w_round_cone(p, vec3<f32>(0.050, 0.150, -0.320), vec3<f32>(0.160, 0.090, -0.500), 0.110, 0.070), 0.028);
-    t = w_smin(t, w_round_cone(p, vec3<f32>(0.160, 0.090, -0.500), vec3<f32>(0.240, 0.080, -0.620), 0.070, 0.045), 0.022);
-    t = w_smin(t, w_round_cone(p, vec3<f32>(0.240, 0.080, -0.620), vec3<f32>(0.180, 0.120, -0.700), 0.045, 0.025), 0.018);
-    d = w_smin(d, t, 0.035);
-    d = w_smin(d, w_arms(p, w), 0.030);
+    var t = worm_round_cone(p, vec3<f32>(0.0, 0.280, -0.100), vec3<f32>(0.050, 0.150, -0.320), 0.160, 0.110);
+    t = worm_smin(t, worm_round_cone(p, vec3<f32>(0.050, 0.150, -0.320), vec3<f32>(0.160, 0.090, -0.500), 0.110, 0.070), 0.028);
+    t = worm_smin(t, worm_round_cone(p, vec3<f32>(0.160, 0.090, -0.500), vec3<f32>(0.240, 0.080, -0.620), 0.070, 0.045), 0.022);
+    t = worm_smin(t, worm_round_cone(p, vec3<f32>(0.240, 0.080, -0.620), vec3<f32>(0.180, 0.120, -0.700), 0.045, 0.025), 0.018);
+    d = worm_smin(d, t, 0.035);
+    d = worm_smin(d, worm_arms(p, hand_r, hand_l), 0.030);
 
     // Eyes: hard union, so they stay round in their sockets.
-    d = min(d, w_sphere(p, W_EYE_L, W_EYE_RADIUS));
-    d = min(d, w_sphere(p, W_EYE_R, W_EYE_RADIUS));
+    d = min(d, worm_sphere(p, WORM_EYE_L, WORM_EYE_RADIUS));
+    d = min(d, worm_sphere(p, WORM_EYE_R, WORM_EYE_RADIUS));
     return d;
 }
 
-fn w_normal(p: vec3<f32>, w: Worm) -> vec3<f32> {
+fn worm_normal(p: vec3<f32>, hand_r: vec3<f32>, hand_l: vec3<f32>) -> vec3<f32> {
     let e = 0.0015;
     return normalize(vec3<f32>(
-        w_map(p + vec3<f32>(e, 0.0, 0.0), w) - w_map(p - vec3<f32>(e, 0.0, 0.0), w),
-        w_map(p + vec3<f32>(0.0, e, 0.0), w) - w_map(p - vec3<f32>(0.0, e, 0.0), w),
-        w_map(p + vec3<f32>(0.0, 0.0, e), w) - w_map(p - vec3<f32>(0.0, 0.0, e), w),
+        worm_body(p + vec3<f32>(e, 0.0, 0.0), hand_r, hand_l) - worm_body(p - vec3<f32>(e, 0.0, 0.0), hand_r, hand_l),
+        worm_body(p + vec3<f32>(0.0, e, 0.0), hand_r, hand_l) - worm_body(p - vec3<f32>(0.0, e, 0.0), hand_r, hand_l),
+        worm_body(p + vec3<f32>(0.0, 0.0, e), hand_r, hand_l) - worm_body(p - vec3<f32>(0.0, 0.0, e), hand_r, hand_l),
     ));
 }
 
-fn w_colour(p: vec3<f32>, n: vec3<f32>, w: Worm) -> vec3<f32> {
-    let skin = w.skin.rgb;
-    let skin_dark = skin * 0.84;
-    let belly = mix(skin, vec3<f32>(1.0, 0.93, 0.82), 0.55);
-
-    // Black bead eyes, one catchlight.
-    let dl = length(p - W_EYE_L);
-    let dr = length(p - W_EYE_R);
-    if (min(abs(dl - W_EYE_RADIUS), abs(dr - W_EYE_RADIUS)) < 0.003) {
-        let c = select(W_EYE_R, W_EYE_L, dl < dr);
+// The skin is a parameter so the sheet can keep its fixed colour and the game
+// can use the player's. The dark and belly tints are passed separately: the
+// game derives them from the skin, the sheet uses its own palette.
+fn worm_skin(
+    p: vec3<f32>,
+    n: vec3<f32>,
+    skin: vec3<f32>,
+    skin_dark: vec3<f32>,
+    belly: vec3<f32>,
+    hand_r: vec3<f32>,
+    hand_l: vec3<f32>,
+) -> vec3<f32> {
+    // Black bead eyes, one catchlight. That is the Liero read; big white
+    // human eyes made the model a baby.
+    let dl = length(p - WORM_EYE_L);
+    let dr = length(p - WORM_EYE_R);
+    if (min(abs(dl - WORM_EYE_RADIUS), abs(dr - WORM_EYE_RADIUS)) < 0.003) {
+        let c = select(WORM_EYE_R, WORM_EYE_L, dl < dr);
         let dir = normalize(p - c);
         let hl = normalize(vec3<f32>(-0.35, 0.55, 0.75));
         if (dot(dir, hl) > 0.940) { return vec3<f32>(1.0); }
@@ -312,8 +354,8 @@ fn w_colour(p: vec3<f32>, n: vec3<f32>, w: Worm) -> vec3<f32> {
     }
 
     // Cut grin: dark inside, with the tongue.
-    if (w_mouth(p) < 0.018) {
-        if (w_tongue(p) < 0.006) { return vec3<f32>(0.93, 0.42, 0.45); }
+    if (worm_mouth(p) < 0.018) {
+        if (worm_tongue(p) < 0.006) { return vec3<f32>(0.93, 0.42, 0.45); }
         return vec3<f32>(0.30, 0.075, 0.095);
     }
 
@@ -324,24 +366,55 @@ fn w_colour(p: vec3<f32>, n: vec3<f32>, w: Worm) -> vec3<f32> {
     let belly_m = belly_x * belly_y;
     c = mix(c, belly, belly_m);
 
+    // Faint segment bands on the belly only: a worm cue with no extra geometry.
     let band = abs(fract((p.y - 0.25) * 5.5) - 0.5);
     let crease = smoothstep(0.40, 0.47, band) * belly_m;
     c = mix(c, belly * 0.88, crease * 0.55);
 
+    // Four or five shallow rings down the body and tail, perpendicular to the
+    // spine. Without them the long body reads as a slug.
     let seg = abs(fract((p.y * 0.9 - p.z * 0.7) * 5.0) - 0.5);
     let ring = smoothstep(0.44, 0.49, seg) * smoothstep(1.02, 0.94, p.y);
     c *= 1.0 - 0.10 * ring * (1.0 - belly_m);
 
+    // A lighter underside on the snout, and two dark nostrils at the tip.
     let muzzle = smoothstep(1.25, 1.16, p.y) * smoothstep(0.48, 0.58, p.z) * smoothstep(0.94, 1.01, p.y);
     c = mix(c, belly, muzzle * 0.60);
-    if ((length(p - W_NOSTRIL_L) < 0.013 || length(p - W_NOSTRIL_R) < 0.013) && p.z > 0.690) {
+    if ((length(p - WORM_NOSTRIL_L) < 0.013 || length(p - WORM_NOSTRIL_R) < 0.013) && p.z > 0.690) {
         c = vec3<f32>(0.70, 0.27, 0.25);
     }
-    if (w_brow(p) < 0.010) { c *= 0.86; }
-    if (w_eyelid(p) < 0.008) { c *= 0.94; }
-    if (w_arms(p, w) < 0.008 && p.z > 0.55) { c = mix(c, skin_dark, 0.45); }
+    if (worm_brow(p) < 0.010) { c *= 0.86; }
+    if (worm_eyelid(p) < 0.008) { c *= 0.94; }
+    // Hands read as separate masses through value, not seams.
+    if (worm_arms(p, hand_r, hand_l) < 0.008 && p.z > 0.55) { c = mix(c, skin_dark, 0.45); }
     if (p.y < 0.10) { c = mix(c, skin_dark, 0.25); }
     return c;
+}
+"#;
+
+// The game's view of the shared sculpt: the hands come from the per-worm
+// uniform, and the skin colour is the player's. Everything else (the body, the
+// face, the material) is `WORM_SCULPT`, so the studio sheet cannot drift from
+// what ships.
+const WORM_TRACE: &str = r#"
+fn w_map(p: vec3<f32>, w: Worm) -> f32 {
+    return worm_body(p, w.hand_r.xyz, w.hand_l.xyz);
+}
+
+fn w_normal(p: vec3<f32>, w: Worm) -> vec3<f32> {
+    return worm_normal(p, w.hand_r.xyz, w.hand_l.xyz);
+}
+
+fn w_colour(p: vec3<f32>, n: vec3<f32>, w: Worm) -> vec3<f32> {
+    let skin = w.skin.rgb;
+    return worm_skin(
+        p,
+        n,
+        skin,
+        skin * 0.84,
+        mix(skin, vec3<f32>(1.0, 0.93, 0.82), 0.55),
+        w.hand_r.xyz,
+        w.hand_l.xyz);
 }
 
 // The world -> model transform. The CPU bakes the rig and the model's 1.8 m
@@ -698,6 +771,36 @@ fn soot_at(p: vec3<f32>) -> f32 {
     return min(s, 1.0);
 }
 
+// Blood painted into the rock. A stain is a disc lying on the surface, not a
+// ball in space: only terrain within a few centimetres of its plane is
+// coloured, so a stain behind a bump cannot paint the bump red.
+// Returns premultiplied linear colour in rgb and coverage in a; overlapping
+// stains composite front-to-back as paint would.
+fn stain_at(p: vec3<f32>) -> vec4<f32> {
+    var rgb = vec3<f32>(0.0);
+    var clear = 1.0;
+    for (var i = 0; i < i32(u.counts.z); i++) {
+        let S = u.stains[i];
+        if (S.b.w <= 0.002) { continue; }
+        let d = p - S.a.xyz;
+        // Cheap sphere reject before the surface-distance maths. A ground
+        // pixel is usually far from most stains, so this skips nearly all of
+        // the per-stain work for free.
+        if (dot(d, d) > S.a.w * S.a.w) { continue; }
+        let along = dot(d, S.c.xyz);
+        if (abs(along) > 0.20) { continue; }
+        let rr = length(d - S.c.xyz * along) / S.a.w;
+        if (rr >= 1.0) { continue; }
+        // The same ragged edge as the old decal, so a stain reads as a splat
+        // and not a perfect circle stamped on the floor.
+        let wob = vnoise3(d * 3.0 + vec3<f32>(S.c.w));
+        let a = smoothstep(1.0, 0.22, rr + (wob - 0.5) * 0.55) * S.b.w;
+        rgb += srgb(S.b.rgb) * a * clear;
+        clear *= 1.0 - a;
+    }
+    return vec4<f32>(rgb, 1.0 - clear);
+}
+
 // Three flat bands with a hair of smoothing so the edges do not alias.
 fn toon(x: f32) -> f32 {
     return smoothstep(0.0, 0.04, x) * 0.55 + smoothstep(0.42, 0.46, x) * 0.45;
@@ -855,6 +958,13 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             base = srgb(w_colour(pl, nl, wp));
             base = mix(base, srgb(vec3<f32>(1.0, 0.90, 0.90)), wp.skin.w);
         }
+        // Blood is part of the rock: paint the terrain's own albedo at the
+        // surface point, so the stain follows every bump and can never be
+        // hidden by the ground it lies on.
+        if (kind == 1) {
+            let stain = stain_at(p);
+            base = base * (1.0 - stain.a) + stain.rgb;
+        }
         // Fresh craters are burnt: darken the albedo wherever a recent blast
         // left soot. This follows the bowl's walls for free, which decals on a
         // plane cannot.
@@ -959,9 +1069,10 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
 const SPRITES: &str = r#"
 // Soft billboards and decals: camera-facing quads layered over the inked
 // picture. They are raster, not ray-marched, so a fireball is a soft sprite
-// instead of an opaque ball, and a blood stain is painted onto the rock instead
-// of floating above it. The G-buffer supplies depth (occlusion) and, for
-// decals, the exact surface point and normal.
+// instead of an opaque ball, and a scorch is painted onto the rock instead of
+// floating above it. The G-buffer supplies depth (occlusion) and, for decals,
+// the exact surface point and normal. Blood is not here: it is mixed into the
+// terrain's albedo in the march shader (see `stain_at`), so the ground owns it.
 struct Sprite {
     a: vec4<f32>, // xyz centre, w radius (metres)
     b: vec4<f32>, // rgb colour (sRGB), w opacity 0..1
@@ -1026,7 +1137,10 @@ fn vs_sprite(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
 // crater is erased wholesale by the near rim, even the part that should rise
 // above it.
 fn occlude(ndc: vec2<f32>, centre: vec3<f32>, radius: f32, soft: f32) -> f32 {
-    let px = (ndc * 0.5 + 0.5) * u.size.xy;
+    // NDC y points up, texture rows run down: flip y or every depth query reads
+    // the scene at the mirrored pixel (the foreground below the sprite) and
+    // hilariously hides it behind nothing.
+    let px = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * u.size.xy;
     let t_scene = textureLoad(gbuf_tex, vec2<i32>(floor(px)), 0).w;
     let rd = sprite_rd(ndc);
     let rel = centre - u.cam_pos.xyz;
@@ -1097,7 +1211,8 @@ fn fs_smoke(vin: VSOut) -> @location(0) vec4<f32> {
 fn fs_decal(vin: VSOut) -> @location(0) vec4<f32> {
     let s = sprites.data[vin.i];
     let ndc = vin.ndc;
-    let px = (ndc * 0.5 + 0.5) * u.size.xy;
+    // NDC y is up, texture rows run down (see `occlude`).
+    let px = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * u.size.xy;
     let g = textureLoad(gbuf_tex, vec2<i32>(floor(px)), 0);
     // Only paint onto solid surfaces: the sky keeps its far distance, and
     // inkless primitives mark their normal with -1.
@@ -1316,7 +1431,9 @@ mod tests {
         let groups = TILES_X * TILES_Y / 4;
         let u = uniforms();
         assert!(u.contains(&format!("array<Prim, {MAX_PRIMS}>")));
+        assert!(u.contains(&format!("array<Stain, {}>", crate::renderer::MAX_STAINS)));
         assert!(u.contains(&format!("array<vec4<u32>, {}>", TILE_WORDS * groups)));
+        assert!(!u.contains('$'), "every uniform placeholder is filled in");
         let m = march(glam::IVec3::splat(2));
         assert!(m.contains(&format!("vec2<f32>({TILES_X}.0, {TILES_Y}.0)")));
         assert!(m.contains(&format!("vec2<u32>({}u, {}u)", TILES_X - 1, TILES_Y - 1)));
@@ -1324,5 +1441,22 @@ mod tests {
         assert!(m.contains(&format!("w < {}u", TILE_WORDS)));
         assert!(m.contains(&format!("w * {}u", groups)));
         assert!(MAX_PRIMS % 32 == 0, "every word must be full");
+    }
+
+    // The whole point of the shared chunk: the studio sheet and the game compile
+    // the same body, not two copies that can drift. Also checks that the hand
+    // placeholders were pasted from the Rust constants before the GPU sees them.
+    #[test]
+    fn the_sheet_and_the_game_share_one_sculpt() {
+        let body = sculpt();
+        assert!(!body.contains('$'), "every placeholder is filled in");
+        assert!(body.contains(&vec3(crate::worms::SDF_HAND_R)));
+        assert!(body.contains(&vec3(crate::worms::SDF_HAND_L)));
+
+        let game = march(glam::IVec3::splat(2));
+        let sheet = crate::worm_preview::shader();
+        assert_eq!(game.matches(&body).count(), 1, "the game includes the sculpt once");
+        assert_eq!(sheet.matches(&body).count(), 1, "the sheet includes it once");
+        assert!(!sheet.contains("$SCULPT"), "the sheet placeholder is filled in");
     }
 }

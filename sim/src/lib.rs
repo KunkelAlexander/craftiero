@@ -24,7 +24,8 @@ pub mod world;
 
 pub use glam::{vec3, Vec3};
 pub use combat::{
-    whip_path, AimPath, Projectile, WhipStyle, MAX_HP, RESPAWN_TIME, WHIP_POINTS, WHIP_SWEEP,
+    whip_path, AimPath, Projectile, WhipPose, WhipStyle, MAX_HP, RESPAWN_TIME, WHIP_IDLE,
+    WHIP_POINTS, WHIP_SWEEP,
 };
 pub use input::Input;
 pub use weapons::{WeaponDef, WeaponState, ARSENAL, WEAPONS};

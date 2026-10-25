@@ -175,9 +175,12 @@ pub static WEAPONS: [WeaponDef; 13] = [
         blast_radius: 0.0,
         blast_damage: 0.0,
         knockback: 3.2,
-        // A blaster bolt now bites a small hole out of rock. It is the gun you
+        // A blaster bolt bites a visible crater out of rock. It is the gun you
         // always have, so it should be able to dig and shape, not just tickle.
-        terrain: 0.28,
+        // At 0.28 m the hole was barely wider than one voxel (0.25 m) and the
+        // rock looked untouched; 0.55 m leaves a hole you can actually see and
+        // widen with a burst.
+        terrain: 0.55,
         pellets: 1,
         gravity: 0.0,
         bounce: 0.0,
@@ -437,27 +440,29 @@ pub static WEAPONS: [WeaponDef; 13] = [
         damage: 44.0,
         speed: 0.0,
         lifetime: 0.0,
-        // A lash is a whole-body swing, not a flick of the wrist: a third of a
-        // second to draw it back (the tell), then the crack, then a long beat
-        // before the next. The old instant strike had no weight at all.
+        // A lash is a whole-body swing, not a flick of the wrist. The lash is
+        // always carried, so the wind-up only coils it: a short tell, then the
+        // crack, then a beat before the next swing. Holding the trigger keeps
+        // the whip swinging; it is melee, not a magazine.
         cooldown: 0.55,
-        mag: 15,
-        reload: 1.8,
+        mag: 0,
+        reload: 0.0,
         spread: 0.0,
-        // The lash reaches twelve metres. `terrain` is the radius of the groove
-        // it burns into whatever rock that length passes through.
-        range: 12.0,
+        // The carried lash is about six metres; a strike extends it to
+        // fourteen. `terrain` is the radius of the shallow groove it burns
+        // across whatever rock the sweep crosses.
+        range: 14.0,
         blast_radius: 0.0,
         blast_damage: 0.0,
         knockback: 18.0,
-        terrain: 0.32,
+        terrain: 0.30,
         pellets: 1,
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
-        // Draw the lash back before it cracks. The commitment is the point:
-        // step into range and accept that the swing is coming.
-        windup: 0.30,
+        // A short coil, not the old raised-over-the-shoulder draw. The lash is
+        // never put away, so the tell has to live in its shape, not in hiding it.
+        windup: 0.14,
         loft: 0.0,
     },
     // Not in anyone's arsenal: what the Cluster shell splits into.

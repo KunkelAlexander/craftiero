@@ -1,13 +1,13 @@
 // A studio for the worm's body, separate from the game.
 //
-// The game draws this same sculpt from `WORM_SDF` in `shaders.rs`; this file is
-// the authoring sheet. Keep the body constants in sync: the sheet is rendered
-// from eight angles before the shape is wired in, so a change belongs here
-// first, then in `WORM_SDF`.
+// The sculpt itself is `WORM_SCULPT` in `shaders.rs`, included by both this
+// sheet and the game's march shader. There is no second copy to keep in sync:
+// change the shared chunk and both the sheet and the game get the change.
 //
 // The point is to judge the sculpt before it is wired into the sim: one image
 // with eight yaws, shaded and in flat silhouette, at gameplay size and at the
-// size where a worm is a dozen pixels. No terrain, no gun code, no animation.
+// size where a worm is a dozen pixels. No terrain, no gameplay, no animation:
+// the gun is only here so the silhouette can be judged with it in the hand.
 // If the black shapes do not read here, no amount of shading will save them.
 //
 //   cargo run -p viewer --release -- --worm-preview --shot worm.png \
@@ -26,6 +26,10 @@ use bytemuck::{Pod, Zeroable};
 struct Uniforms {
     size: [f32; 2],
     _pad: [f32; 2],
+}
+
+pub(crate) fn shader() -> String {
+    SHADER.replace("$SCULPT", &crate::shaders::sculpt())
 }
 
 pub fn run(gpu: &Gpu, size: (u32, u32), path: &str) {
@@ -63,9 +67,10 @@ pub fn run(gpu: &Gpu, size: (u32, u32), path: &str) {
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
     });
 
+    let source = shader();
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("worm preview"),
-        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("worm preview"),
@@ -149,113 +154,25 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
 }
 
-// --- distances -------------------------------------------------------------
+$SCULPT
 
-fn smin(a: f32, b: f32, k: f32) -> f32 {
-    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-    return mix(b, a, h) - k * h * (1.0 - h);
-}
-
-fn smax(a: f32, b: f32, k: f32) -> f32 {
-    return -smin(-a, -b, k);
-}
-
-fn sd_sphere(p: vec3<f32>, c: vec3<f32>, r: f32) -> f32 {
-    return length(p - c) - r;
-}
-
-// A good approximation, not an exact distance: step under it in `trace`.
-fn sd_ellipsoid(p: vec3<f32>, c: vec3<f32>, r: vec3<f32>) -> f32 {
-    let q = (p - c) / r;
-    let k0 = length(q);
-    let k1 = length(q / r);
-    return k0 * (k0 - 1.0) / max(k1, 1.0e-6);
-}
-
-// Inigo Quilez's exact round cone: the workhorse for every tapered limb, the
-// spine and the snout. Two radii and a segment are enough to describe a worm.
-fn sd_round_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r1: f32, r2: f32) -> f32 {
-    let ba = b - a;
-    let l2 = dot(ba, ba);
-    let rr = r1 - r2;
-    let a2 = l2 - rr * rr;
-    let il2 = 1.0 / l2;
-
-    let pa = p - a;
-    let y = dot(pa, ba);
-    let z = y - l2;
-    let x2 = dot(pa * l2 - ba * y, pa * l2 - ba * y);
-    let y2 = y * y * l2;
-    let z2 = z * z * l2;
-
-    let k = sign(rr) * rr * rr * x2;
-    if (sign(z) * a2 * z2 > k) { return sqrt(x2 + z2) * il2 - r2; }
-    if (sign(y) * a2 * y2 < k) { return sqrt(x2 + y2) * il2 - r1; }
-    return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
-}
+// --- the held gun ----------------------------------------------------------
+//
+// The game draws its weapons as real primitives. The sheet includes one so the
+// silhouette can be judged with the gun in the hand.
 
 fn sd_box(p: vec3<f32>, c: vec3<f32>, h: vec3<f32>) -> f32 {
     let q = abs(p - c) - h;
     return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
-fn sd_capsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
-    let ba = b - a;
-    let h = clamp(dot(p - a, ba) / dot(ba, ba), 0.0, 1.0);
-    return length(p - a - ba * h) - r;
-}
-
-// --- the worm --------------------------------------------------------------
-
-const EYE_L = vec3<f32>(-0.175, 1.300, 0.520);
-const EYE_R = vec3<f32>( 0.175, 1.300, 0.520);
-const EYE_RADIUS: f32 = 0.062;
-const NOSTRIL_L = vec3<f32>(-0.033, 1.180, 0.735);
-const NOSTRIL_R = vec3<f32>( 0.033, 1.180, 0.735);
+// The gun sits in the right hand, which is `WORM_HAND_R` in the shared sculpt.
 const GUN_C = vec3<f32>(0.10, 0.96, 0.78);
-
-fn sd_mouth(p: vec3<f32>) -> f32 {
-    // A wide grin, cut into the snout. The lower lip below it hides the bottom
-    // of the ellipse; the tongue fills the middle.
-    return sd_ellipsoid(p, vec3<f32>(0.0, 1.100, 0.710), vec3<f32>(0.110, 0.040, 0.055));
-}
-
-fn sd_lower_lip(p: vec3<f32>) -> f32 {
-    return sd_ellipsoid(p, vec3<f32>(0.0, 1.070, 0.710), vec3<f32>(0.088, 0.020, 0.038));
-}
-
-fn sd_tongue(p: vec3<f32>) -> f32 {
-    return sd_ellipsoid(p, vec3<f32>(0.0, 1.082, 0.725), vec3<f32>(0.060, 0.018, 0.028));
-}
-
-fn sd_socket(p: vec3<f32>) -> f32 {
-    // A shallow hole for each eye, so the bead sits in the face instead of on
-    // it. The rim is what casts the dark line the brow sits over.
-    var d = sd_ellipsoid(p, EYE_L, vec3<f32>(0.078, 0.078, 0.070));
-    d = min(d, sd_ellipsoid(p, EYE_R, vec3<f32>(0.078, 0.078, 0.070)));
-    return d;
-}
-
-fn sd_brow(p: vec3<f32>) -> f32 {
-    // The grumpy brow from the upright pass: inner end high, outer end low.
-    // A skin ridge, not a painted line; it sits on the eye's top rim.
-    var d = sd_round_cone(p, vec3<f32>(-0.060, 1.365, 0.535), vec3<f32>(-0.250, 1.350, 0.485), 0.030, 0.020);
-    d = min(d, sd_round_cone(p, vec3<f32>(0.060, 1.365, 0.535), vec3<f32>(0.250, 1.350, 0.485), 0.030, 0.020));
-    return d;
-}
-
-fn sd_eyelid(p: vec3<f32>) -> f32 {
-    // A thin skin fold over the top of the eye. It narrows the bead into a
-    // glare without covering enough to make it sleepy.
-    var d = sd_ellipsoid(p, vec3<f32>(-0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062));
-    d = min(d, sd_ellipsoid(p, vec3<f32>( 0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062)));
-    return d;
-}
 
 fn sd_gun(p: vec3<f32>) -> f32 {
     var d = sd_box(p, GUN_C, vec3<f32>(0.075, 0.095, 0.130));
-    d = min(d, sd_round_cone(p, vec3<f32>(0.10, 0.96, 0.90), vec3<f32>(0.10, 0.96, 1.280), 0.045, 0.034));
-    d = min(d, sd_sphere(p, vec3<f32>(0.10, 0.96, 1.305), 0.055));
+    d = min(d, worm_round_cone(p, vec3<f32>(0.10, 0.96, 0.90), vec3<f32>(0.10, 0.96, 1.280), 0.045, 0.034));
+    d = min(d, worm_sphere(p, vec3<f32>(0.10, 0.96, 1.305), 0.055));
     d = min(d, sd_box(p, vec3<f32>(0.10, 0.835, 0.690), vec3<f32>(0.034, 0.095, 0.050)));
     d = min(d, sd_box(p, vec3<f32>(0.10, 0.865, 0.840), vec3<f32>(0.030, 0.055, 0.040)));
     d = min(d, sd_box(p, vec3<f32>(0.10, 1.058, 0.765), vec3<f32>(0.030, 0.012, 0.090)));
@@ -267,68 +184,11 @@ fn sd_cell(p: vec3<f32>) -> f32 {
     return sd_box(p, vec3<f32>(0.10, 1.074, 0.765), vec3<f32>(0.022, 0.005, 0.065));
 }
 
-fn sd_arms(p: vec3<f32>) -> f32 {
-    // Both hands sit on the weapon: the right on the grip, the left crossing to
-    // the foregrip. This is what stops the gun reading as a floating prop.
-    var d = sd_round_cone(p, vec3<f32>(0.230, 0.980, 0.180), vec3<f32>(0.345, 0.910, 0.370), 0.098, 0.076);
-    d = smin(d, sd_round_cone(p, vec3<f32>(0.345, 0.910, 0.370), vec3<f32>(0.115, 0.875, 0.660), 0.076, 0.058), 0.018);
-    d = smin(d, sd_sphere(p, vec3<f32>(0.108, 0.868, 0.682), 0.086), 0.018);
-
-    var l = sd_round_cone(p, vec3<f32>(-0.230, 0.980, 0.180), vec3<f32>(-0.335, 0.915, 0.375), 0.098, 0.076);
-    l = smin(l, sd_round_cone(p, vec3<f32>(-0.335, 0.915, 0.375), vec3<f32>(0.085, 0.882, 0.838), 0.076, 0.055), 0.018);
-    l = smin(l, sd_sphere(p, vec3<f32>(0.100, 0.870, 0.850), 0.078), 0.018);
-    return min(d, l);
-}
-
+// The body and the held gun. The body is the shared sculpt; the gun is only
+// here so the silhouette can be judged with it in the hand, because the game
+// draws its weapons as real primitives.
 fn map(p: vec3<f32>) -> f32 {
-    // Spine: the hips sit on the ground, the chest leans forward and the head
-    // is well in front of the tail. A C, not a column: this is the worm's shape.
-    var d = sd_round_cone(p, vec3<f32>(0.0, 0.280, -0.080), vec3<f32>(0.0, 0.520, 0.030), 0.220, 0.240);
-    d = smin(d, sd_round_cone(p, vec3<f32>(0.0, 0.520, 0.030), vec3<f32>(0.0, 0.800, 0.140), 0.240, 0.230), 0.055);
-    d = smin(d, sd_round_cone(p, vec3<f32>(0.0, 0.800, 0.140), vec3<f32>(0.0, 1.020, 0.260), 0.230, 0.180), 0.050);
-    d = smin(d, sd_round_cone(p, vec3<f32>(0.0, 1.020, 0.260), vec3<f32>(0.0, 1.120, 0.300), 0.180, 0.180), 0.035);
-
-    // Head: a skull with wide cheeks, tapering into a snout. The eyes sit on
-    // the sides of it, like a lizard's, instead of on a human face.
-    d = smin(d, sd_ellipsoid(p, vec3<f32>(0.0, 1.270, 0.350), vec3<f32>(0.250, 0.240, 0.240)), 0.038);
-    d = smin(d, sd_sphere(p, vec3<f32>(-0.130, 1.210, 0.400), 0.130), 0.036);
-    d = smin(d, sd_sphere(p, vec3<f32>( 0.130, 1.210, 0.400), 0.130), 0.036);
-
-    // The snout is a taper, not a ball. It is the shape the old model could
-    // never make: a forward wedge blended into the head.
-    d = smin(d, sd_round_cone(p, vec3<f32>(0.0, 1.200, 0.410), vec3<f32>(0.0, 1.140, 0.640), 0.170, 0.090), 0.032);
-    d = smin(d, sd_ellipsoid(p, vec3<f32>(0.0, 1.130, 0.680), vec3<f32>(0.090, 0.080, 0.075)), 0.022);
-    d = smin(d, sd_ellipsoid(p, vec3<f32>(0.0, 1.020, 0.520), vec3<f32>(0.115, 0.060, 0.090)), 0.026);
-    d = smin(d, sd_lower_lip(p), 0.015);
-
-    // Sockets, grumpy brows and a thin lid. These are the expression; the
-    // body underneath stays the shape of preview 8.
-    d = smax(d, -sd_socket(p), 0.010);
-    d = smin(d, sd_brow(p), 0.020);
-    d = smin(d, sd_eyelid(p), 0.012);
-
-    // A real cut grin. The cavity is what makes a face read; a raised dark bar
-    // (what the capsule worm had) never does.
-    d = smax(d, -sd_mouth(p), 0.011);
-    d = min(d, sd_tongue(p));
-
-    // A tapering tail rests on the ground and curls up at the tip: the worm's
-    // base, and the asymmetry that makes the back view readable.
-    var t = sd_round_cone(p, vec3<f32>(0.0, 0.280, -0.100), vec3<f32>(0.050, 0.150, -0.320), 0.160, 0.110);
-    t = smin(t, sd_round_cone(p, vec3<f32>(0.050, 0.150, -0.320), vec3<f32>(0.160, 0.090, -0.500), 0.110, 0.070), 0.028);
-    t = smin(t, sd_round_cone(p, vec3<f32>(0.160, 0.090, -0.500), vec3<f32>(0.240, 0.080, -0.620), 0.070, 0.045), 0.022);
-    t = smin(t, sd_round_cone(p, vec3<f32>(0.240, 0.080, -0.620), vec3<f32>(0.180, 0.120, -0.700), 0.045, 0.025), 0.018);
-    d = smin(d, t, 0.035);
-
-    d = smin(d, sd_arms(p), 0.030);
-
-    // Eyes are a hard union: they must stay spherical, with a crisp socket.
-    d = min(d, sd_sphere(p, EYE_L, EYE_RADIUS));
-    d = min(d, sd_sphere(p, EYE_R, EYE_RADIUS));
-
-    // The held gun is part of the silhouette, hard-edged against the soft body.
-    d = min(d, sd_gun(p));
-    return d;
+    return min(worm_body(p, WORM_HAND_R, WORM_HAND_L), sd_gun(p));
 }
 
 fn normal_at(p: vec3<f32>) -> vec3<f32> {
@@ -402,72 +262,19 @@ fn srgb(c: vec3<f32>) -> vec3<f32> {
 const SKIN = vec3<f32>(0.95, 0.44, 0.34);
 const SKIN_DARK = vec3<f32>(0.80, 0.32, 0.26);
 const BELLY = vec3<f32>(0.99, 0.80, 0.64);
-const PUPIL = vec3<f32>(0.045, 0.055, 0.085);
-const MOUTH_COL = vec3<f32>(0.30, 0.075, 0.095);
-const TONGUE_COL = vec3<f32>(0.93, 0.42, 0.45);
-const NOSE_COL = vec3<f32>(0.70, 0.27, 0.25);
 const GUNMETAL = vec3<f32>(0.28, 0.30, 0.38);
 const GUN_DARK = vec3<f32>(0.16, 0.17, 0.23);
 const CYAN = vec3<f32>(0.35, 0.92, 1.0);
 
 fn colour(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    // Eyes: small black beads on the sides of the snout, with one catchlight.
-    // That is the Liero read; big white human eyes made the model a baby.
-    let dl = length(p - EYE_L);
-    let dr = length(p - EYE_R);
-    if (min(abs(dl - EYE_RADIUS), abs(dr - EYE_RADIUS)) < 0.003) {
-        let c = select(EYE_R, EYE_L, dl < dr);
-        let dir = normalize(p - c);
-        let hl = normalize(vec3<f32>(-0.35, 0.55, 0.75));
-        if (dot(dir, hl) > 0.940) { return vec3<f32>(1.0); }
-        return PUPIL;
-    }
-
-    // The gun, including its cyan strip.
+    // The gun is preview-only, including its cyan strip.
     if (sd_gun(p) < 0.006) {
         if (sd_cell(p) < 0.004) { return CYAN; }
         if (p.z < 0.70 && p.y < 0.86) { return GUN_DARK; }
         return GUNMETAL;
     }
-
-    // The grin's cut is dark, with a small tongue in it.
-    if (sd_mouth(p) < 0.018) {
-        if (sd_tongue(p) < 0.006) { return TONGUE_COL; }
-        return MOUTH_COL;
-    }
-
-    var c = SKIN;
-    // Cream belly, painted by normal rather than built from another capsule.
-    let belly_x = smoothstep(0.30, 0.12, abs(p.x));
-    let belly_y = smoothstep(1.04, 0.94, p.y) * smoothstep(0.28, 0.62, n.z);
-    let belly = belly_x * belly_y;
-    c = mix(c, BELLY, belly);
-
-    // Faint segment bands on the belly only: a worm cue with no extra geometry.
-    let band = abs(fract((p.y - 0.25) * 5.5) - 0.5);
-    let crease = smoothstep(0.40, 0.47, band) * belly;
-    c = mix(c, BELLY * 0.88, crease * 0.55);
-
-    // Four or five shallow rings down the body and tail, perpendicular to the
-    // spine. Without them the long body reads as a slug.
-    let seg = abs(fract((p.y * 0.9 - p.z * 0.7) * 5.0) - 0.5);
-    let ring = smoothstep(0.44, 0.49, seg) * smoothstep(1.02, 0.94, p.y);
-    c *= 1.0 - 0.10 * ring * (1.0 - belly);
-
-    // A lighter underside on the snout, and two dark nostrils at the tip.
-    let muzzle = smoothstep(1.25, 1.16, p.y) * smoothstep(0.48, 0.58, p.z) * smoothstep(0.94, 1.01, p.y);
-    c = mix(c, BELLY, muzzle * 0.60);
-    if ((length(p - NOSTRIL_L) < 0.013 || length(p - NOSTRIL_R) < 0.013) && p.z > 0.690) {
-        c = NOSE_COL;
-    }
-    if (sd_brow(p) < 0.010) { c *= 0.86; }
-    if (sd_eyelid(p) < 0.008) { c *= 0.94; }
-
-    // Hands read as separate masses through value, not seams. The head keeps
-    // one continuous surface.
-    if (sd_arms(p) < 0.008 && p.z > 0.55) { c = mix(c, SKIN_DARK, 0.45); }
-    if (p.y < 0.10) { c = mix(c, SKIN_DARK, 0.25); }
-    return c;
+    // Eyes, grin, belly, bands and hands: the same material the game uses.
+    return worm_skin(p, n, SKIN, SKIN_DARK, BELLY, WORM_HAND_R, WORM_HAND_L);
 }
 
 fn toon(x: f32) -> f32 {
