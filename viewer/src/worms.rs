@@ -702,8 +702,8 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             // twist through it as it cracks. This is the "full strike": the
             // shoulder does the work, not the wrist.
             pose.lean += -0.22 * whip_cock + 0.28 * whip_strike;
-            pose.roll += 0.16 * whip_cock - 0.20 * whip_strike;
-            pose.twist += 0.20 * whip_cock - 0.24 * whip_strike;
+            pose.roll += 0.14 * whip_cock - 0.16 * whip_strike;
+            pose.twist += 0.16 * whip_cock - 0.16 * whip_strike;
             pose.wide *= 1.0 + 0.04 * whip_strike;
         }
 
@@ -1233,6 +1233,17 @@ mod tests {
         assert!(recoil_style(ROCKET).0 > recoil_style(BLASTER).0);
         assert!(recoil_style(BLASTER).0 > 0.0);
         assert_eq!(recoil_style(WHIP), (0.0, 0.0), "the swing is the recoil");
+    }
+
+    #[test]
+    fn a_whip_strike_is_a_draw_back_a_swing_and_a_recovery() {
+        assert_eq!(strike_body(0.0), 0.0, "the body starts cocked, not thrown");
+        let peak = strike_body(LASH_UNFURL + LASH_SWING);
+        assert!(peak > 0.95, "the strike peaks at the end of the swing: {peak}");
+        assert_eq!(strike_body(LASH_LIFE), 0.0, "and the follow-through is over");
+        // The beat matters: a strike that lands in one frame has no weight.
+        assert!(LASH_UNFURL + LASH_SWING > 0.25, "the swing takes a beat");
+        assert!(LASH_RECOVER > 0.20, "the follow-through takes one too");
     }
 
     #[test]

@@ -401,11 +401,7 @@ fn run_shot(cfg: &Config, path: &str) {
                 if weapon == WHIP {
                     // The strike lands after the draw-back; start its swing
                     // clock at the tick the sim would have fired it.
-                    anim.struck_at(
-                        WhipStyle::Sweep,
-                        0.0,
-                        elapsed - WEAPONS[WHIP as usize].windup,
-                    );
+                    anim.struck_at(WhipStyle::Sweep, 0.0, elapsed - WEAPONS[WHIP as usize].windup);
                 }
             }
         }
