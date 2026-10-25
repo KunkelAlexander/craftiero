@@ -539,7 +539,7 @@ impl World {
             }
             Kind::Beam => {
                 let dir = spread_dir(&mut self.rng, shot, def.spread);
-                self.fire_beam(i, def, muzzle, dir);
+                self.fire_beam(i, id, def, muzzle, dir);
             }
             // A lump is an ordinary terrain edit, so it needs no new rules,
             // drawing or network message: joiners learn about it from the same
@@ -558,7 +558,7 @@ impl World {
                 self.grid.apply(shape, op);
                 self.events.push(Event::Edit { shape, op });
             }
-            Kind::Whip => self.whip_strike(i, def, muzzle, shot),
+            Kind::Whip => self.whip_strike(i, id, def, muzzle, shot),
         }
     }
 
@@ -646,7 +646,7 @@ impl World {
     /// front; fired during the double jump it becomes an overhead smash that
     /// comes down in front. It damages every worm the lash passes close to and
     /// carves its own path into any rock it crosses.
-    fn whip_strike(&mut self, owner: usize, def: &WeaponDef, origin: Vec3, aim: Vec3) {
+    fn whip_strike(&mut self, owner: usize, weapon: u8, def: &WeaponDef, origin: Vec3, aim: Vec3) {
         let worm = &self.worms[owner];
         let style = if worm.action == Action::DoubleJump && !worm.on_ground {
             WhipStyle::Smash
@@ -706,7 +706,7 @@ impl World {
                     WhipStyle::Sweep => away,
                     WhipStyle::Smash => Vec3::new(away.x, -1.0, away.z).normalize_or_zero(),
                 };
-                self.damage(v, def.damage, owner, push * def.knockback);
+                self.damage(v, def.damage, weapon, owner, push * def.knockback);
             }
         }
 
@@ -722,7 +722,7 @@ impl World {
     }
 
     /// Hitscan: no flying object, the line is resolved instantly.
-    fn fire_beam(&mut self, owner: usize, def: &WeaponDef, origin: Vec3, dir: Vec3) {
+    fn fire_beam(&mut self, owner: usize, weapon: u8, def: &WeaponDef, origin: Vec3, dir: Vec3) {
         // 1) The beam ends at the first rock, and leaves it whole.
         let reach = self.grid.raycast(origin, dir, def.range).unwrap_or(def.range);
         let end = origin + dir * reach;
@@ -741,7 +741,7 @@ impl World {
                 .map(|&p| point_segment_distance(p, origin, end))
                 .fold(f32::MAX, f32::min);
             if nearest < WORM_RADIUS + BEAM_SLACK {
-                self.damage(v, def.damage, owner, dir * def.knockback);
+                self.damage(v, def.damage, weapon, owner, dir * def.knockback);
             }
         }
     }
@@ -772,7 +772,7 @@ impl World {
     /// The single place where a worm loses health. Funnelling every source of
     /// damage through one function means self-damage, spawn protection, kill
     /// credit and scoring live in exactly one spot.
-    fn damage(&mut self, victim: usize, amount: f32, source: usize, impulse: Vec3) {
+    fn damage(&mut self, victim: usize, amount: f32, weapon: u8, source: usize, impulse: Vec3) {
         let worm = &mut self.worms[victim];
         if !worm.alive || worm.invuln > 0.0 {
             return;
@@ -786,7 +786,14 @@ impl World {
         }
         let pos = worm.pos;
         if amount > 0.0 {
-            self.events.push(Event::Hit { victim: victim as u8, pos, damage: amount });
+            // The blood follows the push: away from the shot, or up if the hit
+            // had no knockback at all (a graze, a direct-energy weapon).
+            let dir = if impulse.length_squared() > 1.0e-6 {
+                impulse.normalize()
+            } else {
+                Vec3::Y
+            };
+            self.events.push(Event::Hit { victim: victim as u8, weapon, pos, damage: amount, dir });
         }
         if worm.hp <= 0.0 {
             worm.alive = false;
@@ -969,11 +976,11 @@ impl World {
             // the side it came from, so the rock it hit is between the blast
             // and whoever hides behind it.
             let at = self.free_point(pr.pos, dir, PROJECTILE_RADIUS).unwrap_or(pr.pos);
-            self.explode(at, def, pr.owner as usize);
+            self.explode(at, pr.weapon, pr.owner as usize);
             return;
         }
         if let Some(v) = victim {
-            self.damage(v, def.damage, pr.owner as usize, dir * def.knockback);
+            self.damage(v, def.damage, pr.weapon, pr.owner as usize, dir * def.knockback);
         }
     }
 
@@ -981,8 +988,9 @@ impl World {
     /// can see the blast: rock is cover. That is what makes a built lump an
     /// answer to a rocket or a Nova. Worms are hurt before the crater is cut,
     /// so the rock that a blast destroys still shields you from that blast.
-    fn explode(&mut self, pos: Vec3, def: &WeaponDef, owner: usize) {
-        self.events.push(Event::Explosion { pos, radius: def.blast_radius });
+    fn explode(&mut self, pos: Vec3, weapon: u8, owner: usize) {
+        let def = &WEAPONS[weapon as usize];
+        self.events.push(Event::Explosion { weapon, pos, radius: def.blast_radius });
 
         for v in 0..self.worms.len() {
             if !self.worms[v].alive {
@@ -1003,7 +1011,7 @@ impl World {
             }
             let falloff = 1.0 - d / reach;
             let away = ((a + b) * 0.5 - pos).normalize_or_zero() + Vec3::Y * KNOCK_LIFT;
-            self.damage(v, def.blast_damage * falloff, owner, away.normalize() * def.knockback * falloff);
+            self.damage(v, def.blast_damage * falloff, weapon, owner, away.normalize() * def.knockback * falloff);
         }
 
         if def.terrain > 0.0 {
@@ -1140,6 +1148,15 @@ mod tests {
         events.extend(run(&mut w, 30));
         assert!((w.worms[1].hp - 90.0).abs() < 1.0e-3, "a hit is 10 damage: {}", w.worms[1].hp);
         assert!(events.iter().any(|e| matches!(e, Event::Hit { victim: 1, .. })));
+        // The hit carries the push, so the viewer's blood follows the shot.
+        let push = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Hit { dir, .. } => Some(*dir),
+                _ => None,
+            })
+            .expect("a hit");
+        assert!(push.z > 0.5, "the blast pushes away from the shooter: {push:?}");
 
         let mut w = duel();
         shoot_at(&mut w, BLASTER, 1.0, LEVEL); // aimed well to the side
@@ -1257,6 +1274,54 @@ mod tests {
     }
 
     #[test]
+    fn a_blast_and_a_hit_name_the_weapon_that_caused_them() {
+        // The viewer, the audio and the camera each author their response per
+        // weapon, so the event has to carry which one it was.
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        let mut events = shoot(&mut w, ROCKET, -0.2);
+        events.extend(run(&mut w, 60));
+        assert!(events.iter().any(|e| matches!(e, Event::Explosion { weapon: ROCKET, .. })));
+
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        let mut events = hold(&mut w, NOVA, -0.2, 90);
+        events.extend(run(&mut w, 90));
+        assert!(events.iter().any(|e| matches!(e, Event::Explosion { weapon: NOVA, .. })));
+
+        // A cluster is one shell, but seven bomblet blasts.
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 30.0)]);
+        let mut events = shoot(&mut w, CLUSTER, 0.3);
+        for _ in 0..120 {
+            w.step(&[]);
+            events.extend(w.drain_events());
+            if w.projectiles.iter().any(|p| p.weapon == BOMBLET) {
+                break;
+            }
+        }
+        events.extend(run(&mut w, 60));
+        let pops: Vec<u8> = events
+            .iter()
+            .filter_map(|e| if let Event::Explosion { weapon, .. } = e { Some(*weapon) } else { None })
+            .collect();
+        assert_eq!(pops.len(), 7);
+        assert!(pops.iter().all(|&id| id == BOMBLET), "the children, not the shell: {pops:?}");
+
+        // A direct hit says which gun did it, not only how hard.
+        let mut w = duel();
+        let mut events = shoot(&mut w, BLASTER, LEVEL);
+        events.extend(run(&mut w, 30));
+        assert!(events.iter().any(|e| matches!(e, Event::Hit { weapon: BLASTER, .. })));
+
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 26.0)]);
+        let events = shoot(&mut w, RAILGUN, LEVEL);
+        assert!(events.iter().any(|e| matches!(e, Event::Hit { weapon: RAILGUN, .. })));
+
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 20.0)]);
+        w.worms[0].current = WHIP as usize;
+        let events = hold(&mut w, WHIP, LEVEL, 24);
+        assert!(events.iter().any(|e| matches!(e, Event::Hit { weapon: WHIP, .. })));
+    }
+
+    #[test]
     fn a_rocket_at_your_own_feet_hurts_half_and_launches_you() {
         let mut w = arena(flat, &[(16.0, 16.0)]);
         let ground = w.worms[0].pos.y;
@@ -1322,7 +1387,7 @@ mod tests {
         let hurt = |f: fn(Vec3) -> f32| {
             // The worm stands just behind where the slab is.
             let mut w = arena(f, &[(16.0, 14.0), (16.0, 22.8)]);
-            w.explode(Vec3::new(16.0, 5.0, 19.5), &WEAPONS[BOMB as usize], 0);
+            w.explode(Vec3::new(16.0, 5.0, 19.5), BOMB, 0);
             MAX_HP - w.worms[1].hp
         };
         assert!(hurt(flat) > 20.0, "in the open it hurts: {}", hurt(flat));

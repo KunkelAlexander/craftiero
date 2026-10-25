@@ -363,8 +363,14 @@ pub enum Event {
     /// The worm itself carries the lash every frame, so this event is what
     /// starts the swing animation, not what makes the weapon appear.
     Whip { worm: u8, from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
-    Explosion { pos: Vec3, radius: f32 },
-    Hit { victim: u8, pos: Vec3, damage: f32 },
+    /// `weapon` made the blast: the viewer, the audio and the camera each have
+    /// their own signature for it (see `docs/WEAPON_FEEL.md`). `radius` is the
+    /// damage reach, not the size of the fireball.
+    Explosion { weapon: u8, pos: Vec3, radius: f32 },
+    /// `weapon` hurt `victim`. Carrying it lets a railgun hit spark differently
+    /// from a blaster round. `dir` is the way the damage pushed the body (away
+    /// from the shot or the blast), so the viewer can throw the blood that way.
+    Hit { victim: u8, weapon: u8, pos: Vec3, damage: f32, dir: Vec3 },
     Died { victim: u8, killer: u8, pos: Vec3 },
     /// `worm` jumped from `from` to `to` (the Teleport gun).
     Teleported { worm: u8, from: Vec3, to: Vec3 },

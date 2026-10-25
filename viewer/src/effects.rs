@@ -1,14 +1,17 @@
-// What a shot looks like: projectiles in flight, and the fireballs, dust and
-// beam lines that appear for a moment after an event. Like `worms.rs`, this is
-// the only place that knows colours; the sim knows nothing about how any of it
-// looks.
+// What a shot looks like: projectiles in flight, and the fireballs, shock rings,
+// dust and beam lines that appear for a moment after an event. The palette and
+// the per-weapon signature live in `feel.rs`; the sim knows nothing about how
+// any of it looks.
 //
 // Effects live only in the viewer. Nothing in the sim reads them, so they need
 // no replay and no syncing: a client that joined a second ago simply shows
 // fewer of them.
 
+use crate::feel;
+use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA_HOT, SMOKE, VIOLET};
 use crate::renderer::DrawPrim;
 use glam::Vec3;
+use sdf::Grid;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
 use sim::{whip_path, AimPath, Event, Projectile, Worm, DT, WHIP_POINTS};
 use std::f32::consts::TAU;
@@ -21,28 +24,30 @@ const MAX_DUST: usize = 20;
 /// Air traces. They are the first thing to drop when a fight is busy, because
 /// they are the least important: the shot itself still has to be drawn.
 const MAX_TRAILS: usize = 24;
+/// Droplets are short-lived, so a busy fight recycles them quickly. Splats are
+/// the marks they leave: a separate, small budget, because a blot on the rock
+/// should outlive the flash without ever evicting a rocket.
+const MAX_BLOOD: usize = 36;
+const MAX_SPLATS: usize = 14;
 
-const DUST: Vec3 = Vec3::new(0.60, 0.55, 0.46);
-const SMOKE: Vec3 = Vec3::new(0.38, 0.36, 0.34);
-const SPARK: Vec3 = Vec3::new(1.0, 0.72, 0.28);
-const HOT: Vec3 = Vec3::new(1.0, 0.90, 0.60);
-/// The aim aid: a warm gold, bright enough to read over rock and sky and
-/// clearly not part of the world.
 const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
 
-// Colours shared with the weapons in `worms.rs`, so a shot matches its gun.
-const CYAN: Vec3 = Vec3::new(0.35, 0.92, 1.0);
-const EMBER: Vec3 = Vec3::new(1.0, 0.55, 0.16);
-const LIME: Vec3 = Vec3::new(0.55, 0.95, 0.30);
-const MAGENTA: Vec3 = Vec3::new(0.90, 0.35, 0.85);
-const VIOLET: Vec3 = Vec3::new(0.55, 0.42, 1.0);
-const ICE: Vec3 = Vec3::new(0.80, 0.92, 1.0);
-const BRASS: Vec3 = Vec3::new(0.80, 0.62, 0.26);
-const BEAM: Vec3 = Vec3::new(0.55, 0.92, 1.0);
+// Ammunition colours that are not part of the impact signature.
 const OLIVE: Vec3 = Vec3::new(0.31, 0.37, 0.20);
 const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
-const PLASMA: Vec3 = Vec3::new(0.55, 0.28, 1.0);
-const PLASMA_HOT: Vec3 = Vec3::new(0.92, 0.86, 1.0);
+
+/// Liero blood: uncompromising comic red, not the brown-red of a war film. The
+/// droplets are self-lit so they stay legible in a dark crater; the splats are
+/// darker because a stain on rock should look like a stain, not a lamp.
+const BLOOD: Vec3 = Vec3::new(0.78, 0.035, 0.045);
+const BLOOD_DARK: Vec3 = Vec3::new(0.36, 0.012, 0.020);
+
+/// A deterministic 0..1 from a float. Blood spray must look violent, but the
+/// viewer has no RNG: the same hit in a replay must throw the same droplets.
+fn noise(seed: f32) -> f32 {
+    let s = (seed * 12.9898).sin() * 43758.5453;
+    s - s.floor()
+}
 
 /// A frame along the direction of travel: forward, a perpendicular, and up.
 /// Falls back to +Z for a projectile at rest, so a sphere never degenerates into
@@ -57,21 +62,10 @@ fn frame(dir: Vec3) -> (Vec3, Vec3, Vec3) {
     (fwd, side, side.cross(fwd).normalize())
 }
 
-/// The muzzle flash: a hot ball whose colour and size match the weapon, so a
-/// rocket booms orange and a blaster snaps cyan.
+/// The muzzle flash: colour and size come from the weapon's signature (see
+/// `feel.rs`), so a rocket booms orange and a blaster snaps cyan.
 fn flash(weapon: u8) -> (Vec3, f32) {
-    match weapon {
-        BLASTER => (CYAN, 0.20),
-        ROCKET => (EMBER, 0.34),
-        BOUNCER => (LIME, 0.24),
-        BOMB => (EMBER, 0.26),
-        CLUSTER => (BRASS, 0.28),
-        SWARM => (MAGENTA, 0.18),
-        TELEPORT => (VIOLET, 0.26),
-        NOVA => (ICE, 0.38),
-        WHIP => (PLASMA, 0.26),
-        _ => (HOT, 0.20),
-    }
+    feel::flash(weapon)
 }
 
 /// The charge a weapon with a wind-up is building, at the muzzle. Drawn from
@@ -306,6 +300,10 @@ enum Shape {
     Ball { at: Vec3, radius: f32 },
     /// A beam or a tracer: a thin line that thins out.
     Line { from: Vec3, to: Vec3 },
+    /// A shockwave ring, expanding along the ground plane from a blast.
+    Ring { at: Vec3, radius: f32 },
+    /// A blood splat lying on the rock: one flattened lozenge on `normal`.
+    Splat { at: Vec3, normal: Vec3, radius: f32 },
 }
 
 struct Effect {
@@ -354,6 +352,14 @@ impl Effect {
         self
     }
 
+    /// Skip the ink outline: for soft smoke, a flat decal, a small puff at
+    /// range. Without this the outline swallows the colour and it reads as a
+    /// dark pebble.
+    fn inkless(mut self) -> Effect {
+        self.inkless = true;
+        self
+    }
+
     fn puff(at: Vec3, vel: Vec3, radius: f32, colour: Vec3, life: f32, gravity: f32) -> Effect {
         Effect {
             shape: Shape::Ball { at, radius },
@@ -366,6 +372,41 @@ impl Effect {
             width: 0.0,
             hot: false,
             inkless: false,
+        }
+    }
+
+    /// A blood stain on a surface. It does not move or grow; it just sits there
+    /// and dries out, which is the whole point of a splat.
+    fn splat(at: Vec3, normal: Vec3, radius: f32) -> Effect {
+        Effect {
+            shape: Shape::Splat { at, normal, radius },
+            colour: BLOOD_DARK,
+            vel: Vec3::ZERO,
+            gravity: 0.0,
+            age: 0.0,
+            life: 9.0,
+            burst: false,
+            width: 0.0,
+            hot: false,
+            // A decal has no side; an ink rim would draw a 3D tube around it.
+            inkless: true,
+        }
+    }
+
+    /// A shockwave ring: it grows out to `radius`, thins and fades. Self-lit and
+    /// inkless, so it reads as a wave of air rather than a drawn circle.
+    fn ring(at: Vec3, radius: f32, colour: Vec3, life: f32) -> Effect {
+        Effect {
+            shape: Shape::Ring { at, radius },
+            colour,
+            vel: Vec3::ZERO,
+            gravity: 0.0,
+            age: 0.0,
+            life,
+            burst: true,
+            width: 0.0,
+            hot: true,
+            inkless: true,
         }
     }
 }
@@ -385,6 +426,12 @@ pub struct Effects {
     dust: Vec<Effect>,
     /// Air traces left by rockets and other fast projectiles.
     trails: Vec<Effect>,
+    /// Blood in flight. Kept apart from the burst list so a messy hit cannot
+    /// push a fireball out of the capsule budget.
+    blood: Vec<Effect>,
+    /// Blood that has landed: persistent, decorative, and the first thing to
+    /// drop when the frame is full.
+    splats: Vec<Effect>,
     /// Counts sim ticks, so a trail's spacing follows the fight rather than the
     /// display's frame rate.
     trail_tick: u32,
@@ -394,45 +441,8 @@ impl Effects {
     /// Start whatever effect `event` calls for (most events have none).
     pub fn add(&mut self, event: &Event) {
         match *event {
-            Event::Explosion { pos, radius } => {
-                // The sim's `radius` is the *blast* radius (the edge of the
-                // damage sphere), so the visible ball has to sit well inside it:
-                // a fireball as big as the damage volume hides the whole fight.
-                self.push_burst(
-                    Effect::burst(
-                        Shape::Ball { at: pos, radius: radius * 0.26 },
-                        Vec3::new(1.0, 0.98, 0.92),
-                        0.10,
-                    )
-                    .glow(),
-                );
-                let fire = [
-                    (0.44, 0.12, Vec3::new(1.0, 0.60, 0.20)),
-                    (0.33, 0.17, Vec3::new(1.0, 0.80, 0.28)),
-                    (0.22, 0.20, Vec3::new(1.0, 0.96, 0.78)),
-                ];
-                for (k, (size, dist, col)) in fire.into_iter().enumerate() {
-                    // Deterministic spray, like every other effect here: no RNG.
-                    let a = k as f32 * 2.1 + pos.x * 1.3 + pos.z * 0.7;
-                    let off = Vec3::new(a.cos(), 0.2 + 0.5 * (a * 1.7).sin(), a.sin()) * radius * dist;
-                    self.push_burst(Effect::burst(
-                        Shape::Ball { at: pos + off, radius: radius * size },
-                        col,
-                        0.25 + radius * 0.04,
-                    ));
-                }
-                // Debris sparks fly out, then a small dark smoke puff rises:
-                // small, because a big one would swallow the fireball.
-                self.debris(pos, radius);
-                self.push_dust(Effect::puff(
-                    pos + Vec3::Y * 0.3,
-                    Vec3::Y * 1.2,
-                    radius * 0.22,
-                    SMOKE,
-                    0.8 + radius * 0.05,
-                    -0.2,
-                ));
-                self.dust(pos + Vec3::Y * 0.2, 10.0);
+            Event::Explosion { weapon, pos, radius } => {
+                self.blast(weapon, pos, radius);
             }
             Event::Beam { from, to } => {
                 // A hot line, with a flash at each end: the muzzle it left and
@@ -471,8 +481,10 @@ impl Effects {
                 self.push_burst(Effect::puff(pos, Vec3::ZERO, size, col, 0.06, 0.0).glow());
                 self.push_dust(Effect::puff(pos + Vec3::Y * 0.02, Vec3::Y * 0.5, 0.08, SMOKE, 0.4, -0.1));
             }
-            Event::Hit { pos, .. } => {
-                self.hit(pos);
+            Event::Hit { weapon, pos, damage, dir, .. } => {
+                // The flash and sparks. Blood is added by `main` right after
+                // this, because its splats need the terrain grid to land on.
+                self.hit(pos, weapon, damage, dir);
             }
             Event::Died { pos, .. } => {
                 self.push_burst(
@@ -500,43 +512,187 @@ impl Effects {
         }
     }
 
+    /// One blast, authored by its weapon. The sim's `radius` is the *damage*
+    /// reach, so every visible size is a fraction of it: the fireball stays
+    /// proportional to what the weapon can hurt without hiding the fight.
+    fn blast(&mut self, weapon: u8, pos: Vec3, radius: f32) {
+        let look = feel::blast(weapon);
+        // A white-hot core, then three fire layers thrown out from the centre.
+        self.push_burst(
+            Effect::burst(Shape::Ball { at: pos, radius: radius * look.core_size }, look.core, 0.10).glow(),
+        );
+        for k in 0..3 {
+            // Deterministic spray, like every other effect here: no RNG.
+            let a = k as f32 * 2.1 + pos.x * 1.3 + pos.z * 0.7;
+            let off = Vec3::new(a.cos(), 0.2 + 0.5 * (a * 1.7).sin(), a.sin()) * radius * look.fire_reach[k];
+            let mut fire = Effect::burst(
+                Shape::Ball { at: pos + off, radius: radius * look.fire_size[k] },
+                look.fire[k],
+                (0.25 + radius * 0.04) * look.fire_life,
+            );
+            // Self-lit and soft: a shaded sphere with an ink rim reads as a
+            // balloon, not as fire.
+            fire.hot = true;
+            fire.inkless = true;
+            self.push_burst(fire);
+        }
+        self.debris(pos, radius, &look);
+        // The smoke is a separate, longer-lived thing: it is what the player
+        // sees after the flash has gone, and what makes a bomb feel dirty. It
+        // grows in from nothing, so the fire is not hidden on the first frame.
+        let mut smoke = Effect::burst(
+            Shape::Ball { at: pos + Vec3::Y * 0.3, radius: radius * look.smoke_size },
+            look.smoke,
+            look.smoke_life,
+        );
+        smoke.vel = Vec3::Y * look.smoke_rise;
+        smoke.gravity = -0.2;
+        smoke.inkless = true;
+        self.push_dust(smoke);
+        if look.dust > 0.0 {
+            self.dust(pos + Vec3::Y * 0.2, look.dust);
+        }
+        // Shock rings: heavy weapons get one, the Nova gets two.
+        for k in 0..look.rings {
+            let scale = 1.0 - 0.18 * k as f32;
+            let life = look.ring_life * (1.0 + 0.35 * k as f32);
+            let colour = look.fire[0].lerp(Vec3::ONE, 0.35);
+            self.push_burst(Effect::ring(pos, radius * scale, colour, life));
+        }
+    }
+
     /// A hit: a brief flash and a fan of sparks. `pos` is the point on the
     /// victim, so the sparks read as coming off the body, not the shooter.
-    pub fn hit(&mut self, at: Vec3) {
-        self.push_burst(Effect::puff(at, Vec3::ZERO, 0.16, Vec3::new(1.0, 0.98, 0.9), 0.07, 0.0).glow());
-        for i in 0..5 {
+    /// Colour, count and size come from the weapon; `push` is the way the body
+    /// was knocked, so the spray follows the blow instead of always going up.
+    pub fn hit(&mut self, at: Vec3, weapon: u8, damage: f32, push: Vec3) {
+        let look = feel::hit(weapon);
+        let scale = (damage / 70.0).clamp(0.35, 1.4);
+        let push = push.normalize_or_zero();
+        self.push_burst(Effect::puff(at, Vec3::ZERO, look.size * scale, look.flash, 0.07, 0.0).glow());
+        for i in 0..look.sparks {
             // Deterministic spray: no RNG in the viewer, and the same hit at the
-            // same place looks the same in a replay.
+            // same place looks the same in a replay. The radial fan is bent
+            // along the push, so a rocket throws sparks away from the blast.
             let a = i as f32 * 2.399 + at.x * 1.7 + at.z * 0.9;
             let up = 0.2 + 0.45 * (i as f32 * 2.1).sin().abs();
-            let dir = Vec3::new(a.cos(), up, a.sin()).normalize_or_zero();
+            let radial = Vec3::new(a.cos(), up, a.sin());
+            let dir = (radial * 0.7 + push * 0.8).normalize_or_zero();
             self.push_burst(Effect::puff(
                 at,
-                dir * (3.5 + i as f32 * 0.5),
-                0.055,
-                SPARK,
+                dir * (look.speed + i as f32 * 0.5),
+                0.045 + 0.02 * scale,
+                look.spark,
                 0.12 + i as f32 * 0.02,
                 16.0,
             ));
         }
     }
 
-    /// A fan of debris thrown out of an explosion: bigger and farther than a
-    /// hit's sparks, so a rocket reads as a real blast rather than a pop.
-    fn debris(&mut self, at: Vec3, radius: f32) {
-        let n = 7;
+    /// Liero blood. `at` is the victim's feet (the sim's `Hit` position) and
+    /// `dir` is the way the damage pushed the body, so the spray mostly follows
+    /// the wound outwards; a third of it kicks back towards the shooter, which
+    /// is what makes the hit read from the firing side.
+    ///
+    /// The droplets are plain ballistic puffs: no collision, no simulation. The
+    /// splats are found with two or three raycasts, so a stain really lands on
+    /// the rock below (or the wall behind) instead of hanging in the air.
+    pub fn blood(&mut self, at: Vec3, dir: Vec3, damage: f32, grid: &Grid) {
+        let chest = at + Vec3::Y * 0.95;
+        let push = if dir.length_squared() > 1.0e-6 { dir.normalize() } else { Vec3::Y };
+        let force = (damage / 28.0).clamp(0.35, 2.4);
+        let count = (6.0 + damage * 0.30).clamp(6.0, 30.0) as usize;
+
+        for i in 0..count {
+            let seed = i as f32 * 1.7 + at.x * 3.1 + at.z * 1.3;
+            let a = seed * 2.399;
+            let side = Vec3::new(a.cos(), 0.0, a.sin());
+            // Splash-back on every third drop, the rest out of the exit wound.
+            let along = if i % 3 == 0 { -push } else { push };
+            let up = 0.35 + 0.85 * noise(seed + 7.0);
+            let speed = (4.0 + 4.5 * force) * (0.55 + 0.75 * noise(seed + 3.0));
+            let dir =
+                (along * (0.55 + 0.45 * noise(seed + 11.0)) + Vec3::Y * up + side * 0.90).normalize_or_zero();
+            self.push_blood(
+                Effect::puff(
+                    chest + side * 0.10,
+                    dir * speed,
+                    (0.045 + 0.025 * force) * (0.65 + 0.7 * noise(seed + 19.0)),
+                    BLOOD,
+                    0.45 + 0.55 * noise(seed + 23.0),
+                    17.0,
+                )
+                .glow()
+                .inkless(),
+            );
+        }
+        // Two fat gobs, because Liero never believed in restraint.
+        for i in 0..2 {
+            let a = i as f32 * 2.399 + at.x;
+            let side = Vec3::new(a.cos(), 0.0, a.sin());
+            self.push_blood(
+                Effect::puff(
+                    chest,
+                    (push * 0.5 + Vec3::Y * 0.9 + side * 0.5).normalize_or_zero() * (4.5 + 2.5 * force),
+                    0.100 + 0.04 * force,
+                    BLOOD,
+                    0.55,
+                    17.0,
+                )
+                .glow()
+                .inkless(),
+            );
+        }
+
+        // A stain under the body: a few points around the feet, each dropped
+        // onto the first surface below. Two to five, scaled by damage.
+        let n = (2.0 + damage * 0.035).clamp(2.0, 5.0) as usize;
         for i in 0..n {
+            let seed = i as f32 * 2.3 + at.x * 0.7 + at.z * 1.1;
+            let a = seed * 2.399;
+            let off = Vec3::new(a.cos(), 0.0, a.sin()) * (0.55 + 0.85 * noise(seed + 5.0));
+            let from = at + off + Vec3::Y * 1.4;
+            if let Some(t) = grid.raycast(from, Vec3::NEG_Y, 6.0) {
+                let hit = from - Vec3::Y * t;
+                let normal = grid.gradient(hit);
+                let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { Vec3::Y };
+                self.push_splat(Effect::splat(
+                    hit + normal * 0.015,
+                    normal,
+                    0.12 + 0.08 * noise(seed + 13.0) + 0.03 * force,
+                ));
+            }
+        }
+        // And one on the wall the spray is pointing at, so a hit in a corridor
+        // paints the corridor.
+        if let Some(t) = grid.raycast(chest, push, 4.5) {
+            let hit = chest + push * t;
+            let normal = grid.gradient(hit);
+            let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { -push };
+            self.push_splat(Effect::splat(hit + normal * 0.015, normal, 0.12 + 0.05 * force));
+        }
+    }
+
+    /// A fan of debris thrown out of an explosion: bigger and farther than a
+    /// hit's sparks, so a rocket reads as a real blast rather than a pop. A bomb
+    /// throws dirt (not glowing sparks), which is what makes it read as ground.
+    fn debris(&mut self, at: Vec3, radius: f32, look: &feel::Blast) {
+        for i in 0..look.debris {
             let a = i as f32 * 2.399 + at.x * 1.3 + at.z * 0.7;
-            let up = 0.35 + 0.55 * (i as f32 * 2.1).sin().abs();
+            let up = look.debris_up + 0.5 * (i as f32 * 2.1).sin().abs();
             let dir = Vec3::new(a.cos(), up, a.sin()).normalize_or_zero();
-            self.push_burst(Effect::puff(
+            let mut spark = Effect::puff(
                 at,
-                dir * (4.0 + radius * 0.8),
-                0.06,
-                SPARK,
+                dir * (look.debris_speed + radius * 0.6),
+                0.06 + radius * 0.006,
+                look.debris_colour,
                 0.20 + (i as f32 % 3.0) * 0.03,
                 14.0,
-            ).glow());
+            );
+            if look.debris_hot {
+                spark = spark.glow();
+            }
+            self.push_burst(spark);
         }
     }
 
@@ -615,7 +771,14 @@ impl Effects {
     }
 
     pub fn update(&mut self, dt: f32) {
-        for e in self.list.iter_mut().chain(self.dust.iter_mut()).chain(self.trails.iter_mut()) {
+        for e in self
+            .list
+            .iter_mut()
+            .chain(self.blood.iter_mut())
+            .chain(self.splats.iter_mut())
+            .chain(self.dust.iter_mut())
+            .chain(self.trails.iter_mut())
+        {
             e.age += dt;
             if let Shape::Ball { at, .. } = &mut e.shape {
                 *at += e.vel * dt;
@@ -625,13 +788,24 @@ impl Effects {
             }
         }
         self.list.retain(|e| e.age < e.life);
+        self.blood.retain(|e| e.age < e.life);
+        self.splats.retain(|e| e.age < e.life);
         self.dust.retain(|e| e.age < e.life);
         self.trails.retain(|e| e.age < e.life);
     }
 
     pub fn capsules(&self) -> Vec<DrawPrim> {
-        let mut out = Vec::with_capacity(self.list.len() + self.dust.len() + self.trails.len() + 16);
-        for e in self.list.iter().chain(self.dust.iter()).chain(self.trails.iter()) {
+        let mut out = Vec::with_capacity(
+            self.list.len() + self.blood.len() + self.splats.len() + self.dust.len() + self.trails.len() + 16,
+        );
+        for e in self
+            .list
+            .iter()
+            .chain(self.blood.iter())
+            .chain(self.splats.iter())
+            .chain(self.dust.iter())
+            .chain(self.trails.iter())
+        {
             let u = (e.age / e.life).clamp(0.0, 1.0);
             match &e.shape {
                 Shape::Ball { at, radius } => {
@@ -649,6 +823,40 @@ impl Effects {
                 Shape::Line { from, to } => {
                     let line = DrawPrim::capsule(*from, *to, e.width * (1.0 - u), e.colour, false);
                     out.push(styled(line, e));
+                }
+                Shape::Ring { at, radius } => {
+                    // Expand from a tight knot to the blast radius, thinning as
+                    // it goes. Eighteen segments keeps the circle smooth; the
+                    // ring is one effect, so the budget stays predictable.
+                    let r = *radius * (0.15 + 0.85 * u);
+                    let width = (0.03 + radius * 0.015) * (1.0 - u).max(0.0);
+                    let n = 18;
+                    for k in 0..n {
+                        let a0 = k as f32 * TAU / n as f32;
+                        let a1 = (k + 1) as f32 * TAU / n as f32;
+                        let p0 = *at + Vec3::new(a0.cos(), 0.0, a0.sin()) * r;
+                        let p1 = *at + Vec3::new(a1.cos(), 0.0, a1.sin()) * r;
+                        out.push(styled(DrawPrim::capsule(p0, p1, width, e.colour, false), e));
+                    }
+                }
+                Shape::Splat { at, normal, radius } => {
+                    // One flat lozenge lying on the surface. Varying its angle
+                    // and length with a hash keeps a wall of splats from looking
+                    // stamped; it dries (darkens and thins) over its long life.
+                    let dry = if u < 0.70 { 1.0 } else { 1.0 - (u - 0.70) / 0.30 };
+                    let base = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
+                    let base = if base.length_squared() > 1.0e-4 { base.normalize() } else { Vec3::X };
+                    let spin = noise(at.x * 2.3 + at.z * 1.7) * TAU;
+                    let (s, c) = spin.sin_cos();
+                    let dir = base * c + normal.cross(base) * s;
+                    let long = *radius * (0.75 + 0.35 * noise(at.z * 3.1 + at.x));
+                    let a = *at - dir * long;
+                    let b = *at + dir * long * 0.80;
+                    let colour = e.colour * (0.45 + 0.55 * dry);
+                    out.push(styled(
+                        DrawPrim::capsule(a, b, *radius * 0.52 * dry.max(0.35), colour, false),
+                        e,
+                    ));
                 }
             }
         }
@@ -674,6 +882,20 @@ impl Effects {
             self.trails.remove(0);
         }
         self.trails.push(e);
+    }
+
+    fn push_blood(&mut self, e: Effect) {
+        if self.blood.len() >= MAX_BLOOD {
+            self.blood.remove(0);
+        }
+        self.blood.push(e);
+    }
+
+    fn push_splat(&mut self, e: Effect) {
+        if self.splats.len() >= MAX_SPLATS {
+            self.splats.remove(0);
+        }
+        self.splats.push(e);
     }
 }
 
@@ -707,12 +929,54 @@ mod tests {
     #[test]
     fn a_hit_flashes_and_throws_sparks() {
         let mut e = Effects::default();
-        e.add(&Event::Hit { victim: 0, pos: Vec3::new(4.0, 1.0, 2.0), damage: 10.0 });
+        e.add(&Event::Hit {
+            victim: 0,
+            weapon: BLASTER,
+            pos: Vec3::new(4.0, 1.0, 2.0),
+            damage: 10.0,
+            dir: Vec3::Z,
+        });
         assert!(count(&e) >= 5, "a flash and a fan of sparks: {}", count(&e));
         e.update(0.05);
         assert!(count(&e) >= 3, "still in the air: {}", count(&e));
         e.update(0.5);
         assert_eq!(count(&e), 0);
+    }
+
+    #[test]
+    fn a_hit_sprays_blood_and_stains_the_rock() {
+        // Flat rock at y = 2, so the stains have somewhere real to land.
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
+        let mut e = Effects::default();
+        e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::NEG_Z, 34.0, &grid);
+        assert!(e.blood.len() >= 8, "a spray, not a drop: {}", e.blood.len());
+        assert!(e.splats.len() >= 2, "blood marks the floor: {}", e.splats.len());
+        for s in &e.splats {
+            match &s.shape {
+                Shape::Splat { at, normal, radius } => {
+                    assert!((at.y - 2.0).abs() < 0.2, "the stain is on the rock: {at:?}");
+                    assert!(normal.is_normalized());
+                    assert!(*radius > 0.0);
+                }
+                _ => panic!("a splat should be a splat"),
+            }
+        }
+        // Droplets are ballistic and short-lived; stains are the receipt.
+        e.update(1.2);
+        assert!(e.blood.is_empty(), "the droplets have fallen");
+        assert!(!e.splats.is_empty(), "the stains remain");
+        assert_eq!(e.capsules().len(), e.splats.len(), "one cheap primitive per stain");
+    }
+
+    #[test]
+    fn a_long_fight_cannot_flood_the_blood_budget() {
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
+        let mut e = Effects::default();
+        for i in 0..40 {
+            e.blood(Vec3::new(4.0 + i as f32 * 0.1, 2.0, 4.0), Vec3::Z, 70.0, &grid);
+        }
+        assert!(e.blood.len() <= MAX_BLOOD, "droplets are capped: {}", e.blood.len());
+        assert!(e.splats.len() <= MAX_SPLATS, "stains are capped: {}", e.splats.len());
     }
 
     #[test]
@@ -864,7 +1128,30 @@ mod tests {
     #[test]
     fn an_explosion_is_a_fireball_plus_dust() {
         let mut e = Effects::default();
-        e.add(&Event::Explosion { pos: Vec3::ZERO, radius: 3.0 });
+        e.add(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, radius: 3.0 });
         assert!(count(&e) > 1, "the blast also kicks up dust: {}", count(&e));
+    }
+
+    #[test]
+    fn a_nova_and_a_bomblet_are_different_pictures() {
+        let mut nova = Effects::default();
+        nova.add(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, radius: 8.0 });
+        let mut pop = Effects::default();
+        pop.add(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, radius: 1.8 });
+
+        // A Nova gets two shock rings, ten capsules each; a bomblet none.
+        assert!(count(&nova) > count(&pop) * 3, "{} vs {}", count(&nova), count(&pop));
+        // The rings expand: after a moment the widest primitive is far out.
+        nova.update(0.2);
+        let far = nova
+            .capsules()
+            .iter()
+            .map(|p| a_of(p).length())
+            .fold(0.0f32, f32::max);
+        assert!(far > 2.0, "the shockwave has travelled: {far}");
+        // And the Nova's cloud outlives the pop's.
+        nova.update(1.0);
+        pop.update(1.0);
+        assert!(count(&nova) > 0 && count(&pop) == 0, "the crater still smokes: {} {}", count(&nova), count(&pop));
     }
 }

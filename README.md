@@ -20,7 +20,12 @@ after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
 arc to the point it will land on, a ricochet marks its first bounce, and a big
 blast shows its footprint, while rockets leave smoke in the air. Every weapon
 also has its own synthesised voice: a dry blaster tick, a rocket thump, a
-railgun crack with a ringing tail, and a cavern-sized Nova. Sounds are panned
+railgun crack with a ringing tail, and a cavern-sized Nova. The same weapon id
+shapes the picture too: a rocket blooms orange, a bomb throws dirt under a long
+dark cloud, and a Nova is ice-white with a shockwave; hits spark in the weapon's
+colour and shake the camera by its weight. Hits are loud in the Liero sense:
+the victim flashes white and flinches, blood arcs out and stains the rock, and
+a wounded worm carries a five-pip health bar over its head. Sounds are panned
 and muffled by distance. The rules run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
@@ -77,6 +82,7 @@ cargo run -p viewer --release -- --shot out.png --edits --cam 62,36,54,180,-12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 66.5,19.4,41,226,-11 --weapon 8
+cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 58,19,30,56,-10 --hurt 34
 cargo run -p viewer --release -- --bench --size 1920x1080
 cargo test -p sdf -p sim -p viewer
 ```
@@ -89,7 +95,8 @@ catches the blast, and `--fire 11,28` catches the whip at full crack.
 
 `--no-brush` hides the orange dig ring that otherwise sits on the terrain behind
 the character, and `--no-aim` hides the weapon aim aid: lobbed arcs, blast rings
-and ricochet marks.
+and ricochet marks. `--hurt damage` wounds the worm first, so one PNG shows the
+blood spray, the hurt flash and the health bar without needing a second player.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.

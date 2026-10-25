@@ -12,7 +12,12 @@ first and how to check each step.
 > oscillator/noise synth with the three layers, a voice per weapon, distance
 > muffle and delay, pitch variance, and a Nova wind-up hum. The mix is
 > deliberately hot (soft-clipped) and the heavy weapons have 2-4 s tails, so a
-> Nova is a wall of sound rather than a click. Phases 2-6 remain open.
+> Nova is a wall of sound rather than a click. Phase 2 (per-weapon impact) is
+> implemented too: `Explosion` and `Hit` carry the weapon, and `viewer/src/feel.rs`
+> is the single signature table for fire colour, debris, shock rings, hit sparks,
+> camera shake, shove and lens punch. Phase 3 (victim reaction) is mostly in: hurt
+> flash, flinch, Liero blood with terrain stains, and a health-pip bar. Phases
+> 4-6 remain open.
 
 ## 1. The claim
 
@@ -91,7 +96,7 @@ one camera response.
 | Leak | Evidence | Consequence |
 |---|---|---|
 | **No audio at all** | `viewer/Cargo.toml` has no audio crate; PLAN puts synthesised audio at M6 | Roughly half of impact is missing. A silent explosion is a puff of colour. |
-| **One explosion recipe** | `Event::Explosion { pos, radius }` carries no weapon id; `effects.rs` draws the same fireball scaled by radius | A Nova and a bomblet are the same picture at two sizes. |
+| **One explosion recipe** | **Fixed in phase 2:** `Event::Explosion` carries the weapon, and `viewer/src/feel.rs` gives each one its own fire, debris, smoke, shock ring and camera response | A Nova and a bomblet are different pictures, not the same ball at two sizes. |
 | **No hitstop, no punch** | `camera.rs`: `SHAKE_MAX` 0.12 m (drawn at ×0.66), `RECOIL_MAX` 0.07 m | The heaviest blast in the game moves the view less than a fist. |
 | **The victim does not react** | `Anim` has `fire` but no hurt state (`worms.rs`); `Hit` is a flash and 5 sparks; `Died` is one white ball (`effects.rs`) | Hits land on a statue. No stagger, no launch, no reward burst. |
 | **Afterglow is too short** | A fireball lives `0.25 s + 0.04 × radius`, smoke `0.8 s + 0.05 × radius` (`effects.rs`) | A cavern-sized blast is over before the dust settles. |
@@ -128,14 +133,10 @@ and the **Nova's aim ring** (the choice is heavy before the shot).
 
 ### 6.1 A weapon id on the blast
 
-`Event::Explosion { pos, radius }` should carry the weapon (or a small "blast
-kind" enum). Every other effect can then be authored per weapon instead of
-reusing one recipe. This is the highest-leverage data change in the document: it
-unlocks colour, debris shape, ring, sound, shake, kick and hitstop per weapon,
-and it costs one field and a `match`.
-
-The same applies to `Hit`: the victim needs to know *what* hit them, so a
-railgun hit can throw a different spray than a blaster round.
+`Event::Explosion` and `Event::Hit` now carry the weapon id. Every other effect
+can therefore be authored per weapon instead of reusing one recipe: colour,
+debris shape, ring, sound, shake and lens punch are all read from one table in
+`viewer/src/feel.rs`.
 
 ### 6.2 The impact frame: hitstop and punch
 
@@ -161,16 +162,24 @@ for exactly this reason; keep it that way.
 The target is currently the least expressive thing on screen. Needs:
 
 - **Hurt flash** — the worm's body goes white for 60-80 ms on a hit, scaled by
-  damage. This is the cheapest "it connected" signal in existence.
+  damage. This is the cheapest "it connected" signal there is. **Done:** 0.10 s,
+  scaled by damage, plus a squeezed-shut face and an open mouth.
 - **Stagger** — a hit above a threshold interrupts the walk for a few ticks and
   tilts the body. Do it in the viewer from the `Hit` event, not in the sim (the
-  sim stays authoritative and deterministic).
+  sim stays authoritative and deterministic). **Done:** `Anim::hurt` drives a
+  lean/roll/twist flinch for 0.4 s, strongest on the first frames.
+- **Blood** — Liero's lesson: the hit does not need a number if it paints the
+  room. **Done:** `Event::Hit` carries the push direction; `effects.rs::blood`
+  throws a deterministic spray of self-lit red droplets that follow the wound
+  (a third splash back towards the shooter), then raycasts a few stains onto the
+  rock below and the wall behind. Droplets live under a second, stains for 9 s.
+  It is pure cosmetic particles, no collision and no sim state.
 - **Launch** — knockback already pushes. Make the *body* tumble: rotate the
   capsule chain along the velocity while airborne after a hit, and let the death
   throw the body 8-14 m/s instead of replacing it with a white ball.
 - **Reward burst** — on death, a spray of shards or energy bolts from the body,
   plus the killer's confirmation cue. R&C's enemies burst because the burst *is*
-  the reward.
+  the reward. A death already gets a larger version of the blood fountain.
 
 ### 6.4 Afterglow and the receipt
 
@@ -222,7 +231,10 @@ tool: the Blaster must not have a big tail.
   that grows and fades).
 - **Damage numbers** — arcade, but they are how players learn that a Nova is a
   one-shot and a blaster is ten. If that is too gamey, a segmented health bar on
-  the target is the alternative.
+  the target is the alternative. **Done (bar):** a wounded worm carries five
+  chunky horizontal pips above its head — filled pips green → yellow → red,
+  empty sockets left dark. It is vertical so it reads from every camera angle,
+  and it only appears once there is damage to report.
 - **Kill chime** and a brief "kills" flourish in the HUD.
 - **Weapon name on swap**, large, for a beat.
 
@@ -263,14 +275,22 @@ of this is reviewable headless except sound.
 |---|---|---|
 | **1** | **Sound.** A tiny synth + mixer; events drive it. Three layers, pitch variance, distance filter. | Fire each weapon in turn with eyes closed: can you name it? |
 | **2** | **Weapon id on `Explosion`/`Hit`**, and a per-weapon effect table (colour, fireball, debris, ring, shake, kick). | `--fire 8` and `--fire 1` produce unmistakably different frames. |
-| **3** | **Victim reaction**: hurt flash, stagger, death launch + reward burst. | Shoot the dummy with each weapon; the body must move. |
+| **3** | **Victim reaction**: hurt flash, stagger, blood, death launch + reward burst. | `--hurt 34`: the body flashes, flinches and bleeds. |
 | **4** | **Impact frame**: punch table, FOV kick, white frame; hitstop offline only. | Rocket at your feet *feels* like a hit, not a nudge. |
 | **5** | **Afterglow**: longer smoke, cooling crater rim, settling dust. | A Nova crater is still readable 3 s later from the spawn camera. |
 | **6** | **Ritual + confirmation**: Nova spin-up, reload ceremony, weapon weight, hitmarker, damage numbers, name on swap. | Play one full fight and describe each kill afterwards. |
 
 Phases 1-3 change the game more than 4-6. If only one ships, ship sound.
 
-**Done so far.** The Nova's wind-up (`WeaponDef::windup`): 1.2 s, committed on
+**Done so far.** Phase 2 landed in `viewer/src/feel.rs`: one signature table per
+weapon drives the fire colour and size, debris (a bomb throws dirt, a rocket
+throws sparks), the smoke that stays after the flash, a shock ring on the heavy
+weapons, hit-spark colour, camera shake (a Nova is a 0.20 m shove), a
+directional shove and a distance-scaled lens punch. A Nova and a bomblet are now
+different pictures, and the audio uses the same weapon id instead of guessing
+from the blast radius.
+
+The Nova's wind-up (`WeaponDef::windup`): 1.2 s, committed on
 the press, cancelled by a weapon swap, drawn as a charge ring and a narrowing
 view. And the per-weapon camera recoil (phase 4, partly): a shot now shoves the
 view up, climbs the muzzle and punches the lens, instead of the old slide
@@ -281,6 +301,13 @@ the worm's own model, hangs from the hand at rest, is cocked over the shoulder
 for 0.3 s, and then cracks out to its full 9.5 m reach over a 0.32 s swing that
 the whole body follows. Nothing is spawned by the shot, so the weapon is never a
 thing that "appears" — it is either in the hand or mid-swing.
+
+Hits now react (phase 3, mostly): the victim flashes white, flinches off its
+axis, sprays Liero-red blood that arcs out and stains the floor and walls, and a
+wounded worm wears a five-pip health bar. The blood is purely cosmetic
+(`effects.rs`), deterministic, and sits in its own capsule budget so a messy
+fight trims stains before it trims rockets. `--hurt damage` takes a screenshot of
+all of it at once.
 
 ## 9. Open questions for the owner
 

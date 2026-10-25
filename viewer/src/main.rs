@@ -13,6 +13,7 @@
 mod audio;
 mod camera;
 mod effects;
+mod feel;
 mod renderer;
 mod shaders;
 mod world;
@@ -21,13 +22,12 @@ mod worms;
 use audio::Audio;
 use camera::{Camera, CameraFeel, Kick, FOLLOW_DIST};
 use effects::Effects;
+use feel::shot_kick;
 use glam::{Vec2, Vec3};
 use renderer::{FrameParams, Gpu, Offscreen, Renderer};
 use sdf::{Grid, Op, Shape};
-use sim::weapons::{
-    BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
-};
-use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, WEAPONS, WhipStyle};
+use sim::weapons::WHIP;
+use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -79,6 +79,9 @@ struct Config {
     /// `--weapon id`: that worm simply holds this weapon, without firing, so a
     /// screenshot shows the gun itself instead of a muzzle flash.
     weapon: Option<u8>,
+    /// `--hurt damage`: wound that worm before the shot, so the blood, the hurt
+    /// flash and the health bar can be inspected without a second player.
+    hurt: Option<f32>,
     brush: bool,
     /// `--no-aim`: hide the weapon aim aid (arcs, blast rings, ricochet marks) in a screenshot.
     aim: bool,
@@ -100,6 +103,7 @@ fn parse_args() -> Config {
         rope: false,
         fire: None,
         weapon: None,
+        hurt: None,
         brush: true,
         aim: true,
         shadows: true,
@@ -138,6 +142,7 @@ fn parse_args() -> Config {
                 c.fire = Some((id.trim().parse().expect("--fire weapon_id[,ticks]"), ticks.trim().parse().expect("ticks")));
             }
             "--weapon" => c.weapon = Some(value("--weapon").parse().expect("--weapon weapon_id")),
+            "--hurt" => c.hurt = Some(value("--hurt").parse().expect("--hurt damage")),
             "--no-brush" => c.brush = false,
             "--no-aim" => c.aim = false,
             "--no-shadows" => c.shadows = false,
@@ -170,36 +175,6 @@ fn weapon_key(key: KeyCode) -> Option<u8> {
         KeyCode::Equal => 11,
         _ => return None,
     })
-}
-
-/// How a shot pushes the view, per weapon. This is feel data, not rules, so it
-/// lives with the viewer's event handling rather than in `WeaponDef`.
-///
-/// The old kick only slid the camera backwards along its own view direction:
-/// a dolly, which the eye reads as nothing. A shot now also climbs (pitch) and
-/// widens the lens, and the lens is the aim-safe part because the ray through
-/// the centre of the screen does not move. Fast weapons get less of everything
-/// than their single shot suggests, because their next shot arrives before the
-/// view has settled.
-fn shot_kick(weapon: u8) -> Kick {
-    let (up, back, pitch, fov) = match weapon {
-        NOVA => (0.100, 0.30, 3.0, 8.0),
-        ROCKET => (0.045, 0.16, 1.6, 4.5),
-        RAILGUN => (0.035, 0.13, 1.3, 3.5),
-        CLUSTER => (0.035, 0.11, 1.1, 3.0),
-        SWARM => (0.020, 0.065, 0.6, 1.8),
-        BOUNCER => (0.014, 0.050, 0.4, 1.2),
-        WHIP => (0.020, 0.035, 0.8, 2.0),
-        TELEPORT => (0.010, 0.030, 0.3, 0.6),
-        BLASTER => (0.008, 0.030, 0.25, 0.8),
-        BOMB => (0.008, 0.020, 0.2, 0.5),
-        BUILD => (0.010, 0.020, 0.15, 0.3),
-        TRACTOR => (0.004, 0.008, 0.05, 0.1),
-        _ => (0.006, 0.015, 0.2, 0.4),
-    };
-    // A lash hits across the body rather than away from the shoulder.
-    let side = if weapon == WHIP { 0.10 } else { 0.0 };
-    Kick { up, back, side, pitch, fov }
 }
 
 fn spawn_camera() -> Camera {
@@ -363,6 +338,11 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
                 effects.trails(&world.projectiles);
                 for e in world.drain_events() {
                     effects.add(&e);
+                    match e {
+                        Event::Hit { pos, damage, dir, .. } => effects.blood(pos, dir, damage, &world.grid),
+                        Event::Died { pos, .. } => effects.blood(pos, Vec3::Y, 120.0, &world.grid),
+                        _ => {}
+                    }
                 }
                 effects.update(DT);
             }
@@ -376,7 +356,7 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
 
 fn run_shot(cfg: &Config, path: &str) {
     let gpu = headless_gpu();
-    let (mut world, effects) = shot_world(cfg);
+    let (mut world, mut effects) = shot_world(cfg);
     let mut renderer = Renderer::new(&gpu, Offscreen::FORMAT, cfg.size, cfg.scale, &mut world.grid);
     if cfg.edits {
         demo_edits(&mut world.grid);
@@ -404,6 +384,26 @@ fn run_shot(cfg: &Config, path: &str) {
                     anim.struck_at(WhipStyle::Sweep, 0.0, elapsed - WEAPONS[WHIP as usize].windup);
                 }
             }
+        }
+    }
+    if let Some(damage) = cfg.hurt {
+        // A developer convenience, like `--fire`: wound the worm so one PNG can
+        // show the blood spray, the flinch and the health bar.
+        if let Some(worm) = world.worms.first_mut() {
+            worm.hp = (MAX_HP - damage).max(1.0);
+        }
+        if let (Some(worm), Some(anim)) = (world.worms.first(), anims.first_mut()) {
+            let at = worm.pos;
+            // Spray towards the camera: the wound is on the near side.
+            let dir = -worm.aim_dir();
+            effects.blood(at, dir, damage, &world.grid);
+            // A sixth of a second in: the spray has left the body, without the
+            // drops already falling out of frame.
+            for _ in 0..10 {
+                effects.update(DT);
+            }
+            anim.hurt(damage);
+            anim.update(worm, 0.03);
         }
     }
     let mut capsules = worms::capsules(&world.worms, &positions, &anims);
@@ -973,10 +973,23 @@ impl Viewer {
             // applied to the drawing copy only (see `camera.rs`), so none of it
             // can steer the aim.
             match event {
-                Event::Explosion { pos, radius } => {
+                Event::Explosion { weapon, pos, .. } => {
                     let away = (pos - self.camera.pos).length();
                     let falloff = (1.0 - away / 28.0).clamp(0.0, 1.0);
-                    self.feel.shake((0.012 + radius * 0.008) * falloff * falloff);
+                    let look = feel::blast(weapon);
+                    // Per-weapon weight, not one radius-shaped nudge: a Nova
+                    // shoves the view, a bomblet does not.
+                    self.feel.shake(look.shake * falloff * falloff);
+                    self.feel.punch(look.fov * falloff);
+                    self.feel.kick(
+                        &self.camera,
+                        Kick {
+                            up: look.push_up * falloff,
+                            back: look.push_back * falloff,
+                            pitch: look.push_pitch * falloff,
+                            ..Kick::default()
+                        },
+                    );
                 }
                 Event::Shot { worm, weapon, .. } => {
                     // The gun recoils and the face reacts, for any worm.
@@ -994,12 +1007,24 @@ impl Viewer {
                         anim.struck(style, phase);
                     }
                 }
-                Event::Hit { victim, pos, .. } => {
+                Event::Hit { victim, weapon, pos, damage, dir } => {
+                    // The victim flinches and flashes, and the hit paints the
+                    // ground. Both are viewer state: the sim only says "this
+                    // much damage, this way".
+                    if let Some(anim) = self.anims.get_mut(victim as usize) {
+                        anim.hurt(damage);
+                    }
+                    self.effects.blood(pos, dir, damage, &self.world.grid);
                     let away = (pos - self.camera.pos).length();
-                    let amount = if victim == 0 { 0.030 } else { 0.018 };
-                    self.feel.shake(amount * (1.0 - away / 18.0).clamp(0.0, 1.0));
+                    // The player being hit is always felt hardest.
+                    let hurt = if victim == 0 { 1.6 } else { 1.0 };
+                    let look = feel::hit(weapon);
+                    self.feel.shake(look.shake * hurt * (1.0 - away / 18.0).clamp(0.0, 1.0));
                 }
                 Event::Died { victim, pos, .. } => {
+                    // A death is a fountain, not a puff: the body comes apart
+                    // in front of the killer.
+                    self.effects.blood(pos, Vec3::Y, 120.0, &self.world.grid);
                     let away = (pos - self.camera.pos).length();
                     let amount = if victim == 0 { 0.080 } else { 0.045 };
                     self.feel.shake(amount * (1.0 - away / 30.0).clamp(0.0, 1.0));
@@ -1417,24 +1442,5 @@ mod tests {
         assert_eq!(landing_impact(true, true, -9.0), None, "already on the ground");
         assert_eq!(landing_impact(false, false, -9.0), None, "still in the air");
         assert_eq!(landing_impact(false, true, -2.0), None, "a step down, no dust");
-    }
-
-    #[test]
-    fn heavy_weapons_kick_harder_and_nothing_kicks_the_blaster() {
-        let (n, r, b) = (shot_kick(NOVA), shot_kick(ROCKET), shot_kick(BLASTER));
-        assert!(n.pitch > r.pitch && r.pitch > b.pitch, "climb: {} {} {}", n.pitch, r.pitch, b.pitch);
-        assert!(n.fov > r.fov && r.fov > b.fov, "lens: {} {} {}", n.fov, r.fov, b.fov);
-        assert!(
-            n.up + n.back > r.up + r.back && r.up + r.back > b.up + b.back,
-            "shove: {} {} {}",
-            n.up + n.back,
-            r.up + r.back,
-            b.up + b.back
-        );
-        // A blaster fired eight times a second must not visibly move the view,
-        // or the aim contract (the crosshair is where the shot goes) breaks.
-        assert!(b.pitch < 0.5 && b.fov < 1.0, "the metronome stays quiet");
-        // The whip is the one weapon that hits across the body.
-        assert!(shot_kick(WHIP).side.abs() > 0.0, "the lash shoves sideways");
     }
 }

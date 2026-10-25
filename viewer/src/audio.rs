@@ -17,7 +17,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use glam::Vec3;
 use sim::weapons::{
-    BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+    BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
 };
 use sim::Event;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -263,9 +263,9 @@ impl Sfx {
                 let p = Place::at(pos, listener, right);
                 self.shot(weapon, p);
             }
-            Event::Explosion { pos, radius } => {
+            Event::Explosion { weapon, pos, .. } => {
                 let p = Place::at(pos, listener, right);
-                self.explosion(radius, p);
+                self.explosion(weapon, p);
             }
             Event::Beam { from, to } => {
                 // The impact end carries the body; the muzzle still cracks.
@@ -282,9 +282,9 @@ impl Sfx {
                 let p = Place::at(from, listener, right);
                 self.whip(p);
             }
-            Event::Hit { pos, damage, .. } => {
+            Event::Hit { pos, damage, weapon, .. } => {
                 let p = Place::at(pos, listener, right);
-                self.hit(damage, p);
+                self.hit(damage, weapon, p);
             }
             Event::Died { pos, .. } => {
                 let p = Place::at(pos, listener, right);
@@ -446,12 +446,11 @@ impl Sfx {
         }
     }
 
-    fn explosion(&mut self, radius: f32, p: Place) {
-        // `Event::Explosion` does not carry a weapon id yet (see
-        // docs/WEAPON_FEEL.md 6.1). Radius is enough to separate the three
-        // sizes: bomblet/swarm, rocket/bomb, Nova.
-        let voices = if radius >= 6.0 {
-            vec![
+    fn explosion(&mut self, weapon: u8, p: Place) {
+        // The weapon shapes the blast: a Nova is a cavern event, a bomb is
+        // deep and dirty, a rocket is a sharp shove, a bomblet is a pop.
+        let voices = match weapon {
+            NOVA => vec![
                 // The cavern eraser: a white-hot crack, a body below the
                 // speakers, then a low rolling tail that outlives the flash.
                 Voice::new(vec![
@@ -478,9 +477,20 @@ impl Sfx {
                 .gain(0.85)
                 .pan(0.35)
                 .delayed(0.19),
-            ]
-        } else if radius >= 2.5 {
-            vec![
+            ],
+            BOMB => vec![
+                // Ground, not fire: most of the energy is below the speakers,
+                // and the dark cloud takes a long time to clear.
+                Voice::new(vec![
+                    Layer::noise(0.62, 0.0006, 32.0, 0.16, 3_400.0),
+                    Layer::sine(0.88, 0.003, 2.5, 1.6, 82.0, 20.0),
+                ]),
+                Voice::new(vec![
+                    Layer::noise(0.62, 0.012, 0.8, 3.0, 180.0),
+                    Layer::sine(0.52, 0.045, 0.35, 3.4, 34.0, 16.0),
+                ]),
+            ],
+            ROCKET => vec![
                 Voice::new(vec![
                     Layer::noise(0.70, 0.0005, 24.0, 0.16, 4_500.0),
                     Layer::sine(0.80, 0.003, 3.0, 1.1, 100.0, 28.0),
@@ -489,17 +499,22 @@ impl Sfx {
                     Layer::noise(0.48, 0.010, 1.8, 2.2, 300.0),
                     Layer::sine(0.42, 0.030, 0.9, 3.0, 40.0, 22.0),
                 ]),
-            ]
-        } else {
-            vec![
+            ],
+            // A cluster's seven children, or a swarm missile: short and dry, so
+            // they read as a sequence instead of one wall.
+            SWARM | BOMBLET => vec![
                 Voice::new(vec![
                     Layer::noise(0.35, 0.0005, 45.0, 0.08, 5_000.0),
                     Layer::sine(0.34, 0.002, 12.0, 0.45, 180.0, 60.0),
                 ]),
+                Voice::new(vec![Layer::noise(0.18, 0.010, 4.0, 0.9, 400.0)]),
+            ],
+            _ => vec![
                 Voice::new(vec![
-                    Layer::noise(0.18, 0.010, 4.0, 0.9, 400.0),
+                    Layer::noise(0.48, 0.0005, 30.0, 0.12, 4_000.0),
+                    Layer::sine(0.50, 0.002, 6.0, 0.8, 120.0, 40.0),
                 ]),
-            ]
+            ],
         };
         for voice in voices {
             self.add(voice, p);
@@ -542,14 +557,30 @@ impl Sfx {
         );
     }
 
-    fn hit(&mut self, damage: f32, p: Place) {
+    fn hit(&mut self, damage: f32, weapon: u8, p: Place) {
         let level = (damage / 70.0).clamp(0.30, 1.30);
-        let voice = Voice::new(vec![
-            Layer::noise(0.38 * level, 0.0004, 60.0, 0.09, 7_000.0),
-            Layer::sine(0.28 * level, 0.001, 18.0, 0.28, 260.0, 80.0),
-            Layer::sine(0.22 * level, 0.002, 10.0, 0.35, 95.0, 45.0),
-        ]);
-        self.add(voice, p);
+        // The thump every hit shares: a crack, a body and a sub-bass shove.
+        self.add(
+            Voice::new(vec![
+                Layer::noise(0.38 * level, 0.0004, 60.0, 0.09, 7_000.0),
+                Layer::sine(0.28 * level, 0.001, 18.0, 0.28, 260.0, 80.0),
+                Layer::sine(0.22 * level, 0.002, 10.0, 0.35, 95.0, 45.0),
+            ]),
+            p,
+        );
+        // Then the weapon's own mark, so a railgun hit rings and a blaster
+        // tick does not.
+        let extra = match weapon {
+            RAILGUN => Some(Voice::new(vec![
+                Layer::sine(0.16 * level, 0.004, 2.0, 0.85, 5_600.0, 4_200.0),
+            ])),
+            WHIP => Some(Voice::new(vec![Layer::noise(0.20 * level, 0.006, 3.0, 0.75, 6_000.0)])),
+            BOUNCER => Some(Voice::new(vec![Layer::sine(0.20 * level, 0.001, 10.0, 0.35, 1_250.0, 900.0)])),
+            _ => None,
+        };
+        if let Some(voice) = extra {
+            self.add(voice, p);
+        }
     }
 
     fn died(&mut self, p: Place) {
@@ -910,16 +941,33 @@ mod tests {
     #[test]
     fn a_bigger_blast_lasts_longer() {
         let mut small = Sfx::new(48_000.0);
-        small.play(&Event::Explosion { pos: Vec3::ZERO, radius: 1.8 }, Vec3::ZERO, Vec3::X);
+        small.play(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, radius: 1.8 }, Vec3::ZERO, Vec3::X);
         let s = render(&mut small, 0.4);
         assert!(peak(&s) > 0.01);
-        assert!(peak(&render(&mut small, 0.6)) < 0.02, "a bomblet is over in under a second");
+        assert!(peak(&render(&mut small, 1.2)) < 0.02, "a bomblet is over in about a second");
 
         let mut big = Sfx::new(48_000.0);
-        big.play(&Event::Explosion { pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
+        big.play(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
         let b = render(&mut big, 0.4);
         assert!(rms(&b) > rms(&s) * 1.5);
         assert!(peak(&render(&mut big, 1.5)) > 0.01, "the Nova still rumbles a second later");
+    }
+
+    #[test]
+    fn a_bomb_and_a_rocket_have_different_voices() {
+        let mut bomb = Sfx::new(48_000.0);
+        bomb.play(&Event::Explosion { weapon: BOMB, pos: Vec3::ZERO, radius: 4.0 }, Vec3::ZERO, Vec3::X);
+        let b = render(&mut bomb, 1.0);
+
+        let mut rocket = Sfx::new(48_000.0);
+        rocket.play(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, radius: 3.0 }, Vec3::ZERO, Vec3::X);
+        let r = render(&mut rocket, 1.0);
+
+        // The bomb is the longer, heavier one; the rocket is over sooner.
+        assert!(rms(&b) > rms(&r), "the bomb carries more low end: {} vs {}", rms(&b), rms(&r));
+        let bomb_tail = peak(&render(&mut bomb, 2.0));
+        let rocket_tail = peak(&render(&mut rocket, 2.0));
+        assert!(bomb_tail > rocket_tail, "and its cloud outlasts the rocket: {bomb_tail} vs {rocket_tail}");
     }
 
     #[test]
@@ -954,7 +1002,7 @@ mod tests {
         assert!(rms(&nova) > rms(&blaster) * 6.0, "and dwarf the Blaster: {} vs {}", rms(&nova), rms(&blaster));
 
         let mut boom = Sfx::new(48_000.0);
-        boom.play(&Event::Explosion { pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
+        boom.play(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
         let one_second = render(&mut boom, 1.0);
         assert!(rms(&one_second) > 0.30, "a Nova is a wall of sound: {}", rms(&one_second));
         // Still rolling two and a half seconds after the flash.

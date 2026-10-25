@@ -67,7 +67,7 @@ impl Camera {
 
 /// One shot's punch, in camera space. `up`, `back` and `side` are metres along
 /// the drawn camera's axes; `pitch` is degrees of muzzle climb; `fov` widens the
-/// lens by degrees. The numbers live with the weapon table's owner in `main.rs`,
+/// lens by degrees. The numbers live in `feel.rs`, beside the blast signature,
 /// because they are feel, not rules.
 #[derive(Clone, Copy, Default)]
 pub struct Kick {
@@ -138,7 +138,9 @@ const DIP_SPRING: f32 = 90.0;
 const DIP_DAMP: f32 = 16.0;
 /// Shake decays fast; a rocket at your feet is over before the next shot.
 const SHAKE_DECAY: f32 = 6.0;
-const SHAKE_MAX: f32 = 0.12;
+/// The cap has to leave room for the top end: a Nova is a 0.20 m shove, and the
+/// old 0.12 m ceiling made it a nudge.
+const SHAKE_MAX: f32 = 0.22;
 /// The shot shove is a stiff spring so it is gone between blaster rounds.
 const RECOIL_SPRING: f32 = 170.0;
 const RECOIL_DAMP: f32 = 21.0;
@@ -291,6 +293,13 @@ impl CameraFeel {
         self.recoil = (self.recoil + shove).clamp_length_max(RECOIL_MAX);
         self.climb = (self.climb + k.pitch.to_radians()).clamp(-CLIMB_MAX, CLIMB_MAX);
         self.fov_kick = (self.fov_kick + k.fov.to_radians()).min(0.25);
+    }
+
+    /// Add a lens punch without a shove. An explosion uses this: widening the
+    /// view cannot move the ray through the centre of the screen, so it is pure
+    /// impact with no cost to the aim contract.
+    pub fn punch(&mut self, degrees: f32) {
+        self.fov_kick = (self.fov_kick + degrees.to_radians()).min(0.25);
     }
 
     /// How far into a wind-up the held weapon is (0..1). A full charge narrows
@@ -492,6 +501,32 @@ mod tests {
         assert!((settled.pos - clean.pos).length() < 1.0e-3, "gone again: {:?}", settled.pos - clean.pos);
         assert!((settled.pitch - clean.pitch).abs() < 1.0e-3, "climb is gone: {}", settled.pitch);
         assert!((settled.fov_y - clean.fov_y).abs() < 1.0e-3, "lens is back: {}", settled.fov_y);
+    }
+
+    #[test]
+    fn a_nova_shove_is_allowed_past_the_old_ceiling() {
+        // The old cap was 0.12 m, which turned a Nova into a nudge. The top of
+        // the range has to be a real shove, while still being capped.
+        let mut feel = CameraFeel::default();
+        feel.shake(0.20);
+        assert!((feel.shake - 0.20).abs() < 1.0e-6, "a Nova is felt: {}", feel.shake);
+        feel.shake(1.0);
+        assert!((feel.shake - SHAKE_MAX).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_blast_punches_the_lens_without_moving_the_aim() {
+        let (grid, c) = cave(8, 15.0);
+        let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 60);
+        let clean = cam;
+
+        feel.punch(4.5);
+        let punched = feel.render(clean);
+        assert!(punched.fov_y > clean.fov_y + 0.05, "the lens widens: {}", punched.fov_y);
+        assert!((punched.pos - clean.pos).length() < 1.0e-6, "the eye does not move");
+        assert!((punched.pitch - clean.pitch).abs() < 1.0e-6, "and the aim line is untouched");
     }
 
     #[test]

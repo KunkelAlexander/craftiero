@@ -11,7 +11,7 @@ use glam::Vec3;
 use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WEAPONS, WHIP,
 };
-use sim::{whip_path, Action, WhipStyle, Worm, WHIP_POINTS, WHIP_SWEEP, WORM_HEIGHT};
+use sim::{whip_path, Action, WhipStyle, Worm, MAX_HP, WHIP_POINTS, WHIP_SWEEP, WORM_HEIGHT};
 use std::f32::consts::TAU;
 
 /// One colour per player (as picked in a paint program).
@@ -52,7 +52,25 @@ pub struct Anim {
     whip: f32,
     whip_phase: f32,
     whip_style: WhipStyle,
+    /// Seconds since this worm was last hurt, and how hard. The flash and the
+    /// flinch are drawn from this; the sim already moved the body.
+    hurt: f32,
+    hurt_damage: f32,
 }
+
+/// How long a hit flashes white, and how long the body keeps flinching. The
+/// flash is deliberately shorter than a sim tick's worth of reaction: it reads
+/// as an impact, not as a status effect.
+const HURT_FLASH: f32 = 0.10;
+const HURT_FLINCH: f32 = 0.40;
+/// A health bar only appears over a worm that has actually lost health. It is
+/// vertical so it stays readable from every camera angle: the third-person view
+/// is rarely square to the body's right.
+const BAR_STEP: f32 = 0.105;
+const BAR_WIDTH: f32 = 0.30;
+const BAR_LOW: Vec3 = Vec3::new(0.95, 0.14, 0.11);
+const BAR_MID: Vec3 = Vec3::new(1.0, 0.72, 0.14);
+const BAR_GOOD: Vec3 = Vec3::new(0.42, 0.94, 0.32);
 
 impl Default for Anim {
     fn default() -> Anim {
@@ -67,6 +85,8 @@ impl Default for Anim {
             whip: 1.0,
             whip_phase: 0.0,
             whip_style: WhipStyle::Sweep,
+            hurt: 10.0,
+            hurt_damage: 0.0,
         }
     }
 }
@@ -87,6 +107,7 @@ impl Anim {
         self.clock = (self.clock + dt) % 1000.0;
         self.fire = (self.fire + dt).min(10.0);
         self.whip = (self.whip + dt).min(10.0);
+        self.hurt = (self.hurt + dt).min(10.0);
         // Running makes the undulation quicker; idle keeps a slow ripple.
         let gait = if worm.on_ground {
             3.0 + worm.forward_vel.abs() * 0.55
@@ -99,6 +120,13 @@ impl Anim {
     /// The worm pulled the trigger: reset the recoil clock.
     pub fn fired(&mut self) {
         self.fire = 0.0;
+    }
+
+    /// This worm was just hurt. `damage` scales the flash and the flinch; the
+    /// sim has already applied the health loss and the knockback.
+    pub fn hurt(&mut self, damage: f32) {
+        self.hurt = 0.0;
+        self.hurt_damage = damage.max(0.0);
     }
 
     /// The plasma whip cracked: start the swing that the carried lash follows.
@@ -604,7 +632,14 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             continue; // (the death flash is an effect, see `effects.rs`)
         }
         let anim = anims.get(i).copied().unwrap_or_default();
-        let colour = COLOURS[i % COLOURS.len()];
+        // A hit flashes the body white for a blink, scaled by how hard it was:
+        // a blaster tick is a flicker, a Nova is a small sun. This is the
+        // cheapest "it connected" signal there is.
+        let flash = (1.0 - anim.hurt / HURT_FLASH).clamp(0.0, 1.0)
+            * (0.35 + 0.65 * (anim.hurt_damage / 30.0).clamp(0.0, 1.0));
+        let colour = COLOURS[i % COLOURS.len()].lerp(Vec3::new(1.0, 0.90, 0.90), flash);
+        let flinch = (1.0 - anim.hurt / HURT_FLINCH).clamp(0.0, 1.0)
+            * (anim.hurt_damage / 25.0).clamp(0.15, 1.0);
         let rs = WORM_HEIGHT / 1.8;
         let caps = |a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool| {
             DrawPrim::capsule(a, b, radius, colour, shadow)
@@ -706,6 +741,14 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             pose.twist += 0.16 * whip_cock - 0.16 * whip_strike;
             pose.wide *= 1.0 + 0.04 * whip_strike;
         }
+        if flinch > 0.0 {
+            // A hit knocks the body off its axis for a beat. The flash says
+            // "connected"; the flinch says "hard". The shake decays fast so a
+            // held trigger does not turn the worm into a vibrating prop.
+            pose.lean -= 0.22 * flinch;
+            pose.roll += (anim.hurt * 52.0).sin() * 0.11 * flinch;
+            pose.twist += (anim.hurt * 41.0).cos() * 0.07 * flinch;
+        }
 
         let rig = Rig::new(pos, worm.face_yaw, &pose, rs);
 
@@ -782,7 +825,10 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         let frown = ((0.22 - anim.fire) / 0.22).clamp(0.0, 1.0);
         let surprise = if air && !tumble { 1.0 } else { 0.0 };
         let brow_angle = frown * 0.11 - surprise * 0.09;
-        let blink = if (anim.clock + (i as f32) * 0.9) % 4.3 < 0.10 { 0.15 } else { 1.0 };
+        // A hurt worm squeezes its eyes shut; it also opens its mouth below.
+        let squint = (1.0 - anim.hurt / 0.22).clamp(0.0, 1.0);
+        let blink = (if (anim.clock + (i as f32) * 0.9) % 4.3 < 0.10 { 0.15 } else { 1.0 })
+            * (1.0 - 0.70 * squint);
         for side in [-1.0, 1.0] {
             let inner = head + look * 0.20 + Vec3::X * (0.07 * side) + Vec3::Y * (0.20 + brow_angle);
             let outer = head + look * 0.24 + Vec3::X * (0.23 * side) + Vec3::Y * (0.15 - brow_angle);
@@ -823,7 +869,8 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         }
 
         // Mouth: a wide dark line that opens with a shout or a gasp.
-        let open = ((0.25 - anim.fire) / 0.25).clamp(0.0, 1.0) + if air { 0.5 } else { 0.0 };
+        let open =
+            ((0.25 - anim.fire) / 0.25).clamp(0.0, 1.0) + if air { 0.5 } else { 0.0 } + 0.8 * flinch;
         let mouth = head + look * 0.35 - Vec3::Y * (0.11 + 0.05 * open);
         let mw = 0.10 + 0.05 * open;
         out.push(caps(
@@ -853,6 +900,47 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             lighten(colour, 1.25),
             false,
         ));
+
+        // Health bar: a chunky vertical bar over a wounded worm. It is vertical
+        // so every camera angle sees its full length, and it only appears once
+        // there is damage to report. A fresh hit makes it jump under the flash,
+        // which is the "indicator" the eye catches before it reads the length.
+        if worm.hp < MAX_HP - 0.01 {
+            let frac = (worm.hp / MAX_HP).clamp(0.0, 1.0);
+            let colour = if frac > 0.55 {
+                BAR_GOOD
+            } else if frac > 0.25 {
+                BAR_MID
+            } else {
+                BAR_LOW
+            };
+            let punch = (1.0 - anim.hurt / 0.18).clamp(0.0, 1.0);
+            let base = pos + Vec3::Y * (2.12 + lift);
+            // Five stacked dashes, not one bar. A horizontal dash keeps its
+            // full width from any camera angle, and the empty sockets stay
+            // visible, so the row reads as a gauge instead of a laser sight
+            // taped to the worm's head.
+            let lit = (frac * 5.0).ceil().max(1.0) as usize;
+            let half = right * (BAR_WIDTH * 0.5);
+            for k in 0..5 {
+                let y = base + Vec3::Y * (k as f32 * BAR_STEP);
+                if k < lit {
+                    out.push(
+                        caps(
+                            y - half,
+                            y + half,
+                            0.026 * rs * (1.0 + 0.55 * punch),
+                            colour.lerp(Vec3::ONE, 0.20 * punch),
+                            false,
+                        )
+                        .glowing()
+                        .inkless(),
+                    );
+                } else {
+                    out.push(caps(y - half, y + half, 0.020 * rs, Vec3::new(0.13, 0.09, 0.10), false).inkless());
+                }
+            }
+        }
 
         // Arms. The right one holds the gun; the left one swings with the gait.
         // In the air both flail out; on a wall or a rope both reach up; digging
@@ -1225,6 +1313,50 @@ mod tests {
         assert!(recoil_curve(0.20) < 0.0, "then overshoots forward, like a spring");
         assert_eq!(recoil_curve(0.50), 0.0);
         assert_eq!(recoil_curve(2.0), 0.0);
+    }
+
+    #[test]
+    fn a_hit_flashes_the_body_and_raises_a_health_bar() {
+        let w = worm(Action::Idle, true);
+        let pos = w.pos;
+        let anim = Anim::default();
+        let full = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
+
+        // A wounded worm gets five extra primitives: the pip row.
+        let mut wounded = w.clone();
+        wounded.hp = MAX_HP * 0.2;
+        let hurt_anims = [anim];
+        let caps = capsules(std::slice::from_ref(&wounded), &[pos], &hurt_anims);
+        assert_eq!(caps.len(), full.len() + 5, "the health bar");
+        let bar = caps
+            .iter()
+            .find_map(|c| match c {
+                DrawPrim::Capsule { a, b, colour, .. } if *colour == BAR_LOW => Some((*a, *b)),
+                _ => None,
+            })
+            .expect("low health is drawn in red");
+        assert!(
+            bar.0.y > pos.y + 1.8 && (bar.1 - bar.0).length() > 0.1,
+            "the bar floats above the head: {bar:?}"
+        );
+
+        // A fresh hit whitens the body and knocks it off its axis.
+        let mut flinching = Anim::default();
+        flinching.hurt(30.0);
+        let flashed = capsules(std::slice::from_ref(&w), &[pos], &[flinching]);
+        let plain_colour = match full[0] {
+            DrawPrim::Capsule { colour, .. } => colour,
+            _ => panic!("the body starts with a capsule"),
+        };
+        let flash_colour = match flashed[0] {
+            DrawPrim::Capsule { colour, .. } => colour,
+            _ => panic!("the body starts with a capsule"),
+        };
+        assert!(flash_colour.y > plain_colour.y + 0.1, "the flash goes white: {plain_colour:?} {flash_colour:?}");
+        assert!(
+            (a_of(&full[0]) - a_of(&flashed[0])).length() > 0.005,
+            "the flinch moves the body"
+        );
     }
 
     #[test]
