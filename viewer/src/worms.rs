@@ -6,7 +6,7 @@
 // and the gun. There are no legs: it gets around by undulating, which is also
 // what most of the animation below is about.
 
-use crate::renderer::DrawPrim;
+use crate::renderer::{DrawPrim, Sprite};
 use glam::Vec3;
 use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WEAPONS, WHIP,
@@ -363,6 +363,7 @@ fn weapon(
     colour: Vec3,
     clock: f32,
     lash: Lash,
+    glow: &mut Vec<Sprite>,
     out: &mut Vec<DrawPrim>,
 ) {
     // A mortar is carried pointing up: the same loft the sim uses to launch its
@@ -539,7 +540,7 @@ fn weapon(
             // The lash is carried, not spawned: the same energy sits in the
             // hand at rest, is drawn back by the wind-up, and cracks out with
             // the strike. See `lash`.
-            lash_draw(&g, lash, rs, clock, out);
+            lash_draw(&g, lash, rs, clock, glow, out);
         }
         _ => {
             // BOMBLET is never held; unknown ids draw nothing.
@@ -554,14 +555,15 @@ fn weapon(
 /// when the strike fires the tip snaps out to the weapon's reach, crosses the
 /// arc with the body, then falls back to whatever the hand is doing (which may
 /// already be the next draw-back).
-fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, out: &mut Vec<DrawPrim>) {
-    let from = g.at(0.46, 0.0, 0.0);
-    // Carried: hangs forward and down, out of the way.
-    let idle_dir = (g.fwd * 0.8 - Vec3::Y * 0.65).normalize_or_zero();
-    let idle_len = 1.45 * rs;
+fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out: &mut Vec<DrawPrim>) {
+    let from = g.at(0.18, 0.0, 0.0);
+    // Carried: hangs forward and down, out of the way. Long enough to read as a
+    // weapon you are holding, not a spark in the hand.
+    let idle_dir = (g.side * 0.75 - Vec3::Y * 0.70 + g.fwd * 0.25).normalize_or_zero();
+    let idle_len = 2.2 * rs;
     // Cocked: drawn up and back over the shoulder, gathered behind the worm.
     let cock_dir = (g.up * 0.65 - g.fwd * 0.55 - g.side * 0.40).normalize_or_zero();
-    let cock_len = 2.00 * rs;
+    let cock_len = 3.6 * rs;
 
     let wind = l.cock;
     let base_dir = idle_dir.lerp(cock_dir, wind).normalize_or_zero();
@@ -609,27 +611,42 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, out: &mut Vec<DrawPrim>) {
         let pulse = (clock * 7.0 - t * 9.0).sin() * 0.5 + 0.5;
         let base = if k % 3 == 0 { PLASMA } else { lighten(PLASMA, 1.15) };
         let col = base.lerp(PLASMA_TIP, heat * (0.12 + 0.20 * pulse));
-        let r = (0.044 - 0.020 * t) * rs * (1.0 + 0.70 * heat);
+        let r = (0.100 - 0.045 * t) * rs * (1.0 + 0.55 * heat);
         out.push(
             DrawPrim::capsule(place(path[k]), place(path[k + 1]), r, col, false)
                 .glowing()
                 .inkless(),
         );
+        // Soft plasma around the core. A halo on every segment keeps the lash a
+        // continuous ribbon instead of a string of beads.
+        let p = place(path[k]);
+        let halo = (r * 2.2).max(0.10);
+        glow.push(Sprite::front_ball(
+            p,
+            halo,
+            PLASMA.lerp(PLASMA_TIP, 0.08 + 0.22 * heat),
+            0.22 + 0.42 * heat,
+            p.x * 1.7 + p.z * 0.9,
+            halo * 0.9,
+        ));
     }
     // The hot tip: a small ball of energy that leads the crack.
     let tip = place(path[WHIP_POINTS - 1]);
-    let size = (0.055 + 0.055 * heat) * rs;
+    let size = (0.14 + 0.14 * heat) * rs;
     out.push(
         DrawPrim::capsule(tip, tip + Vec3::Y * 0.004, size, PLASMA_TIP, false)
             .glowing()
             .inkless(),
     );
+    glow.push(Sprite::front_ball(tip, size * 2.2, PLASMA_TIP, 0.35 + 0.45 * heat, tip.x + tip.z, size * 2.0));
 }
 
 /// The capsules for `worms`, each drawn at `positions[i]` (the sim's position
-/// smoothed between two ticks, see `Viewer::frame`).
-pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawPrim> {
+/// smoothed between two ticks, see `Viewer::frame`), plus the glow sprites the
+/// plasma whip emits. Most rigs produce no sprites; the whip is the exception.
+pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim>, Vec<Sprite>) {
     let mut out = Vec::new();
+    let mut glow = Vec::new();
     for (i, (worm, &pos)) in worms.iter().zip(positions).enumerate() {
         if !worm.alive {
             continue; // (the death flash is an effect, see `effects.rs`)
@@ -1029,6 +1046,7 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
                 phase: anim.whip_phase,
                 style: anim.whip_style,
             },
+            &mut glow,
             &mut out,
         );
 
@@ -1079,7 +1097,12 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             }
         }
     }
-    out
+    (out, glow)
+}
+
+/// Capsules only, for tests that do not inspect the whip's glow.
+pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawPrim> {
+    draw(worms, positions, anims).0
 }
 
 /// The body's forward and right axes. `right` is the direction `move_dir.x`
@@ -1397,10 +1420,10 @@ mod tests {
         // Drawn back: still carried, but gathered up towards the shoulder.
         w.weapons[WHIP as usize].charge = WEAPONS[WHIP as usize].windup;
         let cocked = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        assert!(furthest(&cocked, pos) < 4.0, "still in hand while cocked");
+        assert!(furthest(&cocked, pos) < 4.5, "still in hand while cocked: {}", furthest(&cocked, pos));
         assert!(cocked.iter().all(sane));
 
-        // The strike: the tip reaches almost the whole 9.5 m.
+        // The strike: the tip reaches almost the whole 12 m.
         anim.struck(WhipStyle::Sweep, 0.0);
         anim.whip = LASH_UNFURL + LASH_SWING * 0.5;
         let strike = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
@@ -1411,7 +1434,7 @@ mod tests {
         // carried pose is continuous across the cycle.
         anim.whip = LASH_LIFE + 0.01;
         let settled = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-        assert!(furthest(&settled, pos) < 4.0);
+        assert!(furthest(&settled, pos) < 4.5, "settled: {}", furthest(&settled, pos));
         for c in &settled {
             assert!(sane(c), "settled lash");
         }

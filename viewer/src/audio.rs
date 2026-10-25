@@ -286,6 +286,10 @@ impl Sfx {
                 let p = Place::at(pos, listener, right);
                 self.hit(damage, weapon, p);
             }
+            Event::Impact { weapon, pos, .. } => {
+                let p = Place::at(pos, listener, right);
+                self.impact(weapon, p);
+            }
             Event::Died { pos, .. } => {
                 let p = Place::at(pos, listener, right);
                 self.died(p);
@@ -581,6 +585,24 @@ impl Sfx {
         if let Some(voice) = extra {
             self.add(voice, p);
         }
+    }
+
+    /// A shot stopping against rock: a short dry crack, quieter than a body hit
+    /// but present, so a wall of missed fire still sounds like fire. The weapon
+    /// nudges the pitch, so a railgun ping stays distinct from a blaster tick.
+    fn impact(&mut self, weapon: u8, p: Place) {
+        let body = match weapon {
+            RAILGUN => 1_500.0,
+            WHIP => 900.0,
+            _ => 460.0,
+        };
+        self.add(
+            Voice::new(vec![
+                Layer::noise(0.30, 0.0004, 90.0, 0.05, 8_000.0),
+                Layer::sine(0.18, 0.001, 28.0, 0.13, body, body * 0.35),
+            ]),
+            p,
+        );
     }
 
     fn died(&mut self, p: Place) {

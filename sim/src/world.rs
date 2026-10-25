@@ -373,6 +373,10 @@ pub enum Event {
     /// from a blaster round. `dir` is the way the damage pushed the body (away
     /// from the shot or the blast), so the viewer can throw the blood that way.
     Hit { victim: u8, weapon: u8, pos: Vec3, damage: f32, dir: Vec3 },
+    /// A projectile finished on rock instead of a worm: where it struck and the
+    /// surface normal, so the viewer can spark, mark and voice the hit. Without
+    /// this, most missed shots would be silent and invisible.
+    Impact { weapon: u8, pos: Vec3, normal: Vec3 },
     Died { victim: u8, killer: u8, pos: Vec3 },
     /// `worm` jumped from `from` to `to` (the Teleport gun).
     Teleported { worm: u8, from: Vec3, to: Vec3 },
@@ -1190,6 +1194,35 @@ mod tests {
         let climbed = w.worms[0].pos.x - at.x;
         assert!(climbed > 3.0, "climbed {climbed} m in a second");
         assert!(w.worms[0].on_ground);
+    }
+
+    #[test]
+    fn a_fast_landing_on_a_slope_grounds_the_worm_instead_of_skimming() {
+        // Hitting a slope turns horizontal speed into upward speed (the
+        // collision pushes the body out along the surface). The landing test
+        // used to read that as "taking off", so the worm rode the surface
+        // without ever being on the ground: it could not jump, and only the
+        // light air drag slowed it down. It skated up the whole hill.
+        let mut w = World::new(Grid::from_fn(IVec3::new(16, 8, 8), ramp), &[(18.0, 16.0)], 1);
+        let surface = 4.0 + 18.0 * 30f32.to_radians().tan();
+        {
+            let worm = &mut w.worms[0];
+            worm.pos = Vec3::new(18.0, surface + 1.07, 16.0);
+            worm.vel = Vec3::new(14.0, 0.0, 0.0);
+            worm.on_ground = false;
+            worm.action = Action::Freefall;
+            worm.air_jumps = 0; // spent: a stuck worm cannot jump at all
+        }
+        let mut ticks = 0;
+        while ticks < 60 && !w.worms[0].on_ground {
+            w.step(&[Input::default()]);
+            ticks += 1;
+        }
+        assert!(w.worms[0].on_ground, "landed on the hill");
+        assert!(ticks < 10, "landed at once instead of skating along the slope: {ticks} ticks");
+        // Touching the ground gives the air jump back.
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::Jump, "and can jump again");
     }
 
     #[test]

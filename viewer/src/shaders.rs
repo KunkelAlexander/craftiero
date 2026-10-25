@@ -43,6 +43,10 @@ pub fn post() -> String {
     format!("{}{POST}", uniforms())
 }
 
+pub fn sprites() -> String {
+    format!("{}{SPRITES}", uniforms())
+}
+
 // One uniform block shared by both passes. Everything is vec4 so the Rust side
 // needs no padding thought (WGSL aligns vec3 to 16 bytes, which bites).
 const COMMON_UNIFORMS: &str = r#"
@@ -57,6 +61,19 @@ struct Prim {
     col: vec4<f32>,         // rgb (sRGB) + w: kind 0/1/2
 }
 
+// A dynamic point light: blasts, muzzle flashes, plasma. Must match `Light` in
+// renderer.rs.
+struct Light {
+    a: vec4<f32>,           // xyz: position, w: radius
+    b: vec4<f32>,           // rgb: colour (linear), w: intensity
+}
+
+// A sphere of soot left by a blast. Must match `Soot` in renderer.rs.
+struct Soot {
+    a: vec4<f32>,           // xyz: centre, w: radius
+    b: vec4<f32>,           // x: strength 0..1
+}
+
 struct U {
     cam_pos: vec4<f32>,
     cam_right: vec4<f32>,   // right * tan(fov/2) * aspect
@@ -68,6 +85,8 @@ struct U {
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
     counts: vec4<f32>,      // x: number of capsules in use, y: shadow casters (the first y)
     fx: vec4<f32>,          // x: screen flash 0..1, y: world desaturation 0..1 (zw free)
+    lights: array<Light, 8>,
+    soot: array<Soot, 8>,
     caps: array<Prim, $CAPS>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
     // which capsules can be seen in the tile. With up to $CAPS capsules each
@@ -409,9 +428,44 @@ fn albedo(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return mix(rock, grass, up);
 }
 
+// How much soot covers this point, 0..1. Summed from the recent blasts so two
+// overlapping craters are darker than one.
+fn soot_at(p: vec3<f32>) -> f32 {
+    var s = 0.0;
+    for (var i = 0; i < 8; i++) {
+        let S = u.soot[i];
+        if (S.b.x <= 0.001) { continue; }
+        let f = 1.0 - smoothstep(S.a.w * 0.55, S.a.w, length(p - S.a.xyz));
+        s = max(s, f * S.b.x);
+    }
+    return min(s, 1.0);
+}
+
 // Three flat bands with a hair of smoothing so the edges do not alias.
 fn toon(x: f32) -> f32 {
     return smoothstep(0.0, 0.04, x) * 0.55 + smoothstep(0.42, 0.46, x) * 0.45;
+}
+
+// Add the eight dynamic lights to a shaded surface. The falloff is squared and
+// then banded with `toon`, so a fireball paints hard-edged pools of light on the
+// rock in the same visual language as the sun instead of a smooth CG gradient.
+fn lit_by_points(p: vec3<f32>, n: vec3<f32>, base: vec3<f32>, col: vec3<f32>) -> vec3<f32> {
+    var out = col;
+    for (var i = 0; i < 8; i++) {
+        let L = u.lights[i];
+        if (L.b.w <= 0.001 || L.a.w <= 0.0) { continue; }
+        let d = L.a.xyz - p;
+        let dist2 = dot(d, d);
+        let reach2 = L.a.w * L.a.w;
+        if (dist2 > reach2) { continue; }
+        let dist = sqrt(dist2);
+        let near = max(1.0 - dist / L.a.w, 0.0);
+        let fall = near * near;
+        let ndl = max(dot(n, d / max(dist, 0.001)), 0.0);
+        let band = 0.30 + 0.70 * toon(ndl);
+        out += base * L.b.rgb * L.b.w * fall * band;
+    }
+    return out;
 }
 
 // The world is deliberately quieter than the actors. Most of the green is
@@ -501,6 +555,10 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
 
     var col = sky(rd);
     var inkless = false;
+    // How much this pixel is its own light source, 0..1. Written to the colour
+    // target's alpha so the bloom in `fs_present` only glows emissive things,
+    // never the bright sky or pale rock. A capsule drawn self-lit sets it.
+    var emit = 0.0;
     let fog_col = srgb(vec3<f32>(0.93, 0.86, 0.72));
     if (kind == 1 || kind == 3) {
         let p = ro + rd * t;
@@ -512,6 +570,10 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             n = prim_normal(p, ci);
             base = srgb(u.caps[ci].col.rgb);
         }
+        // Fresh craters are burnt: darken the albedo wherever a recent blast
+        // left soot. This follows the bowl's walls for free, which decals on a
+        // plane cannot.
+        base *= 1.0 - soot_at(p) * 0.90;
 
         // Hard shadow ray towards the sun. Pattern: it reuses `trace`, so it
         // gets the empty-space skipping for free.
@@ -547,7 +609,11 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         let to_cam = ro - p;
         let lamp_d = length(to_cam);
         if (self_lit) {
-            col = base * 1.45;
+            // Brighter than white: the present pass tone-maps it and the bloom
+            // pass spills the excess light into the surrounding rock. This is
+            // what makes a bolt read as energy and not as a painted dot.
+            col = base * 5.0;
+            emit = 1.0;
         } else {
             col = base * tint * mix(0.55, 1.0, occl);
 
@@ -556,6 +622,8 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             // uses the same banding so it still looks drawn, not rendered.
             let lamp = max(dot(n, to_cam / lamp_d), 0.0) * (1.0 - smoothstep(3.0, 26.0, lamp_d));
             col += base * vec3<f32>(1.0, 0.78, 0.5) * toon(lamp) * 0.5 * (1.0 - toon(lit)) * mix(0.5, 1.0, occl);
+            // Blasts, flashes and plasma light the world around them.
+            col = lit_by_points(p, n, base, col);
         }
 
         // A glossy skin: capsules catch a small highlight and a cool rim, which
@@ -591,7 +659,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     }
 
     var out: Out;
-    out.color = vec4<f32>(col, 1.0);
+    out.color = vec4<f32>(col, emit);
     // An inkless primitive writes a sentinel normal instead of a real one:
     // `fs_ink` reads it as "draw no outline here" (and draws none around it).
     var gbuf_n = n * 0.5 + 0.5;
@@ -600,6 +668,160 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     }
     out.gbuf = vec4<f32>(gbuf_n, t);
     return out;
+}
+"#;
+
+const SPRITES: &str = r#"
+// Soft billboards and decals: camera-facing quads layered over the inked
+// picture. They are raster, not ray-marched, so a fireball is a soft sprite
+// instead of an opaque ball, and a blood stain is painted onto the rock instead
+// of floating above it. The G-buffer supplies depth (occlusion) and, for
+// decals, the exact surface point and normal.
+struct Sprite {
+    a: vec4<f32>, // xyz centre, w radius (metres)
+    b: vec4<f32>, // rgb colour (sRGB), w opacity 0..1
+    c: vec4<f32>, // glow/smoke: x seed, y softness; decal: xyz normal, w seed
+}
+struct Sprites { data: array<Sprite> }
+@group(0) @binding(1) var<storage, read> sprites: Sprites;
+@group(0) @binding(2) var gbuf_tex: texture_2d<f32>;
+
+struct VSOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) @interpolate(flat) i: u32,
+    /// Clip-space position (-1..1). `pos` above is in framebuffer pixels in the
+    /// fragment stage, so a sprite shader must use this to build a view ray.
+    @location(2) ndc: vec2<f32>,
+}
+
+// The sRGB colour is converted to linear so the hardware re-encodes it to the
+// same colour on the sRGB target (the march shader does the same).
+fn lin(c: vec3<f32>) -> vec3<f32> {
+    return pow(c, vec3<f32>(2.2));
+}
+
+fn sprite_rd(ndc: vec2<f32>) -> vec3<f32> {
+    return normalize(u.cam_fwd.xyz + ndc.x * u.cam_right.xyz + ndc.y * u.cam_up.xyz);
+}
+
+@vertex
+fn vs_sprite(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut {
+    let s = sprites.data[ii];
+    let right = normalize(u.cam_right.xyz);
+    let up = normalize(u.cam_up.xyz);
+    let fwd = normalize(u.cam_fwd.xyz);
+    let tan = length(u.cam_up.xyz);
+    let aspect = length(u.cam_right.xyz) / tan;
+    let rel = s.a.xyz - u.cam_pos.xyz;
+    let depth = dot(rel, fwd);
+    let corner = vec2<f32>(
+        select(-1.0, 1.0, (vi & 1u) != 0u),
+        select(-1.0, 1.0, (vi & 2u) != 0u));
+    var o: VSOut;
+    o.local = corner;
+    o.i = ii;
+    if (depth < 0.05) {
+        o.pos = vec4<f32>(0.0, 0.0, 2.0, 1.0); // clipped: behind the camera
+        return o;
+    }
+    let cx = dot(rel, right) / (depth * tan * aspect);
+    let cy = dot(rel, up) / (depth * tan);
+    let sx = s.a.w / (depth * tan * aspect);
+    let sy = s.a.w / (depth * tan);
+    o.pos = vec4<f32>(cx + corner.x * sx, cy + corner.y * sy, 0.0, 1.0);
+    o.ndc = o.pos.xy;
+    return o;
+}
+
+// Fade a sprite that is behind the nearest surface, so a fireball behind a hill
+// is occluded without a hard pop. The sprite is treated as a volume: its near
+// face (not its centre) is compared with the scene, so a fireball rising out of
+// the crater it just made is not sliced in half by the rim.
+fn occlude(ndc: vec2<f32>, centre: vec3<f32>, radius: f32, soft: f32) -> f32 {
+    let px = (ndc * 0.5 + 0.5) * u.size.xy;
+    let t_scene = textureLoad(gbuf_tex, vec2<i32>(floor(px)), 0).w;
+    let rd = sprite_rd(ndc);
+    let t_sprite = dot(centre - u.cam_pos.xyz, rd) - radius * 0.55;
+    return 1.0 - smoothstep(0.0, soft, t_sprite - t_scene);
+}
+
+@fragment
+fn fs_glow(vin: VSOut) -> @location(0) vec4<f32> {
+    let r = length(vin.local);
+    if (r > 1.0) { discard; }
+    let s = sprites.data[vin.i];
+    let flags = i32(s.c.z + 0.5);
+    var shape = pow(smoothstep(1.0, 0.0, r), 1.7);
+    var tint = lin(s.b.rgb);
+    if ((flags & 2) != 0) {
+        // A shockwave: a ragged ring near the edge of the quad, not a disc.
+        let band = max(s.c.w / s.a.w, 0.004);
+        let ang = atan2(vin.local.y, vin.local.x);
+        let ragg = vnoise2(vec2<f32>(ang * 3.0 + s.c.x, s.c.x * 0.7));
+        shape = smoothstep(band * (0.55 + 0.9 * ragg), 0.0, abs(r - 0.80)) * (0.55 + 0.45 * ragg);
+    } else if ((flags & 4) != 0) {
+        // Fire: two octaves of noise tear the edge into tongues and break the
+        // perfect circle, and a small white-hot core sits at the middle.
+        let n1 = vnoise2(vin.local * 2.9 + vec2<f32>(s.c.x, s.c.x * 1.3));
+        let n2 = vnoise2(vin.local * 7.1 - vec2<f32>(s.c.x * 0.7, s.c.x));
+        let n3 = vnoise2(vin.local * 13.0 + vec2<f32>(s.c.x * 1.7, s.c.x * 0.3));
+        let ragged = 0.5 * n1 + 0.3 * n2 + 0.2 * n3;
+        // Cut holes out of the sheet of flame: that is what turns a disc into
+        // tongues of fire. The holes are larger towards the edge.
+        let holes = smoothstep(0.30, 0.46, ragged + (1.0 - r) * 0.30);
+        shape = smoothstep(1.0, 0.45, r + (ragged - 0.5) * 0.55) * holes * (0.55 + 0.45 * (1.0 - r));
+        tint = mix(tint, vec3<f32>(3.0, 2.2, 1.4), pow(max(1.0 - r, 0.0), 3.0) * 0.22);
+    }
+    var alpha = s.b.w * shape;
+    if ((flags & 1) == 0) {
+        alpha *= occlude(vin.ndc, s.a.xyz, s.a.w, s.c.y);
+    }
+    if (alpha <= 0.004) { discard; }
+    // Fire is orange light with a small white heart; a flat 3x gain turned the
+    // whole ball into a white blob. Sparks and flashes keep the hotter gain.
+    let gain = select(3.0, 1.25, (flags & 4) != 0);
+    return vec4<f32>(tint * alpha * gain, alpha);
+}
+
+@fragment
+fn fs_smoke(vin: VSOut) -> @location(0) vec4<f32> {
+    let r = length(vin.local);
+    if (r > 1.0) { discard; }
+    let s = sprites.data[vin.i];
+    // A ragged edge, so a cloud reads as billowing smoke rather than a disc.
+    let wob = vnoise2(vin.local * 3.2 + vec2<f32>(s.c.x, s.c.x * 0.7)) - 0.5;
+    let edge = smoothstep(1.0, 0.15, r + wob * 0.28);
+    var alpha = s.b.w * edge;
+    if ((i32(s.c.z + 0.5) & 1) == 0) {
+        alpha *= occlude(vin.ndc, s.a.xyz, s.a.w, s.c.y);
+    }
+    if (alpha <= 0.004) { discard; }
+    return vec4<f32>(lin(s.b.rgb), alpha);
+}
+
+@fragment
+fn fs_decal(vin: VSOut) -> @location(0) vec4<f32> {
+    let s = sprites.data[vin.i];
+    let ndc = vin.ndc;
+    let px = (ndc * 0.5 + 0.5) * u.size.xy;
+    let g = textureLoad(gbuf_tex, vec2<i32>(floor(px)), 0);
+    // Only paint onto solid surfaces: the sky keeps its far distance, and
+    // inkless primitives mark their normal with -1.
+    if (g.w > 300.0 || g.x < 0.0) { discard; }
+    // The visible surface point, projected from the G-buffer. A stain is a
+    // sphere of paint: every surface point inside it gets the colour. That is
+    // what lets one stain cover a curved crater wall instead of a flat plane.
+    let p = u.cam_pos.xyz + sprite_rd(ndc) * g.w;
+    let t = p - s.a.xyz;
+    let rr = length(t) / s.a.w;
+    if (rr > 1.0) { discard; }
+    // An irregular splatter edge, so a stain reads as splatter, not a stamp.
+    let wob = vnoise3(t * 3.0 + vec3<f32>(s.c.w));
+    let mask = smoothstep(1.0, 0.22, rr + (wob - 0.5) * 0.55);
+    let alpha = s.b.w * mask;
+    if (alpha <= 0.004) { discard; }
+    return vec4<f32>(lin(s.b.rgb), alpha);
 }
 "#;
 
@@ -668,7 +890,8 @@ fn edge(p: vec2<i32>, o: i32) -> f32 {
 @fragment
 fn fs_ink(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let home = vec2<i32>(floor(frag.xy));
-    var col = textureLoad(color_tex, home, 0).rgb;
+    let src = textureLoad(color_tex, home, 0);
+    var col = src.rgb;
 
     if (u.flags.w > 0.5) {
         // Hand-drawn feel: the lines are looked up a pixel or two off, by a
@@ -686,13 +909,77 @@ fn fs_ink(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         }
         col = mix(col, vec3<f32>(0.05, 0.035, 0.07), clamp(line, 0.0, 1.0) * 0.92);
     }
-    return vec4<f32>(col, 1.0);
+    // Carry the emissive mask forward so bloom can run on the inked picture.
+    return vec4<f32>(col, src.a);
+}
+
+// Filmic shoulder: keep the painting's midtones, roll hot effects off to white.
+fn tonemap(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(1.0) - exp(-c * 1.25);
+}
+
+// The glow source at binding 1 is the inked picture for the downsample pass and
+// a bloom level for the blur passes; all three are fullscreen and ratio-2.
+@group(0) @binding(1) var src_tex: texture_2d<f32>;
+@group(0) @binding(2) var src_smp: sampler;
+@group(0) @binding(5) var bloom_tex: texture_2d<f32>;
+
+// First bloom step: halve the ink picture, keeping only the light it emits (the
+// alpha mask), with a 3x3 tent. Half resolution is plenty for a soft halo and
+// makes the blur below cheap.
+@fragment
+fn fs_bloom_down(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = frag.xy * 2.0 / u.size.xy;
+    let px = 1.0 / u.size.xy;
+    let w = vec3<f32>(0.25, 0.125, 0.0625);
+    var c = vec3<f32>(0.0);
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let s = textureSampleLevel(src_tex, src_smp, uv + vec2<f32>(f32(x), f32(y)) * px, 0.0);
+            let weight = select(w.y, w.z, x != 0 && y != 0);
+            c += s.rgb * min(s.a, 1.0) * select(weight, w.x, x == 0 && y == 0);
+        }
+    }
+    return vec4<f32>(c, 0.0);
+}
+
+// Two separable gaussian blurs: wide enough to spill a fireball's light several
+// metres across the rock, smooth enough that a bright ring does not turn into a
+// stack of ghost rings (which a one-pass tap ring does).
+fn blur(src_uv: vec2<f32>, axis: vec2<f32>) -> vec3<f32> {
+    let half = u.size.xy * 0.5;
+    let d = axis / half;
+    var c = textureSampleLevel(src_tex, src_smp, src_uv, 0.0).rgb * 0.227027;
+    c += textureSampleLevel(src_tex, src_smp, src_uv + d * 1.3846, 0.0).rgb * 0.316216;
+    c += textureSampleLevel(src_tex, src_smp, src_uv - d * 1.3846, 0.0).rgb * 0.316216;
+    c += textureSampleLevel(src_tex, src_smp, src_uv + d * 3.2308, 0.0).rgb * 0.070270;
+    c += textureSampleLevel(src_tex, src_smp, src_uv - d * 3.2308, 0.0).rgb * 0.070270;
+    return c;
+}
+
+@fragment
+fn fs_blur_h(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(blur(frag.xy / (u.size.xy * 0.5), vec2<f32>(1.0, 0.0)), 0.0);
+}
+
+@fragment
+fn fs_blur_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4<f32>(blur(frag.xy / (u.size.xy * 0.5), vec2<f32>(0.0, 1.0)), 0.0);
 }
 
 @fragment
 fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = frag.xy / u.size.zw;
     var col = textureSampleLevel(ink_tex, ink_smp, uv, 0.0).rgb;
+
+    // Bloom: the blurred light (fire, plasma, flashes) added in linear light,
+    // then tone-mapped. Only emissive pixels contributed, so the sky and pale
+    // rock stay clean.
+    col += textureSampleLevel(bloom_tex, ink_smp, uv, 0.0).rgb * 0.85;
+
+    // Tone-map the HDR picture. Hot cores roll off to white, which is what
+    // makes a fireball look like it is emitting light instead of being orange.
+    col = tonemap(col);
 
     // Impact flash: a white frame with a slight lens split. The two extra
     // texture taps only run while a flash is alive (a blink), so the steady
@@ -704,7 +991,8 @@ fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let ca = flash * 0.010;
         let r = textureSampleLevel(ink_tex, ink_smp, uv + d * ca, 0.0).r;
         let b = textureSampleLevel(ink_tex, ink_smp, uv - d * ca, 0.0).b;
-        col = vec3<f32>(r, col.g, b);
+        let split = tonemap(vec3<f32>(r, col.g, b));
+        col = vec3<f32>(split.r, col.g, split.b);
         let core = 1.0 - 0.40 * smoothstep(0.0, 0.7, dot(d, d) * 2.0);
         col = mix(col, vec3<f32>(1.0, 0.97, 0.90), flash * core * 0.60);
     }

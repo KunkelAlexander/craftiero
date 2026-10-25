@@ -8,19 +8,19 @@
 // fewer of them.
 
 use crate::feel;
-use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA_HOT, SMOKE, VIOLET};
-use crate::renderer::DrawPrim;
+use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA, PLASMA_HOT, SMOKE, VIOLET};
+use crate::renderer::{DrawPrim, Light, Soot, Sprite};
 use glam::Vec3;
 use sdf::Grid;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
-use sim::{whip_path, AimPath, Event, Projectile, Worm, DT, WHIP_POINTS};
+use sim::{whip_path, AimPath, Event, Projectile, Worm, DT, WHIP_POINTS, WHIP_SWEEP};
 use std::f32::consts::TAU;
 
 /// Gameplay effects share the renderer's 256-slot core pool with the worms,
 /// projectiles and aim aid. Keep these lists small so a busy fight drops dust
 /// instead of rockets.
-const MAX_BURSTS: usize = 24;
-const MAX_DUST: usize = 20;
+const MAX_BURSTS: usize = 96;
+const MAX_DUST: usize = 96;
 /// Air traces. They are the first thing to drop when a fight is busy, because
 /// they are the least important: the shot itself still has to be drawn.
 const MAX_TRAILS: usize = 24;
@@ -28,7 +28,9 @@ const MAX_TRAILS: usize = 24;
 /// two lists feed it: stains are queued first, so a full pool loses droplets,
 /// never the marks on the floor.
 const MAX_BLOOD: usize = 128;
-const MAX_SPLATS: usize = 48;
+/// Surface decals (blood stains and scorch marks) are cheap sprites, not SDF
+/// primitives, so the floor can hold a lot of them.
+const MAX_SPLATS: usize = 192;
 
 const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
 
@@ -41,6 +43,11 @@ const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
 /// darker because a stain on rock should look like a stain, not a lamp.
 const BLOOD: Vec3 = Vec3::new(0.78, 0.035, 0.045);
 const BLOOD_DARK: Vec3 = Vec3::new(0.50, 0.018, 0.028);
+/// The scorch a shot leaves on rock: near-black, so it reads as a burn, not a
+/// hole, and never competes with the weapon's own colour.
+const SCORCH: Vec3 = Vec3::new(0.09, 0.075, 0.07);
+/// Freshly broken rock: the lumps a blast throws out.
+const ROCK: Vec3 = Vec3::new(0.34, 0.28, 0.23);
 
 /// A deterministic 0..1 from a float. Blood spray must look violent, but the
 /// viewer has no RNG: the same hit in a replay must throw the same droplets.
@@ -147,9 +154,10 @@ fn ammo(weapon: u8, at: Vec3, vel: Vec3, out: &mut Vec<DrawPrim>) {
     let ball = |p: Vec3, r: f32, col: Vec3| DrawPrim::capsule(p, p + up * 0.004, r, col, false);
     match weapon {
         BLASTER => {
-            // A plasma bolt: a hot head with a short tail so its speed reads.
-            out.push(DrawPrim::cylinder(back(0.36), at, 0.035, CYAN, false));
-            out.push(ball(at, 0.11, HOT).glowing());
+            // A plasma bolt: a hot head with a tail so its speed reads, sized up
+            // so the ammunition is a thing you can actually track in flight.
+            out.push(DrawPrim::cylinder(back(0.52), at, 0.05, CYAN, false));
+            out.push(ball(at, 0.16, HOT).glowing());
         }
         ROCKET => {
             // A real rocket: body, nose, and a flame where the exhaust is.
@@ -213,6 +221,9 @@ pub fn projectiles(list: &[Projectile], alpha: f32) -> Vec<DrawPrim> {
 /// self-lit.
 fn trail(weapon: u8) -> Option<(Vec3, f32, u32, bool)> {
     match weapon {
+        // The blaster is a fast bolt, so its ammunition reads as a hot comet
+        // tail rather than a puff of smoke.
+        BLASTER => Some((CYAN, 0.055, 1, true)),
         // A rocket leaves the classic grey plume.
         ROCKET => Some((Vec3::new(0.62, 0.60, 0.57), 0.180, 1, false)),
         CLUSTER => Some((Vec3::new(0.62, 0.56, 0.45), 0.140, 1, false)),
@@ -318,6 +329,10 @@ enum Shape {
     Ring { at: Vec3, normal: Vec3, radius: f32 },
     /// A blood splat lying on the rock: one flattened lozenge on `normal`.
     Splat { at: Vec3, normal: Vec3, radius: f32 },
+    /// A lump of rock thrown by a blast. Drawn as a solid capsule (with ink,
+    /// shadow and shading), because flying rubble is what makes a crater look
+    /// like it was torn open rather than painted on.
+    Rock { at: Vec3, radius: f32 },
 }
 
 struct Effect {
@@ -340,6 +355,10 @@ struct Effect {
     /// Skip the ink outline (soft smoke, the aim aid). Without this a small
     /// primitive far away is all outline and reads as a dark pebble.
     inkless: bool,
+    /// Draw in front of the scene, with no depth fade. A muzzle flash sits
+    /// inside the drawn barrel and an impact flash is half-buried in the rock;
+    /// both would otherwise be erased by the very geometry that made them.
+    front: bool,
 }
 
 impl Effect {
@@ -355,6 +374,7 @@ impl Effect {
             width: 0.12,
             hot: false,
             inkless: false,
+            front: false,
         }
     }
 
@@ -374,6 +394,12 @@ impl Effect {
         self
     }
 
+    /// Draw it in front of the scene (see `front`).
+    fn front(mut self) -> Effect {
+        self.front = true;
+        self
+    }
+
     fn puff(at: Vec3, vel: Vec3, radius: f32, colour: Vec3, life: f32, gravity: f32) -> Effect {
         Effect {
             shape: Shape::Ball { at, radius },
@@ -386,6 +412,7 @@ impl Effect {
             width: 0.0,
             hot: false,
             inkless: false,
+            front: false,
         }
     }
 
@@ -394,7 +421,7 @@ impl Effect {
     fn splat(at: Vec3, normal: Vec3, radius: f32) -> Effect {
         Effect {
             shape: Shape::Splat { at, normal, radius },
-            colour: BLOOD_DARK,
+            colour: BLOOD,
             vel: Vec3::ZERO,
             gravity: 0.0,
             age: 0.0,
@@ -402,10 +429,12 @@ impl Effect {
             // that the pool recycles instead of becoming permanent.
             life: 14.0,
             burst: false,
-            width: 0.0,
+            // Opacity: 1 for a fresh wound, lower for a faint burn.
+            width: 1.0,
             hot: false,
             // A decal has no side; an ink rim would draw a 3D tube around it.
             inkless: true,
+            front: false,
         }
     }
 
@@ -423,6 +452,7 @@ impl Effect {
             width: 0.0,
             hot: true,
             inkless: true,
+            front: false,
         }
     }
 }
@@ -493,6 +523,15 @@ fn draw_effects<'a>(iter: impl Iterator<Item = &'a Effect>, out: &mut Vec<DrawPr
                     e,
                 ));
             }
+            Shape::Rock { at, radius } => {
+                // A lump, not a sphere: the two ends differ a little so the
+                // silhouette is a nugget. It shrinks as it burns out.
+                let size = radius * (1.0 - 0.45 * u);
+                let tilt = noise(at.x * 3.0 + at.z * 2.0) - 0.5;
+                let b = *at + Vec3::new(tilt, 0.55, -tilt) * size;
+                let a = *at - Vec3::new(tilt, 0.55, -tilt) * size * 0.55;
+                out.push(styled(DrawPrim::capsule(a, b, size, e.colour, false), e));
+            }
         }
     }
 }
@@ -515,6 +554,46 @@ pub struct Effects {
     /// Counts sim ticks, so a trail's spacing follows the fight rather than the
     /// display's frame rate.
     trail_tick: u32,
+    /// Dynamic lights thrown by blasts, flashes and plasma.
+    lights: Vec<LightFx>,
+    /// Soot spheres on the terrain, left by blasts.
+    soot: Vec<SootFx>,
+}
+
+/// A patch of soot that fades over half a minute.
+#[derive(Clone, Copy)]
+struct SootFx {
+    at: Vec3,
+    radius: f32,
+    strength: f32,
+    age: f32,
+    life: f32,
+}
+
+impl SootFx {
+    fn now(&self) -> f32 {
+        let u = (self.age / self.life).clamp(0.0, 1.0);
+        // Full strength for the first half, then a slow wash-out.
+        self.strength * (1.0 - ((u - 0.5) / 0.5).clamp(0.0, 1.0))
+    }
+}
+
+/// A point light with a short life. Its power fades with age, so an explosion
+/// lights the cave for a beat and then lets the world go dark again.
+#[derive(Clone, Copy)]
+struct LightFx {
+    at: Vec3,
+    colour: Vec3,
+    radius: f32,
+    power: f32,
+    age: f32,
+    life: f32,
+}
+
+impl LightFx {
+    fn now(&self) -> f32 {
+        (1.0 - (self.age / self.life).clamp(0.0, 1.0)).powi(2) * self.power
+    }
 }
 
 impl Effects {
@@ -540,8 +619,28 @@ impl Effects {
                 let points = whip_path(from, dir, side, phase, length, style);
                 let tip = points[WHIP_POINTS - 1];
                 self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.30, PLASMA_HOT, 0.15, 0.0).glow());
-                for i in 0..5 {
-                    let a = i as f32 * 2.399 + phase;
+                self.push_light(tip, PLASMA, 9.0, 5.0, 0.28);
+                // The swing, drawn as a crescent of fading plasma. The sim only
+                // reports the pose at the end; replaying the sweep at a handful
+                // of bearings is what lets the player see the lash's reach.
+                for k in 0..11 {
+                    let s = k as f32 / 10.0;
+                    let ang = WHIP_SWEEP * (1.0 - 2.0 * s);
+                    let rot = glam::Quat::from_rotation_y(ang);
+                    let d = rot * dir;
+                    let sd = rot * side;
+                    let trail = whip_path(from, d, sd, phase, length, style);
+                    let t = trail[WHIP_POINTS - 1];
+                    let life = 0.38 - 0.16 * s;
+                    self.push_burst(
+                        Effect::puff(t, Vec3::ZERO, 0.13 + 0.04 * (1.0 - s), PLASMA, life, 0.0).glow().front(),
+                    );
+                    let mid = trail[WHIP_POINTS * 2 / 3];
+                    self.push_burst(
+                        Effect::puff(mid, Vec3::ZERO, 0.09, PLASMA, life * 0.8, 0.0).glow().front(),
+                    );
+                }
+                for i in 0..5 {                    let a = i as f32 * 2.399 + phase;
                     let spark = Vec3::new(a.cos(), 0.35 + 0.4 * (a * 1.7).sin().abs(), a.sin());
                     self.push_burst(Effect::puff(
                         tip,
@@ -554,17 +653,36 @@ impl Effects {
                 }
             }
             Event::Shot { weapon, pos, .. } => {
-                // A short hot ball at the muzzle in the weapon's own colour (the
+                // A hot flash at the muzzle in the weapon's own colour (the
                 // tracer's direction is known to `main`), plus a wisp of smoke
-                // that drifts up after it.
+                // that drifts up after it. Long enough to read: a flash that
+                // lives three frames was why the old muzzle felt like a pop.
                 let (col, size) = flash(weapon);
-                self.push_burst(Effect::puff(pos, Vec3::ZERO, size, col, 0.06, 0.0).glow());
-                self.push_dust(Effect::puff(pos + Vec3::Y * 0.02, Vec3::Y * 0.5, 0.08, SMOKE, 0.4, -0.1));
+                // A hot core and a wider halo: a flash has to be seen over the
+                // gun, and a single soft dot at barrel height disappears.
+                self.push_burst(Effect::puff(pos, Vec3::ZERO, size * 0.85, col, 0.16, 0.0).glow().front());
+                self.push_burst(Effect::puff(pos, Vec3::ZERO, size * 2.1, col, 0.10, 0.0).glow().front());
+                // Three short spikes, so the flash has a silhouette instead of
+                // being a round lamp.
+                for i in 0..3 {
+                    let a = i as f32 * 2.094 + pos.x;
+                    let off = Vec3::new(a.cos(), 0.25 + 0.3 * (a * 1.3).sin().abs(), a.sin()) * size * 1.1;
+                    self.push_burst(
+                        Effect::puff(pos + off, Vec3::ZERO, size * 0.42, col, 0.09, 0.0).glow().front(),
+                    );
+                }
+                self.push_light(pos, col, 5.0, 1.6, 0.09);
+                self.push_dust(Effect::puff(pos + Vec3::Y * 0.03, Vec3::Y * 0.6, 0.10, SMOKE, 0.5, -0.1));
             }
             Event::Hit { weapon, pos, damage, dir, .. } => {
                 // The flash and sparks. Blood is added by `main` right after
                 // this, because its splats need the terrain grid to land on.
                 self.hit(pos, weapon, damage, dir);
+            }
+            Event::Impact { weapon, pos, normal } => {
+                // A shot stopped against rock: sparks, a flash and a scorch.
+                // Most missed shots would otherwise be silent and invisible.
+                self.impact(weapon, pos, normal);
             }
             Event::Died { pos, .. } => {
                 self.push_burst(
@@ -597,49 +715,175 @@ impl Effects {
     /// proportional to what the weapon can hurt without hiding the fight.
     fn blast(&mut self, weapon: u8, pos: Vec3, normal: Vec3, radius: f32) {
         let look = feel::blast(weapon);
-        // A white-hot core, then three fire layers thrown out from the centre.
+        let up = if normal.length_squared() > 1.0e-4 { normal.normalize_or_zero() } else { Vec3::Y };
+        // Lift the fire out of the crater the blast just carved. A fireball
+        // centred at the impact point sits at the bottom of its own bowl, where
+        // the near rim hides every pixel of it from a normal camera. Rising out
+        // of the hole is also what a real explosion does.
+        let lift = 0.05 * radius;
+        let base = pos + up * lift;
+
+        // A white-hot core that stays in front of everything: the first frames
+        // of a blast are the frame the player remembers.
         self.push_burst(
-            Effect::burst(Shape::Ball { at: pos, radius: radius * look.core_size }, look.core, 0.10).glow(),
+            Effect::burst(Shape::Ball { at: base + up * 0.15, radius: radius * look.core_size }, look.core, 0.11)
+                .glow()
+                .front(),
         );
-        for k in 0..3 {
-            // Deterministic spray, like every other effect here: no RNG.
-            let a = k as f32 * 2.1 + pos.x * 1.3 + pos.z * 0.7;
-            let off = Vec3::new(a.cos(), 0.2 + 0.5 * (a * 1.7).sin(), a.sin()) * radius * look.fire_reach[k];
+        self.push_light(
+            pos + up * (lift + 0.4),
+            look.fire[0].lerp(Vec3::ONE, 0.30),
+            radius * 2.6 + 2.0,
+            2.0 + radius * 1.6,
+            0.45 + radius * 0.10,
+        );
+        // The crater is burnt: one soot sphere, centred a little below the
+        // impact so it covers the floor and walls of the bowl.
+        if self.soot.len() >= 16 {
+            self.soot.remove(0);
+        }
+        self.soot.push(SootFx {
+            at: pos - up * radius * 0.30,
+            radius: radius * 1.7,
+            strength: 0.95,
+            age: 0.0,
+            life: 24.0,
+        });
+
+        // The body of the fireball: seven lobes of different sizes and colours,
+        // thrown out and up and slowing as they rise. One sphere per colour
+        // reads as a balloon; a ragged cluster reads as fire.
+        let fire_life = (0.34 + radius * 0.09) * look.fire_life;
+        // One big fire body with smaller lobes around it. All-lobes reads as a
+        // string of glowing beads; one big sphere reads as a balloon. Together
+        // they make a ragged, connected fireball.
+        let mut body = Effect::burst(
+            Shape::Ball { at: base + up * radius * 0.15, radius: radius * 0.80 },
+            look.fire[1],
+            fire_life * 1.15,
+        );
+        body.vel = up * (1.8 + radius * 0.40);
+        body.gravity = 4.0;
+        body.hot = true;
+        body.inkless = true;
+        body.front = true;
+        self.push_burst(body);
+        for k in 0..7 {
+            let a = k as f32 * 2.399 + pos.x * 1.3 + pos.z * 0.7;
+            let out = Vec3::new(a.cos(), 0.0, a.sin());
+            let reach = radius * look.fire_reach[k % 3] * (0.55 + 0.40 * k as f32);
+            let rise = radius * (0.10 + 0.08 * ((k * 2 + 1) as f32).sin().abs());
+            let size = radius * look.fire_size[k % 3] * (0.42 + 0.20 * (a * 1.7).sin().abs());
             let mut fire = Effect::burst(
-                Shape::Ball { at: pos + off, radius: radius * look.fire_size[k] },
-                look.fire[k],
-                (0.25 + radius * 0.04) * look.fire_life,
+                Shape::Ball { at: base + out * reach + up * rise, radius: size },
+                look.fire[k % 3],
+                fire_life * (0.90 + 0.12 * k as f32),
             );
-            // Self-lit and soft: a shaded sphere with an ink rim reads as a
-            // balloon, not as fire.
+            // The fire keeps climbing after the flash, so its top is above the
+            // crater rim within a frame or two.
+            fire.vel = up * (2.0 + radius * 0.55) + out * (0.8 + radius * 0.22);
+            fire.gravity = 5.0;
             fire.hot = true;
             fire.inkless = true;
+            // Fire is drawn in front of the terrain. A blast carves its own pit,
+            // and from a shoulder-height camera the near rim would otherwise hide
+            // the entire fireball. The fire is light: letting it spill over the
+            // rim is what an explosion looks like.
+            fire.front = true;
             self.push_burst(fire);
         }
-        self.debris(pos, radius, &look);
-        // The smoke is a separate, longer-lived thing: it is what the player
-        // sees after the flash has gone, and what makes a bomb feel dirty. It
-        // grows in from nothing, so the fire is not hidden on the first frame.
-        let mut smoke = Effect::burst(
-            Shape::Ball { at: pos + Vec3::Y * 0.3, radius: radius * look.smoke_size },
-            look.smoke,
-            look.smoke_life,
+
+        // A short-lived white flash around the whole thing, so the blast reads
+        // as a burst of light and not only a ball of fire.
+        let mut flare = Effect::burst(
+            Shape::Ball { at: base + up * radius * 0.18, radius: radius * 0.55 },
+            look.core,
+            0.13,
         );
-        smoke.vel = Vec3::Y * look.smoke_rise;
-        smoke.gravity = -0.2;
-        smoke.inkless = true;
-        self.push_dust(smoke);
+        flare.hot = true;
+        flare.inkless = true;
+        flare.front = true;
+        self.push_burst(flare);
+
+        self.debris(pos + up * (lift * 0.5), radius, &look);
+        self.rocks(pos + up * (lift * 0.5), radius);
+
+        // The smoke is a separate, longer-lived thing: it is what the player
+        // sees after the fire has gone, and what makes a bomb feel dirty. A
+        // handful of puffs of different sizes, rising at different speeds, build
+        // into a column instead of one grey ball.
+        let puffs = if radius > 4.0 { 12 } else { 8 };
+        for k in 0..puffs {
+            let a = k as f32 * 2.399 + pos.z * 0.9;
+            let out = Vec3::new(a.cos(), 0.0, a.sin()) * radius * (0.05 + 0.08 * (k % 3) as f32);
+            let mut smoke = Effect::puff(
+                base + out + up * radius * (0.10 + 0.06 * (k % 4) as f32),
+                Vec3::ZERO,
+                radius * look.smoke_size * (1.15 + 0.20 * (k % 3) as f32),
+                look.smoke,
+                look.smoke_life * (0.85 + 0.10 * (k % 3) as f32),
+                0.0,
+            );
+            smoke.vel = up * (look.smoke_rise * (1.2 + 0.25 * (k % 3) as f32)) + out * 0.35;
+            smoke.gravity = -0.15;
+            smoke.inkless = true;
+            // Smoke from a blast is drawn over the rim too: it is the cloud that
+            // tells you where the blast was after the fire is gone.
+            smoke.front = true;
+            self.push_dust(smoke);
+        }
+        // A ring of dust along the ground, so the blast meets the crater it made
+        // instead of hovering over a flat pale disc.
+        let ring = if radius > 4.0 { 10 } else { 7 };
+        for k in 0..ring {
+            let a = k as f32 * 6.283185 / ring as f32 + pos.x;
+            let out = Vec3::new(a.cos(), 0.0, a.sin());
+            let mut d = Effect::puff(
+                pos + out * radius * 0.55 + Vec3::Y * 0.25,
+                out * (1.6 + radius * 0.30) + Vec3::Y * 0.6,
+                radius * 0.38 * (0.85 + 0.15 * (k % 3) as f32),
+                DUST,
+                1.1 + 0.15 * (k % 3) as f32,
+                2.5,
+            );
+            d.inkless = true;
+            d.front = true;
+            self.push_dust(d);
+        }
+        // Fire-lit smoke right over the flames: dark, warm, and low, so it does
+        // not read as a second fireball.
+        for k in 0..2 {
+            let a = k as f32 * 2.399 + pos.x * 0.7;
+            let out = Vec3::new(a.cos(), 0.0, a.sin());
+            let mut d = Effect::puff(
+                base + out * radius * 0.25 + up * radius * 0.10,
+                up * (2.2 + radius * 0.25) + out * 0.8,
+                radius * look.smoke_size * 0.55,
+                look.fire[0].lerp(look.smoke, 0.80) * 0.7,
+                1.1,
+                0.0,
+            );
+            d.inkless = true;
+            d.front = true;
+            self.push_dust(d);
+        }
         if look.dust > 0.0 {
             self.dust(pos + Vec3::Y * 0.2, look.dust);
         }
+        // A scorch under the blast. On open ground the crater has replaced it,
+        // but on a wall or a ceiling the burn is what marks the hit.
+        self.scorch(pos, up, radius * 0.42, 0.65);
         // Shock rings: heavy weapons get one, the Nova gets two.
         for k in 0..look.rings {
             let scale = 1.0 - 0.18 * k as f32;
             let life = look.ring_life * (1.0 + 0.35 * k as f32);
-            let colour = look.fire[0].lerp(Vec3::ONE, 0.35);
+            let colour = look.fire[0].lerp(Vec3::ONE, 0.15);
             // A few centimetres proud of the rock: the capsule has width, and a
             // ring exactly on the surface would half-sink into it.
-            self.push_burst(Effect::ring(pos + normal * 0.05, normal, radius * scale, colour, life));
+            let mut ring = Effect::ring(pos + normal * 0.05, normal, radius * scale, colour, life);
+            // Fainter than the fire: a shockwave is a ripple, not a white hoop.
+            ring.width = 0.55;
+            self.push_burst(ring);
         }
     }
 
@@ -651,7 +895,8 @@ impl Effects {
         let look = feel::hit(weapon);
         let scale = (damage / 70.0).clamp(0.35, 1.4);
         let push = push.normalize_or_zero();
-        self.push_burst(Effect::puff(at, Vec3::ZERO, look.size * scale, look.flash, 0.07, 0.0).glow());
+        self.push_burst(Effect::puff(at, Vec3::ZERO, look.size * scale, look.flash, 0.07, 0.0).glow().front());
+        self.push_light(at, look.flash, 3.4, 1.1 * scale, 0.10);
         for i in 0..look.sparks {
             // Deterministic spray: no RNG in the viewer, and the same hit at the
             // same place looks the same in a replay. The radial fan is bent
@@ -667,8 +912,54 @@ impl Effects {
                 look.spark,
                 0.12 + i as f32 * 0.02,
                 16.0,
-            ));
+            ).glow());
         }
+    }
+
+    /// A projectile ending on rock: a brief flash at the point of contact, a fan
+    /// of sparks thrown along the surface, and a scorch mark left behind. The
+    /// same signature as a body hit, so a blaster tick stays a tick.
+    fn impact(&mut self, weapon: u8, at: Vec3, normal: Vec3) {
+        let look = feel::hit(weapon);
+        let n = if normal.length_squared() > 1.0e-6 { normal.normalize() } else { Vec3::Y };
+        let (side, up) = plane_tangents(n);
+        self.push_burst(Effect::puff(at + n * 0.04, Vec3::ZERO, look.size * 0.85, look.flash, 0.08, 0.0).glow().front());
+        self.push_light(at + n * 0.05, look.flash, 2.6, 0.9, 0.09);
+        for i in 0..look.sparks {
+            let a = i as f32 * 2.399 + at.x * 1.7 + at.z * 0.9;
+            let dir = (side * a.cos() + up * a.sin() + n * 0.6).normalize_or_zero();
+            self.push_burst(Effect::puff(
+                at + n * 0.03,
+                dir * (look.speed * 0.75 + i as f32 * 0.4),
+                0.028 + 0.012 * (i as f32 % 2.0),
+                look.spark,
+                0.10 + i as f32 * 0.015,
+                14.0,
+            ).glow());
+        }
+        // The mark it leaves: heavier weapons scorch a wider patch.
+        let r = (0.05 + 0.05 * look.size).clamp(0.06, 0.24);
+        self.scorch(at, n, r, 0.9);
+    }
+
+    /// A dark burn where a shot struck, or (reused) the floor under a blast.
+    /// `strength` is its opacity: a scorch under a blast is fainter than the
+    /// ring a single bolt leaves.
+    fn scorch(&mut self, at: Vec3, normal: Vec3, radius: f32, strength: f32) {
+        let e = Effect {
+            shape: Shape::Splat { at: at + normal * 0.02, normal, radius },
+            colour: SCORCH,
+            vel: Vec3::ZERO,
+            gravity: 0.0,
+            age: 0.0,
+            life: 12.0,
+            burst: false,
+            width: strength.clamp(0.0, 1.0),
+            hot: false,
+            inkless: true,
+            front: false,
+        };
+        self.push_splat(e);
     }
 
     /// Liero blood. `at` is the victim's feet (the sim's `Hit` position) and
@@ -733,7 +1024,7 @@ impl Effects {
         // A stain under the body: eight to twenty-six points around the feet,
         // each dropped onto the first surface below, and each bigger than the
         // old marks. A full strike paints a rough ring around the worm.
-        let n = (8.0 + damage * 0.20).clamp(8.0, 26.0) as usize;
+        let n = (14.0 + damage * 0.35).clamp(14.0, 48.0) as usize;
         for i in 0..n {
             let seed = i as f32 * 2.3 + at.x * 0.7 + at.z * 1.1;
             let a = seed * 2.399;
@@ -746,7 +1037,7 @@ impl Effects {
                 self.push_splat(Effect::splat(
                     hit + normal * 0.015,
                     normal,
-                    0.14 + 0.09 * noise(seed + 13.0) + 0.04 * force,
+                    0.30 + 0.18 * noise(seed + 13.0) + 0.10 * force,
                 ));
             }
         }
@@ -765,7 +1056,7 @@ impl Effects {
                 self.push_splat(Effect::splat(
                     hit + normal * 0.02 + off,
                     normal,
-                    0.10 + 0.08 * noise(at.z + k as f32) + 0.02 * force,
+                    0.24 + 0.16 * noise(at.z + k as f32) + 0.05 * force,
                 ));
             }
         }
@@ -781,16 +1072,43 @@ impl Effects {
             let dir = Vec3::new(a.cos(), up, a.sin()).normalize_or_zero();
             let mut spark = Effect::puff(
                 at,
-                dir * (look.debris_speed + radius * 0.6),
-                0.06 + radius * 0.006,
+                dir * (look.debris_speed + radius * 0.9),
+                0.10 + radius * 0.012,
                 look.debris_colour,
-                0.20 + (i as f32 % 3.0) * 0.03,
+                0.55 + (i as f32 % 4.0) * 0.18,
                 14.0,
             );
             if look.debris_hot {
                 spark = spark.glow();
             }
             self.push_burst(spark);
+        }
+    }
+
+    /// Lumps of rock thrown out of a blast. These are SDF capsules, so they are
+    /// shaded and outlined like the terrain and arc through the air under
+    /// gravity; they are what makes a crater read as torn open.
+    fn rocks(&mut self, at: Vec3, radius: f32) {
+        let n = (6.0 + radius * 2.2).clamp(6.0, 22.0) as usize;
+        for i in 0..n {
+            let a = i as f32 * 2.399 + at.x * 1.3 + at.z * 0.7;
+            let up = 0.45 + 0.65 * (i as f32 * 2.1).sin().abs();
+            let dir = Vec3::new(a.cos(), up, a.sin()).normalize_or_zero();
+            let speed = (4.0 + (i % 5) as f32 * 1.4) * (0.8 + radius * 0.10);
+            let size = (0.09 + 0.035 * (i % 3) as f32) * (0.8 + radius * 0.12);
+            self.push_burst(Effect {
+                shape: Shape::Rock { at, radius: size },
+                colour: ROCK * (0.75 + 0.35 * noise(a + 3.0)),
+                vel: dir * speed,
+                gravity: 18.0,
+                age: 0.0,
+                life: 1.8 + 0.25 * (i % 4) as f32,
+                burst: false,
+                width: 0.0,
+                hot: false,
+                inkless: false,
+                front: false,
+            });
         }
     }
 
@@ -878,11 +1196,14 @@ impl Effects {
             .chain(self.trails.iter_mut())
         {
             e.age += dt;
-            if let Shape::Ball { at, .. } = &mut e.shape {
-                *at += e.vel * dt;
-                e.vel.y -= e.gravity * dt;
-                // Light drag: dust hangs, sparks lose their speed quickly.
-                e.vel *= (-1.5 * dt).exp();
+            match &mut e.shape {
+                Shape::Ball { at, .. } | Shape::Rock { at, .. } => {
+                    *at += e.vel * dt;
+                    e.vel.y -= e.gravity * dt;
+                    // Light drag: dust hangs, sparks lose their speed quickly.
+                    e.vel *= (-1.5 * dt).exp();
+                }
+                _ => {}
             }
         }
         self.list.retain(|e| e.age < e.life);
@@ -890,23 +1211,95 @@ impl Effects {
         self.splats.retain(|e| e.age < e.life);
         self.dust.retain(|e| e.age < e.life);
         self.trails.retain(|e| e.age < e.life);
+        for l in &mut self.lights {
+            l.age += dt;
+        }
+        self.lights.retain(|l| l.age < l.life);
+        for s in &mut self.soot {
+            s.age += dt;
+        }
+        self.soot.retain(|s| s.age < s.life);
     }
 
-    /// The gameplay effects: blasts, beams, sparks, dust and trails. These
-    /// share the renderer's 256-slot core pool.
+    /// The gameplay effects drawn as solids: beam lines and flying rubble. The
+    /// fire, smoke, sparks, dust and shockwaves are soft billboards (see
+    /// `sprites`), which is why a fireball reads as light instead of a ball.
     pub fn core_capsules(&self) -> Vec<DrawPrim> {
-        let mut out = Vec::with_capacity(self.list.len() + self.dust.len() + self.trails.len() + 16);
-        draw_effects(self.list.iter().chain(self.dust.iter()).chain(self.trails.iter()), &mut out);
+        let mut out = Vec::new();
+        draw_effects(
+            self.list.iter().filter(|e| matches!(&e.shape, Shape::Line { .. } | Shape::Rock { .. })),
+            &mut out,
+        );
         out
     }
 
-    /// The cosmetic pool: stains first (the evidence stays), then droplets.
-    /// The renderer keeps these separate from `core_capsules`, so blood can
-    /// never push a worm or a rocket out of the frame.
+    /// The cosmetic pool: the in-flight blood droplets (solid red beads). The
+    /// stains that land are now surface decals, not SDF lozenges.
     pub fn blood_capsules(&self) -> Vec<DrawPrim> {
-        let mut out = Vec::with_capacity(self.splats.len() + self.blood.len());
-        draw_effects(self.splats.iter().chain(self.blood.iter()), &mut out);
+        let mut out = Vec::with_capacity(self.blood.len());
+        draw_effects(self.blood.iter(), &mut out);
         out
+    }
+
+    /// The soft billboards and decals this frame, split by blend mode. `main`
+    /// sorts `smoke` back-to-front once the camera is known.
+    pub fn sprites(&self) -> Sprites {
+        let mut glow = Vec::new();
+        let mut smoke = Vec::new();
+        for e in &self.list {
+            if let Shape::Ball { .. } = &e.shape {
+                if e.hot {
+                    if let Some(s) = ball_sprite(e, true) {
+                        glow.push(s);
+                    }
+                } else if let Some(s) = ball_sprite(e, false) {
+                    smoke.push(s);
+                }
+            } else if let Shape::Ring { .. } = &e.shape {
+                if let Some(s) = ring_sprite(e) {
+                    glow.push(s);
+                }
+            }
+        }
+        for e in &self.dust {
+            if let Some(s) = ball_sprite(e, false) {
+                smoke.push(s);
+            }
+        }
+        for e in &self.trails {
+            if let Some(s) = line_sprite(e) {
+                if e.hot {
+                    glow.push(s);
+                } else {
+                    smoke.push(s);
+                }
+            }
+        }
+        let mut decals = Vec::new();
+        for e in &self.splats {
+            if let Some(d) = decal_sprite(e) {
+                decals.push(d);
+            }
+        }
+        // The eight strongest lights. A busy fight can have more events than
+        // the shader has slots; the biggest blasts win, which is what the eye
+        // expects too.
+        let mut lights: Vec<LightFx> = self.lights.clone();
+        lights.sort_unstable_by(|a, b| b.now().partial_cmp(&a.now()).unwrap_or(std::cmp::Ordering::Equal));
+        let lights = lights
+            .iter()
+            .take(crate::renderer::MAX_LIGHTS)
+            .map(|l| Light::point(l.at, l.colour, l.radius, l.now()))
+            .collect();
+        let mut soot: Vec<SootFx> = self.soot.clone();
+        soot.sort_unstable_by(|a, b| b.now().partial_cmp(&a.now()).unwrap_or(std::cmp::Ordering::Equal));
+        let soot = soot
+            .iter()
+            .take(crate::renderer::MAX_SOOT)
+            .filter(|s| s.now() > 0.01)
+            .map(|s| Soot::new(s.at, s.radius, s.now()))
+            .collect();
+        Sprites { glow, smoke, decals, lights, soot }
     }
 
     /// Everything, for tests that do not care about the pools.
@@ -951,6 +1344,126 @@ impl Effects {
         }
         self.splats.push(e);
     }
+
+    /// Add a point light. Kept short and capped: lights cost a loop iteration in
+    /// every terrain pixel, and more than a handful at once reads as soup.
+    fn push_light(&mut self, at: Vec3, colour: Vec3, radius: f32, power: f32, life: f32) {
+        if self.lights.len() >= 24 {
+            self.lights.remove(0);
+        }
+        self.lights.push(LightFx { at, colour, radius, power, age: 0.0, life });
+    }
+}
+
+/// The three sprite lists the renderer layers over the picture. Additive glow
+/// and alpha smoke are separate buffers (and passes) because they need
+/// different blend modes.
+pub struct Sprites {
+    pub glow: Vec<Sprite>,
+    pub smoke: Vec<Sprite>,
+    pub decals: Vec<Sprite>,
+    pub lights: Vec<Light>,
+    pub soot: Vec<Soot>,
+}
+
+impl Sprites {
+    /// Draw alpha smoke back-to-front (far first) so near puffs blend over far
+    /// ones instead of sorting wrong where they overlap.
+    pub fn sort_smoke(&mut self, cam: Vec3) {
+        self.smoke.sort_unstable_by(|a, b| {
+            let da = Vec3::new(a.a[0], a.a[1], a.a[2]).distance_squared(cam);
+            let db = Vec3::new(b.a[0], b.a[1], b.a[2]).distance_squared(cam);
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+}
+
+/// A round soft blob: the flashes, fire, sparks and smoke. Size and opacity
+/// follow the effect's age, so a flash pops and a smoke puff grows and thins.
+fn ball_sprite(e: &Effect, glow: bool) -> Option<Sprite> {
+    let Shape::Ball { at, radius } = &e.shape else { return None };
+    let u = (e.age / e.life).clamp(0.0, 1.0);
+    let (size, alpha) = if e.burst {
+        // A fireball blooms almost instantly, then shrinks and fades. It stays
+        // bright for most of its life: a blast that dims as soon as it is born
+        // reads as a wet match.
+        let grow = (u / 0.16).clamp(0.0, 1.0);
+        let s = grow * (1.0 - 0.62 * (u - 0.16).max(0.0));
+        (*radius * s, (1.0 - u).powf(0.85) * 0.55)
+    } else if glow {
+        // A flash is full-size at birth and fades quickly.
+        (*radius * (1.0 - 0.4 * u), (1.0 - u).powf(1.5))
+    } else {
+        // Smoke expands and thins out as it dissipates. It stays denser for
+        // longer than a dust puff: a rocket's cloud is the after-image of the
+        // shot and has to hang in the air.
+        (*radius * (1.0 + 1.9 * u), (1.0 - u).powf(1.2) * 0.75)
+    };
+    if alpha <= 0.01 {
+        return None;
+    }
+    let seed = at.x * 1.7 + at.y * 0.9 + at.z * 1.3;
+    // A glow sprite fades over a longer distance so a muzzle flash is not
+    // swallowed by the gun it is in front of; smoke hugs the surface it hides.
+    let soft = if glow { (size * 1.5 + 0.25).max(0.12) } else { (size * 0.6 + 0.12).max(0.05) };
+    Some(if e.front && e.burst {
+        Sprite::flame(*at, size, e.colour, alpha, seed, soft)
+    } else if e.front {
+        Sprite::front_ball(*at, size, e.colour, alpha, seed, soft)
+    } else {
+        Sprite::ball(*at, size, e.colour, alpha, seed, soft)
+    })
+}
+
+/// A trail puff: a short streak of smoke becomes one soft blob at its middle.
+/// A hot trail (a blaster bolt, a bomblet ember) is bright; a rocket's plume is
+/// dim smoke.
+fn line_sprite(e: &Effect) -> Option<Sprite> {
+    let Shape::Line { from, to } = &e.shape else { return None };
+    let mid = (*from + *to) * 0.5;
+    let radius = (e.width + (*to - *from).length() * 0.5).max(0.08);
+    let u = (e.age / e.life).clamp(0.0, 1.0);
+    let alpha = if e.hot { (1.0 - u).powf(1.5) } else { (1.0 - u).powf(1.6) * 0.55 };
+    if alpha <= 0.01 {
+        return None;
+    }
+    let seed = mid.x * 1.7 + mid.y * 0.9 + mid.z * 1.3;
+    let soft = if e.hot { (radius * 1.5 + 0.25).max(0.12) } else { (radius * 0.6 + 0.12).max(0.05) };
+    Some(Sprite::ball(mid, radius, e.colour, alpha, seed, soft))
+}
+
+/// A shockwave: a ring that races out from the blast and thins as it goes. It
+/// faces the camera because the blast is inside its own crater; a ring painted
+/// on the ground would be hidden by the rim and would read as a plate.
+fn ring_sprite(e: &Effect) -> Option<Sprite> {
+    let Shape::Ring { at, normal, radius } = &e.shape else { return None };
+    let u = (e.age / e.life).clamp(0.0, 1.0);
+    // Fast at first, then coasting: a shockwave loses speed as it loses energy.
+    let out = 1.0 - (1.0 - u).powi(3);
+    let r = radius * (0.18 + 0.95 * out);
+    let alpha = (1.0 - u).powi(2) * 0.95 * if e.width > 0.0 { e.width } else { 1.0 };
+    if alpha <= 0.01 {
+        return None;
+    }
+    let thickness = 0.10 + radius * 0.10 * (1.0 - u);
+    let seed = at.x * 1.7 + at.z * 0.9 + normal.y;
+    Some(Sprite::shock(*at + *normal * 0.05, r, e.colour, alpha, seed, thickness))
+}
+
+
+/// A stain lying on a surface: blood or a scorch mark. It holds full strength
+/// for most of its life, then dries out (fades) at the end.
+fn decal_sprite(e: &Effect) -> Option<Sprite> {
+    let Shape::Splat { at, normal, radius } = &e.shape else { return None };
+    let u = (e.age / e.life).clamp(0.0, 1.0);
+    let alpha = (1.0 - ((u - 0.7) / 0.3).clamp(0.0, 1.0)).clamp(0.0, 1.0) * 0.95 * e.width.clamp(0.0, 1.0);
+    if alpha <= 0.01 {
+        return None;
+    }
+    let seed = at.x * 2.3 + at.z * 1.7 + normal.y * 3.1;
+    // A fresh stain is bright red; it dries to a darker maroon as it ages.
+    let colour = e.colour.lerp(BLOOD_DARK, u * 0.65);
+    Some(Sprite::decal(*at + *normal * 0.02, *normal, *radius, colour, alpha, seed))
 }
 
 #[cfg(test)]
@@ -959,6 +1472,18 @@ mod tests {
 
     fn count(e: &Effects) -> usize {
         e.capsules().len()
+    }
+
+    fn glow_count(e: &Effects) -> usize {
+        e.sprites().glow.len()
+    }
+
+    fn smoke_count(e: &Effects) -> usize {
+        e.sprites().smoke.len()
+    }
+
+    fn decal_count(e: &Effects) -> usize {
+        e.sprites().decals.len()
     }
 
     /// The `a` endpoint of a puff (all effect primitives are capsules).
@@ -973,11 +1498,13 @@ mod tests {
     fn a_shot_flashes_briefly_then_smokes() {
         let mut e = Effects::default();
         e.add(&Event::Shot { worm: 0, weapon: 0, pos: Vec3::ZERO });
-        assert_eq!(count(&e), 2, "a flash and a wisp of smoke");
-        e.update(0.07);
-        assert_eq!(count(&e), 1, "the flash is over, the smoke hangs on");
+        assert!(glow_count(&e) >= 5, "a core, a halo and spikes: {}", glow_count(&e));
+        assert_eq!(smoke_count(&e), 1, "and a wisp of smoke");
+        e.update(0.2);
+        assert_eq!(glow_count(&e), 0, "the flash is over");
+        assert_eq!(smoke_count(&e), 1, "the smoke hangs on");
         e.update(0.5);
-        assert_eq!(count(&e), 0);
+        assert_eq!(smoke_count(&e), 0);
     }
 
     #[test]
@@ -990,11 +1517,11 @@ mod tests {
             damage: 10.0,
             dir: Vec3::Z,
         });
-        assert!(count(&e) >= 5, "a flash and a fan of sparks: {}", count(&e));
+        assert!(glow_count(&e) >= 5, "a flash and a fan of sparks: {}", glow_count(&e));
         e.update(0.05);
-        assert!(count(&e) >= 3, "still in the air: {}", count(&e));
+        assert!(glow_count(&e) >= 3, "still in the air: {}", glow_count(&e));
         e.update(0.5);
-        assert_eq!(count(&e), 0);
+        assert_eq!(glow_count(&e), 0);
     }
 
     #[test]
@@ -1019,7 +1546,7 @@ mod tests {
         e.update(1.2);
         assert!(e.blood.is_empty(), "the droplets have fallen");
         assert!(!e.splats.is_empty(), "the stains remain");
-        assert_eq!(e.capsules().len(), e.splats.len(), "one cheap primitive per stain");
+        assert!(decal_count(&e) >= 10, "the stains are painted as decals: {}", decal_count(&e));
     }
 
     #[test]
@@ -1050,12 +1577,14 @@ mod tests {
     fn a_landing_throws_a_ring_of_dust() {
         let mut e = Effects::default();
         e.dust(Vec3::ZERO, 12.0);
-        assert!(count(&e) >= 4, "hard landings throw a ring: {}", count(&e));
-        let at = a_of(&e.capsules()[0]);
+        assert!(smoke_count(&e) >= 4, "hard landings throw a ring: {}", smoke_count(&e));
+        let at = e.sprites().smoke[0].a;
         e.update(0.1);
-        assert!((a_of(&e.capsules()[0]) - at).length() > 0.001, "the puffs move");
+        let now = e.sprites().smoke[0].a;
+        let moved = Vec3::new(now[0] - at[0], now[1] - at[1], now[2] - at[2]).length();
+        assert!(moved > 0.001, "the puffs move: {moved}");
         e.update(1.0);
-        assert_eq!(count(&e), 0);
+        assert_eq!(smoke_count(&e), 0);
     }
 
     #[test]
@@ -1092,13 +1621,13 @@ mod tests {
         let rocket = Projectile { pos: Vec3::new(0.0, 8.0, 0.0), vel: Vec3::Z * 35.0, weapon: ROCKET, owner: 0, life: 1.0 };
         let mut e = Effects::default();
         e.trails(std::slice::from_ref(&rocket));
-        assert_eq!(count(&e), 1, "one puff behind the rocket");
+        assert_eq!(smoke_count(&e), 1, "one puff behind the rocket");
         e.trails(std::slice::from_ref(&rocket));
-        assert_eq!(count(&e), 2, "the next tick leaves the next puff");
+        assert_eq!(smoke_count(&e), 2, "the next tick leaves the next puff");
         e.update(0.2);
-        assert_eq!(count(&e), 2, "the trail hangs in the air");
+        assert_eq!(smoke_count(&e), 2, "the trail hangs in the air");
         e.update(0.5);
-        assert_eq!(count(&e), 0, "and then it is gone");
+        assert_eq!(smoke_count(&e), 0, "and then it is gone");
     }
 
     #[test]
@@ -1178,25 +1707,17 @@ mod tests {
         });
         // The lash itself is part of the worm (see `worms::lash`); the event
         // only adds the crack at the far end and the sparks it throws.
-        let prims = e.capsules();
-        assert!(prims.len() >= 5, "a flash and sparks: {}", prims.len());
-        for p in &prims {
-            match *p {
-                DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
-                    assert!(a.is_finite() && b.is_finite() && radius > 0.0);
-                }
-                DrawPrim::Cuboid { centre, half, .. } => assert!(centre.is_finite() && half.max_element() > 0.0),
-            }
-        }
-        e.update(0.3);
-        assert_eq!(count(&e), 0, "the sparks are gone in a blink");
+        assert!(glow_count(&e) >= 5, "a flash and sparks: {}", glow_count(&e));
+        e.update(0.5);
+        assert_eq!(glow_count(&e), 0, "the sparks and the arc are gone");
     }
 
     #[test]
     fn an_explosion_is_a_fireball_plus_dust() {
         let mut e = Effects::default();
         e.add(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, normal: Vec3::Y, radius: 3.0 });
-        assert!(count(&e) > 1, "the blast also kicks up dust: {}", count(&e));
+        assert!(glow_count(&e) > 1, "fire and hot debris: {}", glow_count(&e));
+        assert!(smoke_count(&e) > 0, "plus dust and smoke: {}", smoke_count(&e));
     }
 
     #[test]
@@ -1206,36 +1727,34 @@ mod tests {
         let mut pop = Effects::default();
         pop.add(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, normal: Vec3::Y, radius: 1.8 });
 
-        // A Nova gets two shock rings, eighteen capsules each; a bomblet none.
-        assert!(count(&nova) > count(&pop) * 3, "{} vs {}", count(&nova), count(&pop));
-        // The rings expand: after a moment the widest primitive is far out.
-        nova.update(0.2);
-        let far = nova
-            .capsules()
-            .iter()
-            .map(|p| a_of(p).length())
-            .fold(0.0f32, f32::max);
-        assert!(far > 2.0, "the shockwave has travelled: {far}");
+        // A Nova gets two shockwaves; a bomblet none. They are billboards now,
+        // so the blast wave is visible above the crater it just made.
+        let rings = |e: &Effects| e.sprites().glow.iter().filter(|s| (s.c[2] as i32 & 2) != 0).count();
+        assert!(rings(&nova) >= 2, "the Nova answers with rings: {}", rings(&nova));
+        assert_eq!(rings(&pop), 0);
+        // More fire and debris for the bigger weapon.
+        assert!(glow_count(&nova) > glow_count(&pop) + 6, "{} vs {}", glow_count(&nova), glow_count(&pop));
         // And the Nova's cloud outlives the pop's.
-        nova.update(1.0);
-        pop.update(1.0);
-        assert!(count(&nova) > 0 && count(&pop) == 0, "the crater still smokes: {} {}", count(&nova), count(&pop));
+        nova.update(1.6);
+        pop.update(1.6);
+        assert!(smoke_count(&nova) > 0, "the crater still smokes");
+        assert_eq!(smoke_count(&pop), 0);
     }
 
     #[test]
-    fn a_shock_ring_lies_on_the_surface_it_hit() {
-        // An explosion on a wall must paint the wall, not cut a flat ground
-        // ring through the rock. A ring with normal +X stays in the YZ plane.
+    fn a_shockwave_expands_and_sits_on_the_normal_side_of_the_blast() {
         let at = Vec3::new(1.0, 2.0, 3.0);
         let mut e = Effects::default();
         e.push_burst(Effect::ring(at, Vec3::X, 5.0, Vec3::ONE, 0.5));
         e.update(0.25);
-        let prims = e.capsules();
-        assert_eq!(prims.len(), 18, "one capsule per segment");
-        for p in &prims {
-            let a = a_of(p);
-            assert!((a.x - at.x).abs() < 1.0e-4, "the ring is in the wall plane: {a:?}");
-            assert!(a.distance(at) > 1.0, "and it has expanded: {a:?}");
-        }
+        let s = e.sprites();
+        let ring = s
+            .glow
+            .iter()
+            .find(|s| (s.c[2] as i32 & 2) != 0)
+            .expect("a shockwave sprite");
+        assert!(ring.a[0] > at.x, "it stands proud of the surface: {:?}", ring.a);
+        assert!(ring.a[3] > 1.0, "and it has expanded: {}", ring.a[3]);
+        assert!(ring.c[3] > 0.0, "with a thickness: {}", ring.c[3]);
     }
 }

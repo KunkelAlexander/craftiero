@@ -118,14 +118,13 @@ at 2 must stay quiet even when it is the newest thing in the game.
 | 2 | Railgun | the line through the room | the filament snaps into place with a rising whine | a white-blue line, a crack that arrives *after* the line, debris at the wall | an afterimage fading over 0.5 s, a ringing ear | **4** |
 | 3 | Bouncer | the billiard ball | none | ping on the first wall, pitch rising per bounce | each bounce leaves a short hot trail so you can read the chain | **3** |
 | 4 | Bomb | the trap you leave | a blink and a beep while it sits; the beep accelerates | a deep, dirty boom; more ground than fire | a crater that smokes and a low rumble that outlasts the flash | **4** |
-| 5 | Cluster | the mortar over the hill | its barrel is carried upward; the shell's fall whistle | seven separate pops in sequence, not one boom | seven small craters, seven small smoke columns | **4** |
+| 5 | Cluster | the mortar over the hill | its barrel is carried upward; the shell's fall whistle | twelve separate pops in sequence, not one boom | twelve small craters and one smoke bank | **4** |
 | 6 | Swarm | the pack | a rising whine as the six launch | six staggered impacts over ~0.5 s | the last missile still curling in when the first has landed | **3** |
 | 7 | Teleport | the swap | a hum that climbs | a snap, a violet ring, a hard cut in the world | the ringing ear; the swapped enemy visibly confused for a beat | **3** |
 | 8 | Nova | the cavern eraser | a 1.2 s charge: the view narrows, a ring of light gathers and spins | white-out, a fireball that fills the crater, the ground rolling | a 3 s smoke column and a crater rim glowing orange, cooling to black | **5** |
 | 9 | Block | the wall | none: it is instant | the rock *slams* into place, a dust ring, one hard thud | dust settling off the new face | **2** |
 | 10 | Tractor | the bridge | a grinding hum while held | a continuous stream of lumps, each with a small impact | the new span, still dusty | **2** |
 | 11 | Plasma Whip | the scar | a 0.3 s draw-back: the lash is carried, cocked over the shoulder, the plasma brightens | the crack, a sine-wave scar, sparks along the arc | the groove cooling white → red → black over ~2 s | **3** |
-
 Two of these are already the best in the game and should be the template: the
 **Whip** (its scar is shaped by the weapon: a sine wave burned into the rock)
 and the **Nova's aim ring** (the choice is heavy before the shot).
@@ -308,6 +307,23 @@ from the blast radius. Shock rings lie in the plane of the surface they hit, so
 an explosion on a wall paints the wall. The Cluster is carried with its barrel
 up and always launches on a lofted arc, even from a level crosshair.
 
+The effects themselves are now billboards, not SDF solids: the inked picture is
+HDR, a half-resolution bloom chain adds the light of every self-lit pixel, and a
+filmic tone-map rolls the cores off to white. Fire, smoke, sparks and shockwaves
+are camera-facing quads; the terrain, worms and guns are lit by up to eight
+dynamic point lights from blasts and plasma. Blood stains are decals; crater
+scorch is a **soot sphere** in the march shader, so the burn follows the curved
+bowl a blast carves instead of needing a flat plane. A shot that ends on rock
+emits `Event::Impact`, so a missed shot still sparks, scorches and ticks.
+
+Explosions are a layered recipe: a white core, one big fire body plus seven
+ragged lobes (noise-cut, so the silhouette is tongues of flame), rising embers,
+rock chunks under gravity, a ground dust wave, a column of smoke and a faint
+shockwave. The Blaster now bites a small hole out of rock, fires at 85 m/s on a
+0.085 s cycle, and still keeps the driest flash and smallest kick in the
+arsenal. The Bomb is a 5.5 m blast that leaves a 10 m crater. The Cluster throws
+twelve bomblets, each with a 2.8 m blast, so one shell carpets an area.
+
 The Nova's wind-up (`WeaponDef::windup`): 1.2 s, committed on
 the press, cancelled by a weapon swap, drawn as a charge ring and a narrowing
 view. And the per-weapon camera recoil (phase 4, partly): a shot now shoves the
@@ -315,10 +331,12 @@ view up, climbs the muzzle and punches the lens, instead of the old slide
 straight back along the aim — a dolly, which is why the recoil was invisible.
 
 The Plasma Whip now carries its lash (phase 6, the ritual): the lash is part of
-the worm's own model, hangs from the hand at rest, is cocked over the shoulder
-for 0.3 s, and then cracks out to its full 9.5 m reach over a 0.32 s swing that
-the whole body follows. Nothing is spawned by the shot, so the weapon is never a
-thing that "appears" — it is either in the hand or mid-swing.
+the worm's own model, hangs from the hand at rest as a glowing violet cable,
+is cocked over the shoulder for 0.3 s, and then cracks out to its full 12 m
+reach over a 0.32 s swing that the whole body follows. The plasma is drawn as a
+thick glowing core plus a chain of additive halo billboards, and the swing
+replays its tip as a fading crescent, so the reach is visible even from the
+shoulder camera.
 
 Hits now react (phase 3, mostly): the victim flashes white, flinches off its
 axis, sprays Liero-red blood that arcs out and stains the floor and walls, and a

@@ -87,6 +87,7 @@ cargo run -p viewer --release -- --shot out.png --edits --cam 62,36,54,180,-12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,200 --cam 64,19.5,32,0,-0.12
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 66.5,19.4,41,226,-11 --weapon 8
+cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 58,19,30,56,-10 --boom 4,74,18,36,20
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 58,19,30,56,-10 --hurt 34
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 58,19,30,56,-10 --hurt 34 --flash 0.6
 cargo run -p viewer --release -- --bench --size 1920x1080
@@ -105,6 +106,10 @@ and ricochet marks. `--hurt damage` wounds the worm first, so one PNG shows the
 blood spray, the hurt flash and the health bar without needing a second player.
 `--flash 0..1` previews the post-process impact flash, and `--no-grade` turns off
 the world desaturation (the same A/B as the `C` key).
+
+`--boom weapon,x,y,z[,ticks]` carves a blast at that point and takes the picture
+`ticks` later (default 10), so one exact camera can inspect an explosion without
+hunting for one in play.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.

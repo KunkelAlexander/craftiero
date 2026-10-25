@@ -44,7 +44,7 @@ const KNOCK_LIFT: f32 = 0.35;
 const MUZZLE: f32 = 0.8;
 /// The muzzle flash is placed further along the barrel than the shot starts, so
 /// it sits at the tip instead of inside the barrel (where the gun would hide it).
-const FLASH_AHEAD: f32 = 0.5;
+const FLASH_AHEAD: f32 = 0.2;
 /// Build lumps join the terrain with a rounded crease this wide, like clay.
 const BUILD_SMOOTH: f32 = 0.4;
 /// Extra room around a worm (and a spawn point) that a lump must leave free,
@@ -184,9 +184,9 @@ pub fn whip_path(
                 // the hand, curves out to the worm's left, and returns to the
                 // aim line at the tip, so it keeps its full reach where the
                 // crosshair points and still leaves a whip-shaped scar.
-                let bow = -0.16 * length * (t * std::f32::consts::PI).sin();
+                let bow = -0.34 * length * (t * std::f32::consts::PI).sin();
                 let wave = (phase + t * std::f32::consts::TAU * 1.5).sin()
-                    * 0.05
+                    * 0.06
                     * length
                     * (t * std::f32::consts::PI).sin();
                 *p = from + dir * (length * t) + side * (bow + wave);
@@ -989,6 +989,29 @@ impl World {
         }
         if let Some(v) = victim {
             self.damage(v, def.damage, pr.weapon, pr.owner as usize, dir * def.knockback);
+        } else {
+            // It ended on rock. A bullet that stops against a wall must still be
+            // *seen* and *heard* stopping there: the viewer turns this into a
+            // spark, a scorch and a tick of sound. The gradient of the distance
+            // field is the surface normal; a degenerate one falls back to the
+            // incoming direction.
+            let at = self.free_point(pr.pos, dir, PROJECTILE_RADIUS).unwrap_or(pr.pos);
+            let normal = {
+                let n = self.grid.gradient(at);
+                if n.length_squared() > 1.0e-6 {
+                    n.normalize()
+                } else {
+                    -dir
+                }
+            };
+            // A weapon with a terrain radius bites a hole where it lands. The
+            // blaster is the everyday digging gun, so its bolt must move rock.
+            if def.terrain > 0.0 {
+                let shape = Shape::Sphere { center: at, radius: def.terrain };
+                self.grid.apply(shape, Op::Carve);
+                self.events.push(Event::Edit { shape, op: Op::Carve });
+            }
+            self.events.push(Event::Impact { weapon: pr.weapon, pos: at, normal });
         }
     }
 
@@ -1086,6 +1109,7 @@ mod tests {
     };
     use glam::IVec3;
     use sdf::Grid;
+    use std::f32::consts::FRAC_PI_2;
 
     // Headless like the movement tests: a few worms in a 32 x 16 x 32 m box and a
     // list of inputs. Aiming is by angles; worm 0 looks along +z at yaw 0, and
@@ -1096,6 +1120,13 @@ mod tests {
 
     fn flat(p: Vec3) -> f32 {
         p.y - 4.0
+    }
+
+    /// A 30 degree ramp rising towards +x. The slope that turns a horizontal
+    /// knockback into an upward one.
+    fn ramp(p: Vec3) -> f32 {
+        let (s, c) = 30f32.to_radians().sin_cos();
+        (p.y - 4.0 - p.x * s / c) * c
     }
 
     /// Flat ground and a wall of rock beyond z = 24.
@@ -1161,11 +1192,36 @@ mod tests {
     }
 
     #[test]
+    fn a_shot_that_hits_rock_reports_the_strike() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        // Aim well down so the bolt buries itself in the floor ahead of the worm.
+        let events = hold(&mut w, BLASTER, -1.0, 30);
+        let impact = events
+            .iter()
+            .find_map(|e| {
+                if let Event::Impact { weapon, pos, normal } = e {
+                    Some((*weapon, *pos, *normal))
+                } else {
+                    None
+                }
+            })
+            .expect("a bolt that stops on rock reports where");
+        assert_eq!(impact.0, BLASTER);
+        assert!(impact.1.y > 3.0 && impact.1.y < 5.0, "it struck near the floor: {}", impact.1.y);
+        assert!(impact.2.y > 0.5, "the floor points up: {:?}", impact.2);
+        // The everyday gun also digs: a blaster bolt leaves a small hole.
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Edit { op: Op::Carve, .. })),
+            "the bolt bites the rock it hits"
+        );
+    }
+
+    #[test]
     fn a_blaster_bolt_hurts_the_worm_it_hits_and_only_that() {
         let mut w = duel();
         let mut events = shoot(&mut w, BLASTER, LEVEL);
         events.extend(run(&mut w, 30));
-        assert!((w.worms[1].hp - 90.0).abs() < 1.0e-3, "a hit is 10 damage: {}", w.worms[1].hp);
+        assert!((w.worms[1].hp - 88.0).abs() < 1.0e-3, "a hit is 12 damage: {}", w.worms[1].hp);
         assert!(events.iter().any(|e| matches!(e, Event::Hit { victim: 1, .. })));
         // The hit carries the push, so the viewer's blood follows the shot.
         let push = events
@@ -1347,7 +1403,7 @@ mod tests {
             .iter()
             .filter_map(|e| if let Event::Explosion { weapon, .. } = e { Some(*weapon) } else { None })
             .collect();
-        assert_eq!(pops.len(), 7);
+        assert_eq!(pops.len(), 12);
         assert!(pops.iter().all(|&id| id == BOMBLET), "the children, not the shell: {pops:?}");
 
         // A direct hit says which gun did it, not only how hard.
@@ -1479,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cluster_shell_bursts_into_seven_bomblets_that_each_explode() {
+    fn a_cluster_shell_bursts_into_twelve_bomblets_that_each_explode() {
         let mut w = arena(flat, &[(16.0, 16.0), (16.0, 30.0)]);
         shoot(&mut w, CLUSTER, 0.3);
         let mut seen = 0;
@@ -1490,9 +1546,9 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(seen, 7, "the burst");
+        assert_eq!(seen, 12, "the burst");
         let events = run(&mut w, 60);
-        assert_eq!(explosions(&events), 7);
+        assert_eq!(explosions(&events), 12);
         assert!(w.projectiles.is_empty());
     }
 
@@ -1709,6 +1765,25 @@ mod tests {
                 .any(|e| matches!(e, Event::Whip { style: WhipStyle::Sweep, .. })),
             "and the viewer is told to draw a left-to-right sweep"
         );
+    }
+
+    #[test]
+    fn a_whip_hit_along_a_slope_does_not_send_the_victim_skating_away() {
+        // The lash knocks the victim up the hill. The slope turns the push into
+        // upward speed, which used to keep it airborne for the whole tumble and
+        // far beyond it: the worm skated along the surface with no friction.
+        let mut w = World::new(Grid::from_fn(IVec3::new(16, 8, 8), ramp), &[(14.0, 16.0), (17.0, 16.0)], 1);
+        run(&mut w, 180);
+        assert!(w.worms.iter().all(|v| v.on_ground), "both stand on the hill");
+        w.worms[0].current = WHIP as usize;
+        let start = w.worms[1].pos;
+        // Swing uphill at the worm above.
+        hold_at(&mut w, WHIP, FRAC_PI_2, 0.2, 30);
+        assert!(w.worms[1].hp < MAX_HP, "the lash landed");
+        run(&mut w, 60);
+        let moved = (w.worms[1].pos - start).length();
+        assert!(w.worms[1].on_ground, "the victim is standing, not skating");
+        assert!(moved < 3.0, "a hit shoves it a little, not to the end of the map: {moved} m");
     }
 
     #[test]

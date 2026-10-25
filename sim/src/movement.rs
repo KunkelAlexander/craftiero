@@ -503,7 +503,16 @@ fn step_air(
     }
 
     let settled = settle_on_ground(grid, worm, false);
-    if (hit.ground || settled) && worm.vel.y <= 0.5 {
+    // Land on a standing contact. `settle_on_ground` has already rejected a
+    // body that is flying away from the surface, so this catches the case that
+    // used to break the state machine: running (or being knocked) into a slope
+    // turns horizontal speed into upward speed, and the worm then rides the
+    // slope without ever landing. It was not on the ground, so it had no ground
+    // jump, and the slow air drag let it slide for ages. `hit.ground` is the
+    // coarser "touched a floor-like surface" flag, which a fast fall can reach
+    // for one tick before the settle skin does; that one only counts if the
+    // worm was not already rising when the tick began (a real jump or launch).
+    if settled || (hit.ground && before_move.y <= 0.5) {
         land(worm);
         return;
     }

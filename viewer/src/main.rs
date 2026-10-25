@@ -5,6 +5,7 @@
 //
 //   cargo run -p viewer --release                  the interactive viewer
 //   cargo run -p viewer --release -- --shot a.png  render one frame to a PNG
+//   cargo run -p viewer --release -- --worm-preview --shot worm.png  body sculpt sheet
 //   cargo run -p viewer --release -- --bench       time the GPU per frame
 //
 // The split from CLAUDE.md: the rules live in `sim`. This file turns keys into
@@ -17,6 +18,7 @@ mod feel;
 mod renderer;
 mod shaders;
 mod world;
+mod worm_preview;
 mod worms;
 
 use audio::Audio;
@@ -63,6 +65,8 @@ Controls
 
 struct Config {
     shot: Option<String>,
+    /// `--worm-preview`: the SDF body on a studio sheet instead of the game.
+    worm_preview: bool,
     bench: bool,
     size: (u32, u32),
     scale: f32,
@@ -86,6 +90,10 @@ struct Config {
     /// `--flash 0..1`: fill the screenshot with an impact flash, for looking at
     /// the post effect without having to catch it in play.
     flash: Option<f32>,
+    /// `--boom weapon,x,y,z[,ticks]`: carve a blast at that point and take the
+    /// picture `ticks` later. A developer knob for looking at an explosion from
+    /// a known angle instead of hunting for one in play.
+    boom: Option<(u8, Vec3, u32)>,
     /// `--no-grade`: leave the environment colours alone (the interactive `C`
     /// key toggles the same grade).
     grade: bool,
@@ -100,6 +108,7 @@ struct Config {
 fn parse_args() -> Config {
     let mut c = Config {
         shot: None,
+        worm_preview: false,
         bench: false,
         size: (1280, 720),
         scale: 1.0,
@@ -112,6 +121,7 @@ fn parse_args() -> Config {
         weapon: None,
         hurt: None,
         flash: None,
+        boom: None,
         grade: true,
         brush: true,
         aim: true,
@@ -124,6 +134,7 @@ fn parse_args() -> Config {
         let mut value = |name: &str| args.next().unwrap_or_else(|| panic!("{name} needs a value"));
         match a.as_str() {
             "--shot" => c.shot = Some(value("--shot")),
+            "--worm-preview" => c.worm_preview = true,
             "--bench" => c.bench = true,
             "--size" => {
                 let v = value("--size");
@@ -153,6 +164,15 @@ fn parse_args() -> Config {
             "--weapon" => c.weapon = Some(value("--weapon").parse().expect("--weapon weapon_id")),
             "--hurt" => c.hurt = Some(value("--hurt").parse().expect("--hurt damage")),
             "--flash" => c.flash = Some(value("--flash").parse().expect("--flash 0..1")),
+            "--boom" => {
+                let v: Vec<f32> = value("--boom").split(',').map(|s| s.trim().parse().expect("number")).collect();
+                let ticks = v.get(4).copied().unwrap_or(10.0) as u32;
+                c.boom = Some((
+                    v[0] as u8,
+                    Vec3::new(v[1], v[2], v[3]),
+                    ticks,
+                ));
+            }
             "--no-grade" => c.grade = false,
             "--no-brush" => c.brush = false,
             "--no-aim" => c.aim = false,
@@ -292,7 +312,10 @@ fn demo_edits(grid: &mut Grid) {
 fn main() {
     println!("{HELP}\n");
     let cfg = parse_args();
-    if cfg.bench {
+    if cfg.worm_preview {
+        let gpu = headless_gpu();
+        worm_preview::run(&gpu, cfg.size, cfg.shot.as_deref().unwrap_or("worm_preview.png"));
+    } else if cfg.bench {
         run_bench(&cfg);
     } else if let Some(path) = cfg.shot.clone() {
         run_shot(&cfg, &path);
@@ -363,6 +386,16 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
             }
         }
     }
+    if let Some((weapon, at, ticks)) = cfg.boom {
+        let def = &WEAPONS[weapon as usize];
+        if def.terrain > 0.0 {
+            world.grid.apply(Shape::Sphere { center: at, radius: def.terrain }, Op::Carve);
+        }
+        effects.add(&Event::Explosion { weapon, pos: at, normal: Vec3::Y, radius: def.blast_radius });
+        for _ in 0..ticks {
+            effects.update(DT);
+        }
+    }
     for (i, w) in world.worms.iter().enumerate() {
         println!("worm {i} stands at {:.1}, {:.1}, {:.1}{}", w.pos.x, w.pos.y, w.pos.z, if w.rope.is_some() { " on its rope" } else { "" });
     }
@@ -421,7 +454,7 @@ fn run_shot(cfg: &Config, path: &str) {
             anim.update(worm, 0.03);
         }
     }
-    let mut capsules = worms::capsules(&world.worms, &positions, &anims);
+    let (mut capsules, whip_glow) = worms::draw(&world.worms, &positions, &anims);
     for worm in &world.worms {
         capsules.extend(effects::charging(worm));
     }
@@ -434,10 +467,18 @@ fn run_shot(cfg: &Config, path: &str) {
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
     capsules.extend(effects.core_capsules());
     let blood = effects.blood_capsules();
+    let mut sprites = effects.sprites();
+    sprites.glow.extend(whip_glow);
+    sprites.sort_smoke(cam.pos);
     let params = FrameParams {
         camera: &cam,
         capsules: &capsules,
         blood: &blood,
+        glow: &sprites.glow,
+        smoke: &sprites.smoke,
+        decals: &sprites.decals,
+        lights: &sprites.lights,
+        soot: &sprites.soot,
         brush: if cfg.brush { aim_point(&world.grid, &cam).map(|p| (p, 3.0)) } else { None },
         time: 0.0,
         shadows: cfg.shadows,
@@ -550,6 +591,11 @@ fn run_bench(cfg: &Config) {
                 camera: cam,
                 capsules: &[],
                 blood: &[],
+                glow: &[],
+                smoke: &[],
+                decals: &[],
+                lights: &[],
+                soot: &[],
                 brush: None,
                 time: 0.0,
                 shadows,
@@ -580,6 +626,11 @@ fn run_bench(cfg: &Config) {
         camera: &views[0].1,
         capsules: &capsules,
         blood: &[],
+        glow: &[],
+        smoke: &[],
+        decals: &[],
+        lights: &[],
+        soot: &[],
         brush: None,
         time: 0.0,
         shadows: true,
@@ -608,6 +659,11 @@ fn run_bench(cfg: &Config) {
         camera: cam,
         capsules: &[],
         blood: &[],
+        glow: &[],
+        smoke: &[],
+        decals: &[],
+        lights: &[],
+        soot: &[],
         brush: None,
         time: 0.0,
         shadows: true,
@@ -1263,7 +1319,7 @@ impl Viewer {
             }
         }
 
-        let mut capsules = worms::capsules(&self.world.worms, &draw_pos, &self.anims);
+        let (mut capsules, whip_glow) = worms::draw(&self.world.worms, &draw_pos, &self.anims);
         // A charge is state, not an event: draw it for every worm, so a Nova
         // spin-up is a warning you can see coming.
         for worm in &self.world.worms {
@@ -1281,6 +1337,11 @@ impl Viewer {
         // Cosmetic blood travels in its own pool, so it can never trim the
         // worms, the aim aid or a rocket.
         let blood = self.effects.blood_capsules();
+        // Soft effects and surface marks: billboards and decals, sorted so alpha
+        // smoke draws back-to-front.
+        let mut sprites = self.effects.sprites();
+        sprites.glow.extend(whip_glow);
+        sprites.sort_smoke(render_camera.pos);
         // Show where a dig would land (or, flying, where the brush would).
         let brush = if self.fly {
             aim_point(&self.world.grid, &self.camera).map(|p| (p, self.brush_radius))
@@ -1307,6 +1368,11 @@ impl Viewer {
             camera: &render_camera,
             capsules: &capsules,
             blood: &blood,
+            glow: &sprites.glow,
+            smoke: &sprites.smoke,
+            decals: &sprites.decals,
+            lights: &sprites.lights,
+            soot: &sprites.soot,
             brush,
             time: (now - self.started).as_secs_f32(),
             shadows: self.shadows,

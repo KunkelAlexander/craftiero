@@ -16,6 +16,10 @@ use sdf::{Grid, CHUNK, CHUNK_VOL};
 use std::time::Instant;
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// The inked picture is HDR: fire, plasma and muzzle flashes are brighter than
+/// white, and the present pass tone-maps them. On an 8-bit sRGB target every
+/// effect clipped at 1.0, which is why bloom could not be seen.
+const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const GBUF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 // Towards the sun. It shines over the spawn camera's shoulder, so the first
 // view is lit; the far mountains show their shaded side.
@@ -65,6 +69,22 @@ pub struct FrameParams<'a> {
     /// Cosmetic blood droplets and stains, in their own `MAX_BLOOD_CAPSULES`
     /// pool. They can never push a gameplay primitive out.
     pub blood: &'a [DrawPrim],
+    /// Soft billboards drawn with additive blending: muzzle flash, fire, sparks,
+    /// embers, hot cores. Layered over the inked picture, not ray-marched.
+    pub glow: &'a [Sprite],
+    /// Soft billboards drawn with alpha blending: smoke, dust, blood mist.
+    /// Sorted back-to-front by the caller.
+    pub smoke: &'a [Sprite],
+    /// Surface marks (blood stains, scorch marks) painted onto the terrain
+    /// using the G-buffer, so they lie flat on the rock instead of floating.
+    pub decals: &'a [Sprite],
+    /// Dynamic point lights: blasts, muzzle flashes, plasma. They add to the
+    /// shaded terrain and worms, so an explosion visibly lights the cave around
+    /// it instead of being a sticker on top of the picture.
+    pub lights: &'a [Light],
+    /// Spheres of soot left by blasts. The shader darkens the rock inside them,
+    /// which is the only way a scorch can follow a curved crater wall.
+    pub soot: &'a [Soot],
     /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
     pub brush: Option<(Vec3, f32)>,
     pub time: f32,
@@ -93,6 +113,121 @@ pub const MAX_BLOOD_CAPSULES: usize = 128;
 /// The total uniform array. MUST stay a multiple of 32 (one tile-mask word per
 /// 32 primitives) and inside the 64 KB uniform limit; 384 is 12 words.
 pub const MAX_PRIMS: usize = MAX_CAPSULES + MAX_BLOOD_CAPSULES;
+
+/// The soft billboards and decals. These live in storage buffers, not the
+/// raymarcher's uniform array, so a busy fight can throw a thousand sparks
+/// without touching the capsule budget. Sizes are generous because each sprite
+/// costs one quad, not one ray-march.
+pub const MAX_GLOW: usize = 1024;
+pub const MAX_SMOKE: usize = 768;
+pub const MAX_DECALS: usize = 512;
+
+/// One soft effect drawn as a camera-facing quad: fire, smoke, a spark, a blood
+/// stain. Not intersected by the raymarcher; the sprite pass layers it over the
+/// picture and uses the G-buffer for depth and (for decals) the surface normal.
+///
+/// The three vec4s are interpreted by the sprite shaders:
+///   `a`: xyz centre, w radius (metres)
+///   `b`: rgb colour (sRGB), w opacity 0..1
+///   `c`: glow/smoke: x seed, y softness in metres, z draw flags (bit 0 in front
+///        of the scene, bit 1 shockwave ring, bit 2 turbulent flame), w ring
+///        thickness; decal: xyz normal, w seed
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Sprite {
+    pub a: [f32; 4],
+    pub b: [f32; 4],
+    pub c: [f32; 4],
+}
+
+impl Sprite {
+    /// A round soft blob: the additive flashes and sparks, and the alpha smoke.
+    pub fn ball(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, soft: f32) -> Sprite {
+        Sprite {
+            a: [at.x, at.y, at.z, radius],
+            b: [colour.x, colour.y, colour.z, opacity],
+            c: [seed, soft.max(0.05), 0.0, 0.0],
+        }
+    }
+
+    /// A stain lying on a surface with `normal`: a blood pool or a scorch mark.
+    pub fn decal(at: Vec3, normal: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32) -> Sprite {
+        Sprite {
+            a: [at.x, at.y, at.z, radius],
+            b: [colour.x, colour.y, colour.z, opacity],
+            c: [normal.x, normal.y, normal.z, seed],
+        }
+    }
+
+    /// A blob drawn in front of the scene. For a muzzle or impact flash, which
+    /// lives inside the very gun or rock that would otherwise hide it.
+    pub fn front_ball(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, soft: f32) -> Sprite {
+        let mut s = Sprite::ball(at, radius, colour, opacity, seed, soft);
+        s.c[2] = 1.0;
+        s
+    }
+
+    /// An expanding shockwave: a camera-facing ring, not a solid disc. Drawn in
+    /// front of the terrain, because the blast that made it is inside its own
+    /// crater. `thickness` is in metres.
+    pub fn shock(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, thickness: f32) -> Sprite {
+        Sprite {
+            a: [at.x, at.y, at.z, radius.max(0.05)],
+            b: [colour.x, colour.y, colour.z, opacity],
+            c: [seed, 0.1, 3.0, thickness.max(0.005)],
+        }
+    }
+
+    /// A flame: like a ball, but with a ragged, boiling edge and a white-hot
+    /// centre. A smooth disc reads as a glowing balloon; fire needs a silhouette.
+    pub fn flame(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, soft: f32) -> Sprite {
+        let mut s = Sprite::ball(at, radius, colour, opacity, seed, soft);
+        s.c[2] = 5.0; // in front, and turbulent
+        s
+    }
+}
+
+/// One dynamic point light. The shader adds `colour * power * falloff` to every
+/// surface near it, so a fireball paints the rock, the worm and the gun with its
+/// own colour. Eight at once is plenty for one fight.
+pub const MAX_LIGHTS: usize = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Light {
+    /// xyz: position, w: radius in metres.
+    pub a: [f32; 4],
+    /// rgb: colour (linear), w: intensity.
+    pub b: [f32; 4],
+}
+
+impl Light {
+    pub fn point(at: Vec3, colour: Vec3, radius: f32, power: f32) -> Light {
+        Light {
+            a: [at.x, at.y, at.z, radius.max(0.05)],
+            b: [colour.x, colour.y, colour.z, power.max(0.0)],
+        }
+    }
+}
+
+/// One sphere of soot on the terrain. `a.w` is the radius, `b.x` the strength
+/// (0..1). Must match `Soot` in shaders.rs.
+pub const MAX_SOOT: usize = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Soot {
+    /// xyz: centre, w: radius in metres.
+    pub a: [f32; 4],
+    /// x: strength 0..1. yzw reserved.
+    pub b: [f32; 4],
+}
+
+impl Soot {
+    pub fn new(at: Vec3, radius: f32, strength: f32) -> Soot {
+        Soot { a: [at.x, at.y, at.z, radius.max(0.05)], b: [strength.clamp(0.0, 1.0), 0.0, 0.0, 0.0] }
+    }
+}
 
 /// One primitive the raymarcher intersects in closed form (no sphere tracing),
 /// so each stays a handful of multiplications per pixel. Worms are mostly
@@ -229,6 +364,8 @@ struct Uniforms {
     counts: [f32; 4], // x: number of primitives in use, y: shadow casters (the first y)
     /// x: screen flash 0..1, y: environment desaturation 0..1. zw reserved.
     fx: [f32; 4],
+    lights: [Light; MAX_LIGHTS],
+    soot: [Soot; MAX_SOOT],
     capsules: [GpuPrim; MAX_PRIMS],
     tiles: [[u32; 4]; TILE_WORDS * TILES_X * TILES_Y / 4],
 }
@@ -337,11 +474,29 @@ pub struct Renderer {
     ink_layout: wgpu::BindGroupLayout,
     present_pipeline: wgpu::RenderPipeline,
     present_layout: wgpu::BindGroupLayout,
+    /// The bloom chain: downsample the emissive ink, blur it at half
+    /// resolution in two separable passes, then add it in `fs_present`.
+    bloom_layout: wgpu::BindGroupLayout,
+    bloom_down_pipeline: wgpu::RenderPipeline,
+    blur_h_pipeline: wgpu::RenderPipeline,
+    blur_v_pipeline: wgpu::RenderPipeline,
     upscale_sampler: wgpu::Sampler,
     targets: Targets,
     screen: (u32, u32),
     gbuf: (u32, u32),
     scale: f32,
+    /// Soft billboards and decals: storage buffers, one pipeline per blend mode,
+    /// and a bind group per buffer (the uniforms and G-buffer are shared).
+    glow_buf: wgpu::Buffer,
+    smoke_buf: wgpu::Buffer,
+    decal_buf: wgpu::Buffer,
+    glow_pipeline: wgpu::RenderPipeline,
+    smoke_pipeline: wgpu::RenderPipeline,
+    decal_pipeline: wgpu::RenderPipeline,
+    sprite_layout: wgpu::BindGroupLayout,
+    glow_bind: wgpu::BindGroup,
+    smoke_bind: wgpu::BindGroup,
+    decal_bind: wgpu::BindGroup,
     scratch: Box<[i8; CHUNK_VOL]>,
     /// Staging area for batched uploads, reused so edits allocate nothing.
     region: Vec<i8>,
@@ -441,7 +596,7 @@ impl Renderer {
             &shaders::march(world_chunks),
             "fs",
             &march_layout,
-            &[COLOR_FORMAT, GBUF_FORMAT],
+            &[HDR_FORMAT, GBUF_FORMAT],
         );
 
         // --- pass 2: ink outlines, at G-buffer resolution -----------------------
@@ -457,7 +612,7 @@ impl Renderer {
             entries: &[entry(0, uniform_ty), entry(1, tex2d(false)), entry(2, tex2d(false))],
         });
         let post_wgsl = shaders::post();
-        let ink_pipeline = fullscreen_pipeline(&device, "ink", &post_wgsl, "fs_ink", &ink_layout, &[COLOR_FORMAT]);
+        let ink_pipeline = fullscreen_pipeline(&device, "ink", &post_wgsl, "fs_ink", &ink_layout, &[HDR_FORMAT]);
 
         // --- pass 3: upscale to the screen --------------------------------------
         // The ink image is sampled with a bilinear filter, so rendering below
@@ -468,10 +623,27 @@ impl Renderer {
                 entry(0, uniform_ty),
                 entry(3, tex2d(true)),
                 entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(5, tex2d(true)),
             ],
         });
         let present_pipeline =
             fullscreen_pipeline(&device, "present", &post_wgsl, "fs_present", &present_layout, &[target_format]);
+        // Bloom levels: one shared layout (uniform, source texture, sampler) for
+        // the downsample and both blur directions.
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom layout"),
+            entries: &[
+                entry(0, uniform_ty),
+                entry(1, tex2d(true)),
+                entry(2, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let bloom_down_pipeline =
+            fullscreen_pipeline(&device, "bloom down", &post_wgsl, "fs_bloom_down", &bloom_layout, &[HDR_FORMAT]);
+        let blur_h_pipeline =
+            fullscreen_pipeline(&device, "bloom blur h", &post_wgsl, "fs_blur_h", &bloom_layout, &[HDR_FORMAT]);
+        let blur_v_pipeline =
+            fullscreen_pipeline(&device, "bloom blur v", &post_wgsl, "fs_blur_v", &bloom_layout, &[HDR_FORMAT]);
         let upscale_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("upscale sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -479,8 +651,75 @@ impl Renderer {
             ..Default::default()
         });
 
+        // --- soft billboards and decals --------------------------------------
+        // Three storage buffers (one per blend mode) and three pipelines. The
+        // sprites write into the ink texture after the outline pass, so they are
+        // never outlined, and they read the G-buffer for depth / the surface.
+        let sprite_buf = |label: &str, n: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (std::mem::size_of::<Sprite>() * n) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let glow_buf = sprite_buf("glow sprites", MAX_GLOW);
+        let smoke_buf = sprite_buf("smoke sprites", MAX_SMOKE);
+        let decal_buf = sprite_buf("decal sprites", MAX_DECALS);
+        let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sprite layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: uniform_ty,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                entry(2, tex2d(false)),
+            ],
+        });
+        let sprite_wgsl = shaders::sprites();
+        let glow_pipeline = sprite_pipeline(&device, "glow sprites", &sprite_wgsl, "fs_glow", &sprite_layout, true);
+        let smoke_pipeline = sprite_pipeline(&device, "smoke sprites", &sprite_wgsl, "fs_smoke", &sprite_layout, false);
+        let decal_pipeline = sprite_pipeline(&device, "decals", &sprite_wgsl, "fs_decal", &sprite_layout, false);
+
         let gbuf = scaled(screen, scale);
-        let targets = make_targets(&device, gbuf, &ink_layout, &present_layout, &uniforms, &upscale_sampler);
+        let targets = make_targets(
+            &device,
+            gbuf,
+            &ink_layout,
+            &present_layout,
+            &bloom_layout,
+            &uniforms,
+            &upscale_sampler,
+        );
+
+        // The G-buffer view lives in `targets`, so the sprite bind groups are
+        // built here and again on resize.
+        let sprite_bind = |buf: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sprite bind group"),
+                layout: &sprite_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&targets.gbuf) },
+                ],
+            })
+        };
+        let glow_bind = sprite_bind(&glow_buf);
+        let smoke_bind = sprite_bind(&smoke_buf);
+        let decal_bind = sprite_bind(&decal_buf);
 
         let mut r = Renderer {
             device,
@@ -495,11 +734,25 @@ impl Renderer {
             ink_layout,
             present_pipeline,
             present_layout,
+            bloom_layout,
+            bloom_down_pipeline,
+            blur_h_pipeline,
+            blur_v_pipeline,
             upscale_sampler,
             targets,
             screen,
             gbuf,
             scale,
+            glow_buf,
+            smoke_buf,
+            decal_buf,
+            glow_pipeline,
+            smoke_pipeline,
+            decal_pipeline,
+            sprite_layout,
+            glow_bind,
+            smoke_bind,
+            decal_bind,
             scratch: Box::new([0; CHUNK_VOL]),
             region: Vec::new(),
             surface_cache: Vec::new(),
@@ -532,9 +785,28 @@ impl Renderer {
             self.gbuf,
             &self.ink_layout,
             &self.present_layout,
+            &self.bloom_layout,
             &self.uniforms,
             &self.upscale_sampler,
         );
+        // The sprite bind groups reference the G-buffer view, so they follow it.
+        self.glow_bind = self.sprite_bind(&self.glow_buf);
+        self.smoke_bind = self.sprite_bind(&self.smoke_buf);
+        self.decal_bind = self.sprite_bind(&self.decal_buf);
+    }
+
+    /// A bind group for one sprite pass: the shared uniforms, the storage
+    /// buffer for this pass, and the G-buffer (for depth and the surface normal).
+    fn sprite_bind(&self, buf: &wgpu::Buffer) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sprite bind group"),
+            layout: &self.sprite_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.targets.gbuf) },
+            ],
+        })
     }
 
     /// Whole terrain, one z-layer of chunks at a time so the staging memory
@@ -682,10 +954,34 @@ impl Renderer {
             size: [self.gbuf.0 as f32, self.gbuf.1 as f32, self.screen.0 as f32, self.screen.1 as f32],
             counts: [used as f32, casters as f32, 0.0, 0.0],
             fx: [f.flash.clamp(0.0, 1.0), f.grade.clamp(0.0, 1.0), 0.0, 0.0],
+            lights: {
+                let mut l = [Light::zeroed(); MAX_LIGHTS];
+                for (slot, src) in l.iter_mut().zip(f.lights.iter().take(MAX_LIGHTS)) {
+                    *slot = *src;
+                }
+                l
+            },
+            soot: {
+                let mut s = [Soot::zeroed(); MAX_SOOT];
+                for (slot, src) in s.iter_mut().zip(f.soot.iter().take(MAX_SOOT)) {
+                    *slot = *src;
+                }
+                s
+            },
             capsules,
             tiles,
         };
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        // The soft billboards and decals live in storage buffers, written each
+        // frame with just the sprites in use.
+        let upload = |buf: &wgpu::Buffer, s: &[Sprite], cap: usize| {
+            if !s.is_empty() {
+                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&s[..s.len().min(cap)]));
+            }
+        };
+        upload(&self.glow_buf, f.glow, MAX_GLOW);
+        upload(&self.smoke_buf, f.smoke, MAX_SMOKE);
+        upload(&self.decal_buf, f.decals, MAX_DECALS);
 
         let slot = self.timer.as_mut().and_then(|t| t.begin(&self.device));
         let timer = self.timer.as_ref();
@@ -737,6 +1033,62 @@ impl Renderer {
             pass.set_bind_group(0, &self.targets.ink_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        // Soft effects layered onto the inked picture. Decals first (they are
+        // surface marks), then smoke, then additive glow on top. Each reads the
+        // G-buffer for depth, so a fireball behind a hill is occluded.
+        let sprite_pass = |label: &str,
+                           pipeline: &wgpu::RenderPipeline,
+                           bind: &wgpu::BindGroup,
+                           count: u32,
+                           encoder: &mut wgpu::CommandEncoder| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.ink,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.draw(0..4, 0..count);
+        };
+        sprite_pass("decals", &self.decal_pipeline, &self.decal_bind, f.decals.len().min(MAX_DECALS) as u32, encoder);
+        sprite_pass("smoke", &self.smoke_pipeline, &self.smoke_bind, f.smoke.len().min(MAX_SMOKE) as u32, encoder);
+        sprite_pass("glow", &self.glow_pipeline, &self.glow_bind, f.glow.len().min(MAX_GLOW) as u32, encoder);
+        // Bloom: half-res downsample of the emissive picture, then two separable
+        // blurs. Doing it as a chain (instead of taps in the present shader) is
+        // what keeps a bright shock ring from showing the tap pattern.
+        let bloom_pass = |label: &str,
+                          view: &wgpu::TextureView,
+                          pipeline: &wgpu::RenderPipeline,
+                          bind: &wgpu::BindGroup,
+                          encoder: &mut wgpu::CommandEncoder| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.draw(0..3, 0..1);
+        };
+        bloom_pass("bloom down", &self.targets.bloom_a, &self.bloom_down_pipeline, &self.targets.down_bind_group, encoder);
+        bloom_pass("bloom blur h", &self.targets.bloom_b, &self.blur_h_pipeline, &self.targets.blur_a_bind_group, encoder);
+        bloom_pass("bloom blur v", &self.targets.bloom_a, &self.blur_v_pipeline, &self.targets.blur_b_bind_group, encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present"),
@@ -899,7 +1251,17 @@ struct Targets {
     color: wgpu::TextureView,
     gbuf: wgpu::TextureView,
     ink: wgpu::TextureView,
+    /// The two half-resolution bloom levels. `bloom_a` receives the downsample
+    /// and the final vertical blur; `bloom_b` is the intermediate.
+    bloom_a: wgpu::TextureView,
+    bloom_b: wgpu::TextureView,
     ink_bind_group: wgpu::BindGroup,
+    /// Downsample: the ink picture as the bloom source.
+    down_bind_group: wgpu::BindGroup,
+    /// Blur horizontal: reads `bloom_a`.
+    blur_a_bind_group: wgpu::BindGroup,
+    /// Blur vertical: reads `bloom_b`.
+    blur_b_bind_group: wgpu::BindGroup,
     present_bind_group: wgpu::BindGroup,
 }
 
@@ -908,10 +1270,11 @@ fn make_targets(
     (w, h): (u32, u32),
     ink_layout: &wgpu::BindGroupLayout,
     present_layout: &wgpu::BindGroupLayout,
+    bloom_layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
 ) -> Targets {
-    let make = |label, format| {
+    let make = |label, format, w, h| {
         device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -925,12 +1288,18 @@ fn make_targets(
             })
             .create_view(&Default::default())
     };
-    // Colour is stored sRGB-encoded in 8 bits (a toon image has no use for
-    // more); normal + distance need float precision, hence 16-bit floats.
-    let color = make("g colour", COLOR_FORMAT);
-    let gbuf = make("g normal+depth", GBUF_FORMAT);
-    let ink = make("inked picture", COLOR_FORMAT);
+    // Colour and the inked picture are HDR (linear light), so an effect can be
+    // brighter than white and the present pass tone-maps it. Normal + distance
+    // need float precision too, hence 16-bit floats for both.
+    let color = make("g colour", HDR_FORMAT, w, h);
+    let gbuf = make("g normal+depth", GBUF_FORMAT, w, h);
+    let ink = make("inked picture", HDR_FORMAT, w, h);
+    // Half resolution: a soft halo has no detail worth paying full price for.
+    let (bw, bh) = ((w / 2).max(1), (h / 2).max(1));
+    let bloom_a = make("bloom a", HDR_FORMAT, bw, bh);
+    let bloom_b = make("bloom b", HDR_FORMAT, bw, bh);
     let uniform = || wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() };
+    let filter = || wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) };
     let ink_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ink bind group"),
         layout: ink_layout,
@@ -940,6 +1309,20 @@ fn make_targets(
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gbuf) },
         ],
     });
+    let bloom_bind = |label: &str, src: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: bloom_layout,
+            entries: &[
+                uniform(),
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
+                filter(),
+            ],
+        })
+    };
+    let down_bind_group = bloom_bind("bloom downsample bind", &ink);
+    let blur_a_bind_group = bloom_bind("bloom blur a bind", &bloom_a);
+    let blur_b_bind_group = bloom_bind("bloom blur b bind", &bloom_b);
     let present_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("present bind group"),
         layout: present_layout,
@@ -947,9 +1330,21 @@ fn make_targets(
             uniform(),
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&ink) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&bloom_a) },
         ],
     });
-    Targets { color, gbuf, ink, ink_bind_group, present_bind_group }
+    Targets {
+        color,
+        gbuf,
+        ink,
+        bloom_a,
+        bloom_b,
+        ink_bind_group,
+        down_bind_group,
+        blur_a_bind_group,
+        blur_b_bind_group,
+        present_bind_group,
+    }
 }
 
 /// Every pass is "draw one triangle that covers the screen".
@@ -990,6 +1385,71 @@ fn fullscreen_pipeline(
             targets: &targets,
         }),
         primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// A pass of camera-facing quads: one four-vertex strip per sprite, instanced
+/// from a storage buffer. `additive` picks "add light" (glow) or "cover"
+/// (smoke, decals); the alpha channel of the target is left alone either way,
+/// because it carries the emissive mask the bloom reads.
+fn sprite_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    wgsl: &str,
+    fs_entry: &str,
+    layout: &wgpu::BindGroupLayout,
+    additive: bool,
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: if additive { wgpu::BlendFactor::One } else { wgpu::BlendFactor::SrcAlpha },
+            dst_factor: if additive { wgpu::BlendFactor::One } else { wgpu::BlendFactor::OneMinusSrcAlpha },
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            // Glow adds to the emissive mask as well, so fire and plasma bloom.
+            // Smoke and decals must not: they are not light.
+            src_factor: if additive { wgpu::BlendFactor::One } else { wgpu::BlendFactor::Zero },
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pl),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_sprite"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some(fs_entry),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: HDR_FORMAT,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
