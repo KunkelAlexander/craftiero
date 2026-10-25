@@ -38,6 +38,7 @@ Design decisions, each with its reason in the code comments:
 - **The tractor extrudes rock towards you.** Each lump is placed on the rock the last one made, so at one lump per tick the pile reached the worm in under a second. It now fires every fourth tick (about 8 m/s) and stops short of your face (the "never touch a worm" rule); a test checks it.
 - **The 2D rules were kept** where they still made sense: self damage is half but knockback is full, spawn protection ends when you shoot, a beam has slack so a joiner's lag does not make the host's shots land more often, a cluster shell flies through worms.
 - **Determinism:** the same fight (clusters, swarms, rockets, bouncers, 400 ticks) plays out identically twice (test). The homing turn uses a quaternion (sin/cos), the same caveat as the walk direction.
+- **Sound** is synthesised ahead of M6 (`viewer/src/audio.rs`): a small oscillator/noise synth with three layers per shot (transient, body, tail), a per-weapon voice, distance muffle and delay, pitch variance and a wind-up hum. It listens to the existing `Event` stream, so the sim is unchanged; the audio thread never blocks the frame (commands are queued).
 
 Numbers (release build, this laptop):
 | Measure | Result |
@@ -124,8 +125,8 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 - The map generator only claims "never over-estimates the distance", enforced by a test (`distance_is_never_overestimated`). Mountain flanks gave a slope-corrected estimate that broke it deep underground; the fix is documented in `world::ground`.
 - The empty-space map is per chunk (4 m). Rays that hug the ground spend most of their steps inside the one-chunk shell around the surface.
 - The M1 brush edits the grid directly and bypasses the sim (fly mode only, a developer tool); worm digging goes through `World::step`.
-- There are no match rules yet (score limit, winner, loadout choice: every worm carries all 11 weapons) and no sound or HUD beyond the title bar. The second worm is an idle dummy that dies and respawns; it never shoots back.
-- Weapon values are first guesses and unbalanced: 3D is harder to hit than 2D and the 2D damage numbers were kept, so the Blaster is probably weak. They are table rows in `sim/src/weapons.rs`.
+- There are no match rules yet (score limit, winner, loadout choice: every worm carries all 11 weapons) and no HUD beyond the title bar. The second worm is an idle dummy that dies and respawns; it never shoots back.
+- Weapon values are first guesses and unbalanced: 3D is harder to hit than 2D and the 2D damage numbers were kept, so the Blaster is probably weak. They are table rows in `sim/src/weapons.rs`. The *feel* side (why a hit reads as weak, and what to do about it) is `docs/WEAPON_FEEL.md`.
 - A dead worm is simply not drawn (plus a flash); the camera stays where the body fell. Capsules cap at 64 on screen (`MAX_CAPSULES`): worms first, then projectiles, then effects, so a busy fight drops the newest fireballs first.
 - The arena has an invisible ceiling at 64 m (outside the grid counts as rock), and the camera is held under it.
 - The sim capsule always stands upright; the viewer hangs a cosmetic rig of capsules around it that undulates, leans, flips and squashes.
@@ -226,7 +227,7 @@ Tractor beam / "forming": a moving SDF shape applied each tick as add (smooth-mi
 - **M3 Weapons: BUILT, awaiting review.** `WeaponDef` table (11 weapons), projectiles through the distance field, explosions = carve, build = add, tractor = a rapid stream of small adds, damage, cover, respawn, effects in the viewer.
 - **M4 Host + loopback + Replica (Vec3):** offline play via the same pipeline as the 2D game.
 - **M5 Online:** relay (reused), late join, edit events, checksums.
-- **M6 Polish:** synthesized audio, bots, procedural maps (SDF primitives + noise caves), HUD.
+- **M6 Polish:** bots, procedural maps (SDF primitives + noise caves), HUD, audio polish (the first pass shipped with M3).
 
 ## Fork plan: copy this repo, keep what fits, delete the rest
 Step 0 (first thing after approval): `git clone` this repo to a sibling folder (e.g. `C:\Users\TE\Documents\liero_3d`), keep history (so deleted 2D code stays readable via `git log`/`git show`), remove the `origin` remote so nothing is pushed to the 2D repo by accident. Update `CLAUDE.md`/`PLAN.md` for the 3D game (same style rules, new terrain/rendering sections).

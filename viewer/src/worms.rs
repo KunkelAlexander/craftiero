@@ -11,7 +11,7 @@ use glam::Vec3;
 use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
 };
-use sim::{whip_path, Action, Worm, WHIP_POINTS, WORM_HEIGHT};
+use sim::{whip_path, Action, WhipStyle, Worm, WHIP_POINTS, WORM_HEIGHT};
 use std::f32::consts::TAU;
 
 /// One colour per player (as picked in a paint program).
@@ -436,11 +436,14 @@ fn weapon(
             out.push(g.plate((0.16, 0.10, 0.02), (0.012, 0.05, 0.10), trim));
             // Between strikes the lash hangs from the emitter and undulates,
             // so the weapon reads as a whip even when it is not cracking. A
-            // strike replaces it with the sim's random, full-length lash (see
+            // strike replaces it with the sim's full-length lash (see
             // `effects.rs`), which is why it hides for the first few frames.
             if fire > 0.30 {
                 let from = g.at(0.46, 0.0, 0.0);
-                let path = whip_path(from, g.fwd, g.side, clock * 4.5, 2.4 * rs);
+                // Bias the idle lash forwards and down so it droops from the
+                // handle without poking through the ground.
+                let idle = (g.fwd * 0.8 - Vec3::Y * 0.65).normalize_or_zero();
+                let path = whip_path(from, idle, g.side, clock * 4.5, 1.45 * rs, WhipStyle::Sweep);
                 for k in 0..WHIP_POINTS - 1 {
                     let t = k as f32 / (WHIP_POINTS - 1) as f32;
                     let r = (0.055 - 0.028 * t) * rs;

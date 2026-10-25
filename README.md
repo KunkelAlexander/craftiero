@@ -12,13 +12,17 @@ the networking concepts where they appear.
 **Where it is:** milestone M3 of seven. You play a worm in a cave-and-hills
 world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
 integrated laptop GPU, and now fight: twelve weapons (rockets, a railgun, bombs,
-homing swarms, a teleport gun, a Nova that clears a cavern, a plasma whip that
-scars the rock, a wall-thrower and a forming beam). Explosions carve the terrain,
+homing swarms, a teleport gun, a Nova that charges for a beat and then clears a
+cavern, a plasma whip that
+sweeps the air and smashes down after a double jump, a wall-thrower and a
+forming beam). Explosions carve the terrain,
 rock is cover, and a dead worm comes back
 after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
 arc to the point it will land on, a ricochet marks its first bounce, and a big
-blast shows its footprint, while rockets leave smoke in the air. The rules
-run in a pure `sim` crate, with headless tests.
+blast shows its footprint, while rockets leave smoke in the air. Every weapon
+also has its own synthesised voice: a dry blaster tick, a rocket thump, a
+railgun crack with a ringing tail, and a cavern-sized Nova. Sounds are panned
+and muffled by distance. The rules run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
 
@@ -60,11 +64,12 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 | F1 / F2 / F3 | fixed render resolution 100% / 75% / 50% |
 | T | automatic resolution (default): scales the resolution to hold ~60 fps |
 | G / H / O / V | shadows / ambient occlusion / ink outlines / vsync |
+| M | mute / unmute the sound |
 | R | regenerate the map (about half a second) |
 
 The window title is the HUD until M6: health, the weapon with its magazine (or
 "reloading"), kills and deaths, then fps, GPU milliseconds per pass, the sim, edit
-and upload cost, the brush size and the render scale.
+and upload cost, the brush size, the render scale and whether sound is on.
 
 Headless modes (no window needed):
 
@@ -79,9 +84,12 @@ cargo test -p sdf -p sim -p viewer
 
 `--fire id[,ticks]` fires that weapon and takes the picture `ticks` later (so
 projectiles and blasts are in the air); `--weapon id` just holds it, with no
-shot, which is the way to look at a gun. `--no-brush` hides the orange dig
-ring that otherwise sits on the terrain behind the character, and `--no-aim`
-hides the weapon aim aid: lobbed arcs, blast rings and ricochet marks.
+shot, which is the way to look at a gun. The Nova's wind-up takes 72 ticks, so
+`--fire 8,40` catches it charging and `--fire 8,110` catches the blast.
+
+`--no-brush` hides the orange dig ring that otherwise sits on the terrain behind
+the character, and `--no-aim` hides the weapon aim aid: lobbed arcs, blast rings
+and ricochet marks.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.
@@ -126,8 +134,9 @@ over the network.
   be one the worm could not walk into.
   It runs the sim at a fixed 60 Hz and
   draws between ticks. Read it in this order: `main.rs` (window, input, game
-  loop), `worms.rs`, `effects.rs`, `renderer.rs` (textures, passes, uploads, GPU timers),
-  `shaders.rs` (the WGSL), `world.rs` (the demo map), `camera.rs`.
+  loop), `worms.rs`, `effects.rs`, `audio.rs` (the synth and the event-driven
+  mix), `renderer.rs` (textures, passes, uploads, GPU timers), `shaders.rs` (the
+  WGSL), `world.rs` (the demo map), `camera.rs`.
 
 Why raymarch instead of meshing the terrain? The first plan used Surface Nets
 meshes. At 0.25 m voxels a mesh looks faceted, and toon bands plus outlines make
@@ -161,7 +170,7 @@ Milestones (full detail and decisions in [PLAN.md](PLAN.md)):
 | M3 | Weapons as data rows: explosions carve, build adds, tractor beam: **built, awaiting review** |
 | M4 | Host + loopback + replica: offline play through the same pipeline as online |
 | M5 | Online: relay server, late join, edit events, checksums |
-| M6 | Polish: synthesized audio, bots, procedural maps, HUD |
+| M6 | Polish: bots, procedural maps, HUD, audio polish |
 
 ## Repository
 
@@ -172,6 +181,7 @@ Milestones (full detail and decisions in [PLAN.md](PLAN.md)):
 | `protocol/`, `host/`, `server/`, `game/src/{share,local,join,net,socket}.rs` | the 2D game's networking and relay, kept to be ported at M4-M5; they do not compile yet |
 | [`PLAN.md`](PLAN.md), [`CLAUDE.md`](CLAUDE.md) | the plan and decisions; the working rules for the code |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | performance log |
+| [`docs/WEAPON_FEEL.md`](docs/WEAPON_FEEL.md) | design spec: making each weapon feel powerful (per-weapon signatures, the work order) |
 | [`docs/NETWORKING.md`](docs/NETWORKING.md), [`docs/DEPLOY.md`](docs/DEPLOY.md) | written for the 2D game's relay; they apply again from M5 |
 | [`docs/PLAN_2D.md`](docs/PLAN_2D.md) | the 2D game's plan |
 | `screenshots/` | screenshots used above |

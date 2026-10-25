@@ -10,7 +10,7 @@
 use crate::renderer::DrawPrim;
 use glam::Vec3;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
-use sim::{whip_path, AimPath, Event, Projectile, DT, WHIP_POINTS};
+use sim::{whip_path, AimPath, Event, Projectile, WhipStyle, Worm, DT, WHIP_POINTS, WHIP_SWEEP};
 use std::f32::consts::TAU;
 
 /// The renderer holds `MAX_CAPSULES` (256) primitives in total, and worms,
@@ -72,6 +72,56 @@ fn flash(weapon: u8) -> (Vec3, f32) {
         WHIP => (PLASMA, 0.26),
         _ => (HOT, 0.20),
     }
+}
+
+/// The charge a weapon with a wind-up is building, at the muzzle. Drawn from
+/// state rather than from an event, so it appears from the first tick and shows
+/// in a screenshot taken mid-charge. A hot core swells with the wind-up while a
+/// ring of dashes spins and closes in: the last frame before the shot is a
+/// bright, tight knot, which is what the shot then releases.
+pub fn charging(worm: &Worm) -> Vec<DrawPrim> {
+    let t = worm.charge_fraction();
+    if t <= 0.0 {
+        return Vec::new();
+    }
+    let id = worm.weapons[worm.current].id;
+    let (colour, _) = flash(id);
+    let at = worm.muzzle();
+    let (dir, side, up) = frame(worm.aim_dir());
+    // Start dim and saturate towards white-hot: a charge that is already white
+    // would disappear against the Nova's own pale warhead.
+    let hot = (colour * 0.70).lerp(Vec3::ONE, 0.8 * t);
+
+    let mut out = Vec::with_capacity(15);
+    // A small hot point just past the barrel tip, where the shot will leave.
+    // The muzzle of an oversized gun is more than a metre ahead of the hand, so
+    // the charge has to sit past the barrel to be seen rather than swallowed by
+    // the gun's own warhead (the Nova's is a 0.44 m ball of the same colour).
+    let core = at + dir * 1.55;
+    out.push(DrawPrim::capsule(core, core + up * 0.004, 0.05 + 0.10 * t * t, hot, false).glowing());
+    // A ring of dashes spinning up around the muzzle, wider than the gun so it
+    // is never swallowed by it, and closing in as the charge completes.
+    let radius = 1.00 - 0.30 * t;
+    let width = 0.035 + 0.035 * t;
+    let n = 10;
+    for k in 0..n {
+        let a0 = k as f32 * TAU / n as f32 + t * 3.0;
+        let a1 = a0 + TAU / n as f32 * 0.55;
+        let p0 = core + (side * a0.cos() + up * a0.sin()) * radius;
+        let p1 = core + (side * a1.cos() + up * a1.sin()) * radius;
+        out.push(DrawPrim::capsule(p0, p1, width, hot, false).glowing().inkless());
+    }
+    // Four streaks just outside it, turning the other way: energy being drawn
+    // in, not just a ring that exists.
+    for k in 0..4 {
+        let a = k as f32 * TAU / 4.0 - t * 2.0;
+        let far = radius + 0.34;
+        let near = radius + 0.06;
+        let p0 = core + (side * a.cos() + up * a.sin()) * far;
+        let p1 = core + (side * a.cos() + up * a.sin()) * near;
+        out.push(DrawPrim::capsule(p0, p1, 0.020, hot, false).glowing().inkless());
+    }
+    out
 }
 
 /// One projectile, drawn as a small assembly of primitives so the ammunition
@@ -250,10 +300,11 @@ enum Shape {
     Ball { at: Vec3, radius: f32 },
     /// A beam or a tracer: a thin line that thins out.
     Line { from: Vec3, to: Vec3 },
-    /// A plasma whip's sine-wave lash. The points come from the sim's own
-    /// `whip_path`, so the bright chain the player sees is the same curve that
-    /// hit and scarred the world.
-    Whip { points: [Vec3; WHIP_POINTS] },
+    /// A plasma whip's lash. The points come from the sim's own `whip_path`,
+    /// so the bright chain the player sees is the same curve that scars the
+    /// world. `style` lets the drawing swing a sweep in from the worm's left; a
+    /// smash already contains its overhead arc.
+    Whip { points: [Vec3; WHIP_POINTS], style: WhipStyle },
 }
 
 struct Effect {
@@ -319,14 +370,14 @@ impl Effect {
 
     /// The lash itself: a glowing chain that snaps out to its full length and
     /// then fades, with the segments brightening in a travelling pulse.
-    fn whip(points: [Vec3; WHIP_POINTS]) -> Effect {
+    fn whip(points: [Vec3; WHIP_POINTS], style: WhipStyle) -> Effect {
         Effect {
-            shape: Shape::Whip { points },
+            shape: Shape::Whip { points, style },
             colour: PLASMA,
             vel: Vec3::ZERO,
             gravity: 0.0,
             age: 0.0,
-            life: 0.34,
+            life: 0.42,
             burst: false,
             width: 0.075,
             hot: true,
@@ -408,12 +459,12 @@ impl Effects {
                 self.push_burst(Effect::burst(Shape::Ball { at: from, radius: 0.24 }, BEAM, 0.09).glow());
                 self.push_burst(Effect::burst(Shape::Ball { at: to, radius: 0.55 }, BEAM, 0.16).glow());
             }
-            Event::Whip { from, dir, side, phase, length } => {
-                // The lash is a chain of glowing segments along the same sine
-                // wave the sim used for the hit and the scar. A bright crack
-                // and a few sparks at the tip sell the impact.
-                let points = whip_path(from, dir, side, phase, length);
-                self.push_burst(Effect::whip(points));
+            Event::Whip { from, dir, side, phase, length, style } => {
+                // The lash is a chain of glowing segments along the same curve
+                // the sim scars the world along. A bright crack and a few
+                // sparks at the tip sell the impact.
+                let points = whip_path(from, dir, side, phase, length, style);
+                self.push_burst(Effect::whip(points, style));
                 let tip = points[WHIP_POINTS - 1];
                 self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.26, PLASMA_HOT, 0.12, 0.0).glow());
                 for i in 0..4 {
@@ -616,16 +667,36 @@ impl Effects {
                     let line = DrawPrim::capsule(*from, *to, e.width * (1.0 - u), e.colour, false);
                     out.push(styled(line, e));
                 }
-                Shape::Whip { points } => {
+                Shape::Whip { points, style } => {
                     // The lash snaps out from the handle, holds for a beat, then
                     // fades. Segment brightness ripples along it, so the energy
                     // reads as moving even though the path is fixed.
                     let extend = (u / 0.18).clamp(0.0, 1.0);
                     let head = (extend * (WHIP_POINTS - 1) as f32).max(1.0);
-                    let fade = if u < 0.55 { 1.0 } else { 1.0 - (u - 0.55) / 0.45 };
+                    let fade = if u < 0.65 { 1.0 } else { 1.0 - (u - 0.65) / 0.35 };
                     if fade <= 0.02 {
                         continue;
                     }
+                    // A sweep is drawn as the pose it ends in, rotated in from
+                    // the worm's left. The tip therefore travels left to right
+                    // and lands on the aim line. A smash already has its
+                    // overhead arc baked into the points.
+                    let origin = points[0];
+                    let swing = match style {
+                        WhipStyle::Sweep => {
+                            let s = (u / 0.65).clamp(0.0, 1.0);
+                            let ease = s * s * (3.0 - 2.0 * s);
+                            // +WHIP_SWEEP (left) through the aim to -WHIP_SWEEP
+                            // (right): the full left-to-right follow-through.
+                            WHIP_SWEEP * (1.0 - 2.0 * ease)
+                        }
+                        WhipStyle::Smash => 0.0,
+                    };
+                    let (ss, cs) = swing.sin_cos();
+                    let place = |p: Vec3| {
+                        let d = p - origin;
+                        origin + Vec3::new(d.x * cs + d.z * ss, d.y, -d.x * ss + d.z * cs)
+                    };
                     for k in 0..WHIP_POINTS - 1 {
                         if k as f32 > head {
                             break;
@@ -636,12 +707,12 @@ impl Effects {
                         let pulse = 0.78 + 0.32 * ((k as f32 * 0.9 - u * 18.0).sin() * 0.5 + 0.5);
                         let colour = (e.colour * pulse).clamp(Vec3::ZERO, Vec3::ONE);
                         let radius = (e.width * (1.0 - 0.45 * t) * fade).max(0.004);
-                        let seg = DrawPrim::capsule(points[k], points[k + 1], radius, colour, false);
+                        let seg = DrawPrim::capsule(place(points[k]), place(points[k + 1]), radius, colour, false);
                         out.push(styled(seg, e));
                     }
                     // The bright head of the crack, riding out to the tip.
                     let k = (head as usize).min(WHIP_POINTS - 1);
-                    let p = points[k];
+                    let p = place(points[k]);
                     let tip = DrawPrim::capsule(p, p + Vec3::Y * 0.004, (0.10 * fade).max(0.004), PLASMA_HOT, false);
                     out.push(styled(tip, e));
                 }
@@ -829,14 +900,15 @@ mod tests {
     }
 
     #[test]
-    fn a_whip_lashes_a_sine_wave_that_snaps_out_then_fades() {
+    fn a_whip_lashes_a_curve_that_snaps_out_then_fades() {
         let mut e = Effects::default();
         e.add(&Event::Whip {
             from: Vec3::ZERO,
             dir: Vec3::Z,
-            side: Vec3::X,
+            side: Vec3::NEG_X,
             phase: 0.0,
-            length: 6.0,
+            length: 9.5,
+            style: sim::WhipStyle::Sweep,
         });
         let prims = e.capsules();
         assert!(prims.len() >= 8, "a chain of segments, not a dash: {}", prims.len());

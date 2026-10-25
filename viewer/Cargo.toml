@@ -14,5 +14,8 @@ wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 # Blocks on wgpu's async setup calls; the game itself has no async code.
 pollster = "1"
+# Native audio output. All sounds are synthesised in `audio.rs`; there are no
+# files. `cpal` gives us the device and the callback, nothing else.
+cpal = "0.18"
 # Screenshot output for the headless `--shot` mode.
 png = "0.18"

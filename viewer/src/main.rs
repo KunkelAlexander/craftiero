@@ -10,6 +10,7 @@
 // The split from CLAUDE.md: the rules live in `sim`. This file turns keys into
 // `sim::Input`s, steps `sim::World` at a fixed 60 Hz and draws what it holds.
 
+mod audio;
 mod camera;
 mod effects;
 mod renderer;
@@ -17,12 +18,15 @@ mod shaders;
 mod world;
 mod worms;
 
-use camera::{Camera, CameraFeel, FOLLOW_DIST};
+use audio::Audio;
+use camera::{Camera, CameraFeel, Kick, FOLLOW_DIST};
 use effects::Effects;
 use glam::{Vec2, Vec3};
 use renderer::{FrameParams, Gpu, Offscreen, Renderer};
 use sdf::{Grid, Op, Shape};
-use sim::weapons::{NOVA, ROCKET};
+use sim::weapons::{
+    BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+};
 use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, WEAPONS};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,6 +46,7 @@ Controls
   left mouse        fire (hold)              right mouse  shoot the rope / let go
   1-9 0 - =         pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
                     Bomb Cluster Swarm Teleport Nova Block Tractor Plasma Whip
+                    (the Nova charges for 1.2 s before it fires; a swap cancels it)
   hold W into a wall  climb it; S climbs down; Space kicks off the wall
                      (low ledges and crater rims are climbed automatically;
                      a jump that reaches a higher lip grabs it)
@@ -51,7 +56,8 @@ Controls
                     left mouse carve, right mouse build, mouse wheel brush size
   F1 F2 F3          fixed render resolution 100% / 75% / 50%
   T                 automatic resolution (default): holds ~60 fps by scaling it
-  G shadows   H ambient occlusion   O ink outlines   V vsync   R reset the world";
+  G shadows   H ambient occlusion   O ink outlines   V vsync   R reset the world
+  M mute the sound (synthesised: every weapon has its own voice)";
 
 struct Config {
     shot: Option<String>,
@@ -163,6 +169,36 @@ fn weapon_key(key: KeyCode) -> Option<u8> {
         KeyCode::Equal => 11,
         _ => return None,
     })
+}
+
+/// How a shot pushes the view, per weapon. This is feel data, not rules, so it
+/// lives with the viewer's event handling rather than in `WeaponDef`.
+///
+/// The old kick only slid the camera backwards along its own view direction:
+/// a dolly, which the eye reads as nothing. A shot now also climbs (pitch) and
+/// widens the lens, and the lens is the aim-safe part because the ray through
+/// the centre of the screen does not move. Fast weapons get less of everything
+/// than their single shot suggests, because their next shot arrives before the
+/// view has settled.
+fn shot_kick(weapon: u8) -> Kick {
+    let (up, back, pitch, fov) = match weapon {
+        NOVA => (0.100, 0.30, 3.0, 8.0),
+        ROCKET => (0.045, 0.16, 1.6, 4.5),
+        RAILGUN => (0.035, 0.13, 1.3, 3.5),
+        CLUSTER => (0.035, 0.11, 1.1, 3.0),
+        SWARM => (0.020, 0.065, 0.6, 1.8),
+        BOUNCER => (0.014, 0.050, 0.4, 1.2),
+        WHIP => (0.012, 0.030, 0.5, 1.2),
+        TELEPORT => (0.010, 0.030, 0.3, 0.6),
+        BLASTER => (0.008, 0.030, 0.25, 0.8),
+        BOMB => (0.008, 0.020, 0.2, 0.5),
+        BUILD => (0.010, 0.020, 0.15, 0.3),
+        TRACTOR => (0.004, 0.008, 0.05, 0.1),
+        _ => (0.006, 0.015, 0.2, 0.4),
+    };
+    // A lash hits across the body rather than away from the shoulder.
+    let side = if weapon == WHIP { 0.06 } else { 0.0 };
+    Kick { up, back, side, pitch, fov }
 }
 
 fn spawn_camera() -> Camera {
@@ -351,15 +387,22 @@ fn run_shot(cfg: &Config, path: &str) {
     let mut anims: Vec<worms::Anim> = world.worms.iter().map(|_| worms::Anim::default()).collect();
     // A screenshot taken a few ticks after a shot should show the recoil at the
     // same point in its spring as the game would, not a worm frozen at rest.
-    if let Some((_, ticks)) = cfg.fire {
-        if let (Some(anim), Some(worm)) = (anims.first_mut(), world.worms.first()) {
-            anim.fired();
-            for _ in 0..ticks {
-                anim.update(worm, DT);
+    // A charge-up weapon has not fired yet if the picture is taken mid-wind-up.
+    if let Some((weapon, ticks)) = cfg.fire {
+        let fired = ticks as f32 * DT >= WEAPONS[weapon as usize].windup;
+        if fired {
+            if let (Some(anim), Some(worm)) = (anims.first_mut(), world.worms.first()) {
+                anim.fired();
+                for _ in 0..ticks {
+                    anim.update(worm, DT);
+                }
             }
         }
     }
     let mut capsules = worms::capsules(&world.worms, &positions, &anims);
+    for worm in &world.worms {
+        capsules.extend(effects::charging(worm));
+    }
     // The aim aid worm 0's weapon calls for, if it calls for one.
     if cfg.aim {
         if let Some(path) = world.aim_path(0) {
@@ -569,6 +612,9 @@ struct Viewer {
     seq: u32,
     /// Fireballs and beams, started by the sim's events.
     effects: Effects,
+    /// The synth and its output stream. It listens to the same events; nothing
+    /// in the sim or the effects knows it exists.
+    audio: Audio,
     /// The camera's lag, landing dip, shake and shot kick. It moves the clean
     /// camera and adds its cosmetic offsets only when drawing (see `camera.rs`).
     feel: CameraFeel,
@@ -648,6 +694,7 @@ impl Viewer {
         surface.configure(&gpu.device, &surface_cfg);
 
         println!("window {}x{} px, display scale {:.2}", size.width, size.height, window.scale_factor());
+        let audio = Audio::new();
         let mut world = World::new(world::build(), &world::SPAWNS, SEED);
         let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
@@ -674,6 +721,7 @@ impl Viewer {
             anims,
             seq: 0,
             effects: Effects::default(),
+            audio,
             feel: CameraFeel::default(),
             step_dist: vec![0.0; worms],
             before: vec![(true, 0.0); worms],
@@ -798,6 +846,10 @@ impl Viewer {
             KeyCode::KeyG => self.shadows = !self.shadows,
             KeyCode::KeyH => self.ao = !self.ao,
             KeyCode::KeyO => self.outlines = !self.outlines,
+            KeyCode::KeyM => {
+                let muted = self.audio.toggle_mute();
+                println!("sound {}", if muted { "muted" } else { "on" });
+            }
             KeyCode::KeyV => {
                 self.vsync = !self.vsync;
                 self.surface_cfg.present_mode =
@@ -817,6 +869,7 @@ impl Viewer {
             KeyCode::KeyR => {
                 self.world = World::new(world::build(), &world::SPAWNS, SEED);
                 self.effects = Effects::default();
+                self.audio.stop_all();
                 self.feel = CameraFeel::default();
                 let n = self.world.worms.len();
                 self.step_dist = vec![0.0; n];
@@ -901,10 +954,13 @@ impl Viewer {
             self.sim_ms = t.elapsed().as_secs_f64() * 1000.0;
         }
         // The sim's events start the effects (a fireball per explosion, a line per
-        // beam); sound will listen too, at M6. The renderer needs no event for
-        // terrain edits: it asks the grid which chunks changed.
+        // beam) and the sounds. Both are pure consumers: neither can steer the
+        // sim. The renderer needs no event for terrain edits: it asks the grid
+        // which chunks changed.
+        let (sound_right, _) = self.camera.right_up();
         for event in self.world.drain_events() {
             self.effects.add(&event);
+            self.audio.play(&event, self.camera.pos, sound_right);
             // Camera dynamics: a blast pushes the view, a shot kicks it back,
             // a hit twitches it and a death is the biggest thump. All of it is
             // applied to the drawing copy only (see `camera.rs`), so none of it
@@ -921,13 +977,7 @@ impl Viewer {
                         anim.fired();
                     }
                     if worm == 0 {
-                        let kick = match weapon {
-                            ROCKET => 0.045,
-                            NOVA => 0.060,
-                            _ => 0.015,
-                        };
-                        let dir = self.world.worms[0].aim_dir();
-                        self.feel.kick(dir, kick);
+                        self.feel.kick(&self.camera, shot_kick(weapon));
                     }
                 }
                 Event::Hit { victim, pos, .. } => {
@@ -1063,6 +1113,11 @@ impl Viewer {
         let widen = ((speed - CALM_SPEED) / 12.0).clamp(0.0, 1.0);
         let target_fov = (70.0 + 14.0 * widen).to_radians();
         self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
+        // A wind-up narrows the view, so the release has something to open out
+        // from. Only the drawn copy changes; the clean fov is the aim's.
+        let charge = if self.fly { 0.0 } else { self.world.worms[0].charge_fraction() };
+        self.feel.set_charge(charge);
+        self.audio.set_charge(charge);
         // The camera follows a smoothed point and adds its cosmetic offsets to
         // a copy. `self.camera` stays the clean camera used for aim.
         let render_camera = if self.fly {
@@ -1096,6 +1151,11 @@ impl Viewer {
         }
 
         let mut capsules = worms::capsules(&self.world.worms, &draw_pos, &self.anims);
+        // A charge is state, not an event: draw it for every worm, so a Nova
+        // spin-up is a warning you can see coming.
+        for worm in &self.world.worms {
+            capsules.extend(effects::charging(worm));
+        }
         // The aim aid comes before the effects so a busy fight trims smoke and
         // sparks, not the marker the player is looking at.
         if !self.fly {
@@ -1177,7 +1237,7 @@ impl Viewer {
                 me.deaths
             );
             self.window.set_title(&format!(
-                "liero3d M3 {} | {hud} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {}",
+                "liero3d M3 {} | {hud} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {} sound {}",
                 if self.fly { "fly" } else { "worm" },
                 self.frames as f64 / elapsed,
                 elapsed * 1000.0 / self.frames as f64,
@@ -1195,6 +1255,13 @@ impl Viewer {
                 on(self.ao),
                 on(self.outlines),
                 on(self.vsync),
+                if !self.audio.available() {
+                    "unavailable"
+                } else if self.audio.muted() {
+                    "muted"
+                } else {
+                    "on"
+                },
             ));
             self.frames = 0;
             self.stats_since = Instant::now();
@@ -1336,5 +1403,24 @@ mod tests {
         assert_eq!(landing_impact(true, true, -9.0), None, "already on the ground");
         assert_eq!(landing_impact(false, false, -9.0), None, "still in the air");
         assert_eq!(landing_impact(false, true, -2.0), None, "a step down, no dust");
+    }
+
+    #[test]
+    fn heavy_weapons_kick_harder_and_nothing_kicks_the_blaster() {
+        let (n, r, b) = (shot_kick(NOVA), shot_kick(ROCKET), shot_kick(BLASTER));
+        assert!(n.pitch > r.pitch && r.pitch > b.pitch, "climb: {} {} {}", n.pitch, r.pitch, b.pitch);
+        assert!(n.fov > r.fov && r.fov > b.fov, "lens: {} {} {}", n.fov, r.fov, b.fov);
+        assert!(
+            n.up + n.back > r.up + r.back && r.up + r.back > b.up + b.back,
+            "shove: {} {} {}",
+            n.up + n.back,
+            r.up + r.back,
+            b.up + b.back
+        );
+        // A blaster fired eight times a second must not visibly move the view,
+        // or the aim contract (the crosshair is where the shot goes) breaks.
+        assert!(b.pitch < 0.5 && b.fov < 1.0, "the metronome stays quiet");
+        // The whip is the one weapon that hits across the body.
+        assert!(shot_kick(WHIP).side.abs() > 0.0, "the lash shoves sideways");
     }
 }

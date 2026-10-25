@@ -65,6 +65,19 @@ impl Camera {
     }
 }
 
+/// One shot's punch, in camera space. `up`, `back` and `side` are metres along
+/// the drawn camera's axes; `pitch` is degrees of muzzle climb; `fov` widens the
+/// lens by degrees. The numbers live with the weapon table's owner in `main.rs`,
+/// because they are feel, not rules.
+#[derive(Clone, Copy, Default)]
+pub struct Kick {
+    pub up: f32,
+    pub back: f32,
+    pub side: f32,
+    pub pitch: f32,
+    pub fov: f32,
+}
+
 /// The camera's motion: the part of "feel" that is not aim.
 ///
 /// PS2-era third-person games keep the camera a beat behind the character. It
@@ -72,9 +85,9 @@ impl Camera {
 /// shakes a little when something explodes. That lag is what makes the camera
 /// feel like it has weight instead of being welded to the worm.
 ///
-/// Only `pos` is animated here. `yaw` and `pitch` stay the player's aim, and
-/// the shake/recoil offsets are added to a *copy* for drawing, so a cosmetic
-/// kick can never feed back into the shot the next tick.
+/// Only the *drawn* copy is animated: its position is shoved and its pitch
+/// climbs, while the clean camera keeps the player's aim. A cosmetic kick can
+/// therefore never feed back into the next shot.
 pub struct CameraFeel {
     /// Smoothed point the camera orbits (just above the worm's eye).
     focus: Vec3,
@@ -87,9 +100,22 @@ pub struct CameraFeel {
     /// Shake amplitude in metres, and a clock for the wobble.
     shake: f32,
     clock: f32,
-    /// Cosmetic shot kick and its spring speed.
+    /// Cosmetic shot shove, in world space (up and back along the shot), and
+    /// its spring speed.
     recoil: Vec3,
     recoil_vel: Vec3,
+    /// Muzzle climb in radians, and its spring. This is the part of recoil the
+    /// eye reads first: a gun that only slides backwards looks like a dolly,
+    /// not a shot.
+    climb: f32,
+    climb_vel: f32,
+    /// Field-of-view punch in radians. Unlike a shove, a widening view cannot
+    /// move the ray through the centre of the screen, so it is pure impact with
+    /// no cost to the aim contract.
+    fov_kick: f32,
+    /// 0..1 of a weapon wind-up in progress. A full charge narrows the view a
+    /// little, so the release has something to open from.
+    charge: f32,
     /// The first update snaps instead of easing from nowhere.
     started: bool,
 }
@@ -113,10 +139,19 @@ const DIP_DAMP: f32 = 16.0;
 /// Shake decays fast; a rocket at your feet is over before the next shot.
 const SHAKE_DECAY: f32 = 6.0;
 const SHAKE_MAX: f32 = 0.12;
-/// The shot kick is a stiff spring so it is gone between blaster rounds.
-const RECOIL_SPRING: f32 = 180.0;
-const RECOIL_DAMP: f32 = 22.0;
-const RECOIL_MAX: f32 = 0.07;
+/// The shot shove is a stiff spring so it is gone between blaster rounds.
+const RECOIL_SPRING: f32 = 170.0;
+const RECOIL_DAMP: f32 = 21.0;
+const RECOIL_MAX: f32 = 0.35;
+/// Muzzle climb is stiffer than the shove: it is gone in about a fifth of a
+/// second, well before a heavy weapon can fire again.
+const CLIMB_SPRING: f32 = 230.0;
+const CLIMB_DAMP: f32 = 25.0;
+const CLIMB_MAX: f32 = 0.09;
+/// The view widens on a shot and narrows again in a few frames.
+const FOV_TAU: f32 = 0.07;
+/// A full wind-up narrows the view by about 6 degrees.
+const CHARGE_SQUEEZE: f32 = 0.10;
 
 impl Default for CameraFeel {
     fn default() -> CameraFeel {
@@ -129,6 +164,10 @@ impl Default for CameraFeel {
             clock: 0.0,
             recoil: Vec3::ZERO,
             recoil_vel: Vec3::ZERO,
+            climb: 0.0,
+            climb_vel: 0.0,
+            fov_kick: 0.0,
+            charge: 0.0,
             started: false,
         }
     }
@@ -189,13 +228,20 @@ impl CameraFeel {
         }
         self.recoil_vel += (-RECOIL_SPRING * self.recoil - RECOIL_DAMP * self.recoil_vel) * dt;
         self.recoil += self.recoil_vel * dt;
+        self.climb_vel += (-CLIMB_SPRING * self.climb - CLIMB_DAMP * self.climb_vel) * dt;
+        self.climb += self.climb_vel * dt;
+        self.fov_kick *= (-dt / FOV_TAU).exp();
+        if self.fov_kick < 1.0e-4 {
+            self.fov_kick = 0.0;
+        }
 
         // Keep the view inside the arena, like the fly camera does.
         cam.pos.y = cam.pos.y.min(63.0);
     }
 
-    /// The camera to draw with: the clean gameplay camera plus cosmetic shake
-    /// and recoil. Aim keeps using the clean copy, so these never steer a shot.
+    /// The camera to draw with: the clean gameplay camera plus cosmetic shake,
+    /// shot shove, muzzle climb, lens punch and the charge squeeze. Aim keeps
+    /// using the clean copy, so none of it ever steers a shot.
     pub fn render(&self, cam: Camera) -> Camera {
         let t = self.clock;
         // Three incommensurate sines make a cheap, non-repeating wobble.
@@ -210,6 +256,11 @@ impl CameraFeel {
         let (right, up) = cam.right_up();
         let offset = right * wobble.x + up * wobble.y + cam.forward() * (wobble.z * 0.5);
         out.pos += offset * (self.shake * 0.66) + self.recoil;
+        // The climb and the view punch happen after the directions above have
+        // been worked out from the clean camera, so they only tilt the picture.
+        let limit = 89f32.to_radians();
+        out.pitch = (out.pitch + self.climb).clamp(-limit, limit);
+        out.fov_y = (out.fov_y + self.fov_kick - CHARGE_SQUEEZE * self.charge).max(0.25);
         out
     }
 
@@ -231,10 +282,21 @@ impl CameraFeel {
         self.shake = self.shake.max(metres.clamp(0.0, SHAKE_MAX));
     }
 
-    /// A cosmetic kick opposite `dir`: a shot pushes the view back. This is
-    /// applied only when drawing, so holding the trigger cannot walk the aim.
-    pub fn kick(&mut self, dir: Vec3, metres: f32) {
-        self.recoil = (self.recoil - dir.normalize_or_zero() * metres).clamp_length_max(RECOIL_MAX);
+    /// Add one shot's punch. `cam` is the clean camera, used only for its axes.
+    /// This is applied only when drawing, so holding the trigger cannot walk
+    /// the aim.
+    pub fn kick(&mut self, cam: &Camera, k: Kick) {
+        let (right, up) = cam.right_up();
+        let shove = up * k.up + right * k.side - cam.forward() * k.back;
+        self.recoil = (self.recoil + shove).clamp_length_max(RECOIL_MAX);
+        self.climb = (self.climb + k.pitch.to_radians()).clamp(-CLIMB_MAX, CLIMB_MAX);
+        self.fov_kick = (self.fov_kick + k.fov.to_radians()).min(0.25);
+    }
+
+    /// How far into a wind-up the held weapon is (0..1). A full charge narrows
+    /// the view, so the shot has something to open out from.
+    pub fn set_charge(&mut self, t: f32) {
+        self.charge = t.clamp(0.0, 1.0);
     }
 
     /// Put the camera straight at `target` (a respawn or a teleport), so it
@@ -248,6 +310,10 @@ impl CameraFeel {
         self.shake = 0.0;
         self.recoil = Vec3::ZERO;
         self.recoil_vel = Vec3::ZERO;
+        self.climb = 0.0;
+        self.climb_vel = 0.0;
+        self.fov_kick = 0.0;
+        self.charge = 0.0;
     }
 }
 
@@ -401,23 +467,65 @@ mod tests {
     }
 
     #[test]
-    fn shake_and_kick_are_cosmetic_and_decay() {
+    fn a_shot_shoves_the_view_pitches_it_and_widens_the_lens() {
         let (grid, c) = cave(8, 15.0);
         let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
         let mut feel = CameraFeel::default();
         update_many(&mut feel, &mut cam, c, &grid, 60);
-
         let clean = cam;
+
         assert_eq!(feel.render(clean).pos, clean.pos, "nothing to add at rest");
         feel.shake(0.08);
         assert!((feel.render(clean).pos - clean.pos).length() > 1.0e-3);
-        // Let the shake die first, then check the kick on its own.
+        // Let the shake die first, then check the punch on its own.
         update_many(&mut feel, &mut cam, c, &grid, 120);
-        feel.kick(Vec3::X, 0.05);
+
+        feel.kick(&clean, Kick { up: 0.06, back: 0.20, pitch: 2.0, fov: 5.0, ..Kick::default() });
         let kicked = feel.render(clean);
-        assert!((kicked.pos - clean.pos).dot(Vec3::X) < -0.02, "back from the shot");
+        assert!(kicked.pos.y > clean.pos.y + 0.03, "the view is shoved up: {} vs {}", kicked.pos.y, clean.pos.y);
+        assert!(kicked.pitch > clean.pitch + 0.01, "the muzzle climbs: {}", kicked.pitch);
+        assert!(kicked.fov_y > clean.fov_y + 0.05, "and the lens widens: {}", kicked.fov_y);
+        assert_eq!(clean.pitch, 0.0, "the aim camera is untouched");
+
         update_many(&mut feel, &mut cam, c, &grid, 180);
-        assert!((feel.render(clean).pos - clean.pos).length() < 1.0e-3, "gone again");
+        let settled = feel.render(clean);
+        assert!((settled.pos - clean.pos).length() < 1.0e-3, "gone again: {:?}", settled.pos - clean.pos);
+        assert!((settled.pitch - clean.pitch).abs() < 1.0e-3, "climb is gone: {}", settled.pitch);
+        assert!((settled.fov_y - clean.fov_y).abs() < 1.0e-3, "lens is back: {}", settled.fov_y);
+    }
+
+    #[test]
+    fn a_heavy_kick_is_settled_before_that_weapon_can_fire_again() {
+        let (grid, c) = cave(8, 15.0);
+        let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 60);
+        let clean = cam;
+
+        // A Nova-sized punch, then half a second: the railgun's cooldown is the
+        // shortest wait between two aimed shots of a heavy weapon, so by then
+        // none of the punch may still be pushing the view off the reticle.
+        feel.kick(&clean, Kick { up: 0.10, back: 0.30, pitch: 3.0, fov: 8.0, ..Kick::default() });
+        assert!(feel.render(clean).pitch - clean.pitch > 0.04, "the climb is felt");
+        update_many(&mut feel, &mut cam, c, &grid, 30);
+        let settled = feel.render(clean);
+        assert!((settled.pitch - clean.pitch).abs() < 0.001, "climb is gone: {}", settled.pitch - clean.pitch);
+        assert!((settled.fov_y - clean.fov_y).abs() < 0.001, "lens is back: {}", settled.fov_y - clean.fov_y);
+        assert!((settled.pos - clean.pos).length() < 0.004, "the shove is gone: {:?}", settled.pos - clean.pos);
+    }
+
+    #[test]
+    fn a_charge_narrows_the_view_and_releasing_it_opens_again() {
+        let (grid, c) = cave(8, 15.0);
+        let mut cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 1.0 };
+        let mut feel = CameraFeel::default();
+        update_many(&mut feel, &mut cam, c, &grid, 60);
+        let clean = cam;
+
+        feel.set_charge(1.0);
+        assert!(feel.render(clean).fov_y < clean.fov_y - 0.05, "a full charge narrows the view");
+        feel.set_charge(0.0);
+        assert!((feel.render(clean).fov_y - clean.fov_y).abs() < 1.0e-6, "and letting it go restores it");
     }
 
     #[test]

@@ -31,7 +31,8 @@ pub const BUILD: u8 = 9;
 /// wall by sweeping the aim ("tractor beam", PLAN.md). Not a new mechanic, only
 /// the Build weapon with a short cooldown, a small lump and a big magazine.
 pub const TRACTOR: u8 = 10;
-/// A short-range lash of plasma: it cuts a sine-wave scar into the rock.
+/// A long plasma lash: a left-to-right sweep, or an overhead smash when it is
+/// used during a double jump.
 pub const WHIP: u8 = 11;
 /// What a Cluster shell splits into. Not in the arsenal: only the shell makes it.
 pub const BOMBLET: u8 = 12;
@@ -51,8 +52,9 @@ pub enum Kind {
     Build,
     /// Adds one rectangular wall of terrain just ahead of the worm.
     Wall,
-    /// A short melee sweep: a sine-wave lash that damages what it touches and
-    /// carves a scar along its path.
+    /// A melee lash: a left-to-right sweep that damages what it touches and
+    /// carves a scar along its path. Fired after a double jump, it becomes an
+    /// overhead smash instead.
     Whip,
 }
 
@@ -81,6 +83,10 @@ pub struct WeaponDef {
     pub lifetime: f32,
     /// Seconds between shots.
     pub cooldown: f32,
+    /// Seconds from the trigger pull to the shot. Once it starts, a wind-up
+    /// runs to completion: letting go does not cancel it, but switching weapons
+    /// does. A heavy weapon's cost and its tell are the same number.
+    pub windup: f32,
     /// Rounds per magazine, and seconds to reload once it is empty.
     pub mag: u16,
     pub reload: f32,
@@ -115,11 +121,14 @@ pub struct WeaponState {
     pub cooldown: f32,
     /// Seconds of reload left; > 0 means "reloading".
     pub reload: f32,
+    /// Seconds of wind-up built up for this weapon. Kept per weapon so a
+    /// charge cannot be carried across a swap; switching cancels it.
+    pub charge: f32,
 }
 
 impl WeaponState {
     pub fn full(id: u8) -> WeaponState {
-        WeaponState { id, ammo: WEAPONS[id as usize].mag, cooldown: 0.0, reload: 0.0 }
+        WeaponState { id, ammo: WEAPONS[id as usize].mag, cooldown: 0.0, reload: 0.0, charge: 0.0 }
     }
 }
 
@@ -144,6 +153,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Rocket",
@@ -164,6 +174,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Railgun",
@@ -187,6 +198,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Bouncer",
@@ -209,6 +221,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 10.0,
         bounce: 0.9,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Bomb",
@@ -232,6 +245,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 25.0,
         bounce: 0.3,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Cluster",
@@ -257,6 +271,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 18.0, // a high lob: point up to arc it over cover
         bounce: 0.0,
         special: Special::Cluster(7, BOMBLET),
+        windup: 0.0,
     },
     WeaponDef {
         name: "Swarm",
@@ -277,6 +292,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::Homing(3.0),
+        windup: 0.0,
     },
     WeaponDef {
         name: "Teleport",
@@ -297,6 +313,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::Teleport,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Nova",
@@ -317,6 +334,9 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        // The one weapon that does not fire on the click: a 1.2 s charge-up.
+        // That is the difference between "a bigger rocket" and "a decision".
+        windup: 1.2,
     },
     WeaponDef {
         name: "Block",
@@ -340,6 +360,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Tractor",
@@ -365,11 +386,12 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
     WeaponDef {
         name: "Plasma Whip",
         kind: Kind::Whip,
-        // A short reach and a slow cadence, but a hard hit: this is the
+        // A long reach and a slow cadence, but a hard hit: this is the
         // close-quarters answer to a rocket in the face.
         damage: 34.0,
         speed: 0.0,
@@ -378,9 +400,9 @@ pub static WEAPONS: [WeaponDef; 13] = [
         mag: 15,
         reload: 1.8,
         spread: 0.0,
-        // The lash is six metres long; `terrain` is the radius of the groove
-        // it burns into whatever rock that length passes through.
-        range: 6.0,
+        // The lash reaches nine and a half metres. `terrain` is the radius of
+        // the groove it burns into whatever rock that length passes through.
+        range: 9.5,
         blast_radius: 0.0,
         blast_damage: 0.0,
         knockback: 14.0,
@@ -389,6 +411,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
     // Not in anyone's arsenal: what the Cluster shell splits into.
     WeaponDef {
@@ -410,5 +433,6 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 10.0,
         bounce: 0.0,
         special: Special::None,
+        windup: 0.0,
     },
 ];

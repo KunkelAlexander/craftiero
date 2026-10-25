@@ -11,10 +11,10 @@
 // host runs the sim and clients draw its snapshots. If a client ever predicts
 // its own worm, swap `sin_cos` for a table or an approximation written here.
 
-use crate::combat::{Projectile, MAX_HP};
+use crate::combat::{Projectile, WhipStyle, MAX_HP};
 use crate::input::Input;
 use crate::rng::Rng;
-use crate::weapons::{WeaponState, ARSENAL};
+use crate::weapons::{WeaponState, ARSENAL, WEAPONS};
 use glam::{Vec2, Vec3};
 use sdf::{Grid, Op, Shape};
 
@@ -311,6 +311,22 @@ impl Worm {
     pub fn axis(&self) -> (Vec3, Vec3) {
         body_axis(self.pos)
     }
+
+    /// How far into its wind-up the weapon in hand is, 0..1. Always 0 for a
+    /// weapon that fires on the click, and for a dead worm. The viewer draws
+    /// the charge from this; a HUD would too.
+    pub fn charge_fraction(&self) -> f32 {
+        if !self.alive {
+            return 0.0;
+        }
+        let w = &self.weapons[self.current];
+        let windup = WEAPONS[w.id as usize].windup;
+        if windup <= 0.0 {
+            0.0
+        } else {
+            (w.charge / windup).clamp(0.0, 1.0)
+        }
+    }
 }
 
 /// `Worm::axis` for a worm standing with its feet at `feet`.
@@ -341,10 +357,10 @@ pub enum Event {
     Shot { worm: u8, weapon: u8, pos: Vec3 },
     /// A beam weapon's line, for drawing.
     Beam { from: Vec3, to: Vec3 },
-    /// A plasma whip's lash. `dir`, `side` and `phase` are what the viewer
-    /// needs to rebuild the same sine wave the sim used for the hit and scar
-    /// (see `whip_path`); `length` is the reach.
-    Whip { from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32 },
+    /// A plasma whip's lash. `dir`, `side`, `phase` and `style` are what the
+    /// viewer needs to rebuild the same curve the sim scars (and, for a smash,
+    /// hits) the world along (see `whip_path`); `length` is the reach.
+    Whip { from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
     Explosion { pos: Vec3, radius: f32 },
     Hit { victim: u8, pos: Vec3, damage: f32 },
     Died { victim: u8, killer: u8, pos: Vec3 },
