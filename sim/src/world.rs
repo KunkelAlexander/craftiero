@@ -357,10 +357,12 @@ pub enum Event {
     Shot { worm: u8, weapon: u8, pos: Vec3 },
     /// A beam weapon's line, for drawing.
     Beam { from: Vec3, to: Vec3 },
-    /// A plasma whip's lash. `dir`, `side`, `phase` and `style` are what the
-    /// viewer needs to rebuild the same curve the sim scars (and, for a smash,
-    /// hits) the world along (see `whip_path`); `length` is the reach.
-    Whip { from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
+    /// `worm`'s plasma whip has cracked. `dir`, `side`, `phase` and `style` are
+    /// what the viewer needs to rebuild the same curve the sim scars (and, for
+    /// a smash, hits) the world along (see `whip_path`); `length` is the reach.
+    /// The worm itself carries the lash every frame, so this event is what
+    /// starts the swing animation, not what makes the weapon appear.
+    Whip { worm: u8, from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
     Explosion { pos: Vec3, radius: f32 },
     Hit { victim: u8, pos: Vec3, damage: f32 },
     Died { victim: u8, killer: u8, pos: Vec3 },

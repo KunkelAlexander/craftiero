@@ -27,7 +27,7 @@ use sdf::{Grid, Op, Shape};
 use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
 };
-use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, WEAPONS};
+use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, WEAPONS, WhipStyle};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,7 +46,8 @@ Controls
   left mouse        fire (hold)              right mouse  shoot the rope / let go
   1-9 0 - =         pick a weapon, or the mouse wheel: Blaster Rocket Railgun Bouncer
                     Bomb Cluster Swarm Teleport Nova Block Tractor Plasma Whip
-                    (the Nova charges for 1.2 s before it fires; a swap cancels it)
+                    (the Nova charges for 1.2 s and the whip draws back for
+                    0.3 s before they fire; a swap cancels either)
   hold W into a wall  climb it; S climbs down; Space kicks off the wall
                      (low ledges and crater rims are climbed automatically;
                      a jump that reaches a higher lip grabs it)
@@ -188,7 +189,7 @@ fn shot_kick(weapon: u8) -> Kick {
         CLUSTER => (0.035, 0.11, 1.1, 3.0),
         SWARM => (0.020, 0.065, 0.6, 1.8),
         BOUNCER => (0.014, 0.050, 0.4, 1.2),
-        WHIP => (0.012, 0.030, 0.5, 1.2),
+        WHIP => (0.020, 0.035, 0.8, 2.0),
         TELEPORT => (0.010, 0.030, 0.3, 0.6),
         BLASTER => (0.008, 0.030, 0.25, 0.8),
         BOMB => (0.008, 0.020, 0.2, 0.5),
@@ -197,7 +198,7 @@ fn shot_kick(weapon: u8) -> Kick {
         _ => (0.006, 0.015, 0.2, 0.4),
     };
     // A lash hits across the body rather than away from the shoulder.
-    let side = if weapon == WHIP { 0.06 } else { 0.0 };
+    let side = if weapon == WHIP { 0.10 } else { 0.0 };
     Kick { up, back, side, pitch, fov }
 }
 
@@ -389,12 +390,22 @@ fn run_shot(cfg: &Config, path: &str) {
     // same point in its spring as the game would, not a worm frozen at rest.
     // A charge-up weapon has not fired yet if the picture is taken mid-wind-up.
     if let Some((weapon, ticks)) = cfg.fire {
-        let fired = ticks as f32 * DT >= WEAPONS[weapon as usize].windup;
+        let elapsed = ticks as f32 * DT;
+        let fired = elapsed >= WEAPONS[weapon as usize].windup;
         if fired {
             if let (Some(anim), Some(worm)) = (anims.first_mut(), world.worms.first()) {
                 anim.fired();
                 for _ in 0..ticks {
                     anim.update(worm, DT);
+                }
+                if weapon == WHIP {
+                    // The strike lands after the draw-back; start its swing
+                    // clock at the tick the sim would have fired it.
+                    anim.struck_at(
+                        WhipStyle::Sweep,
+                        0.0,
+                        elapsed - WEAPONS[WHIP as usize].windup,
+                    );
                 }
             }
         }
@@ -978,6 +989,13 @@ impl Viewer {
                     }
                     if worm == 0 {
                         self.feel.kick(&self.camera, shot_kick(weapon));
+                    }
+                }
+                Event::Whip { worm, phase, style, .. } => {
+                    // The lash is part of the worm's model, so the strike is an
+                    // animation cue, not a spawned effect.
+                    if let Some(anim) = self.anims.get_mut(worm as usize) {
+                        anim.struck(style, phase);
                     }
                 }
                 Event::Hit { victim, pos, .. } => {

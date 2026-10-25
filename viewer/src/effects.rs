@@ -10,7 +10,7 @@
 use crate::renderer::DrawPrim;
 use glam::Vec3;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
-use sim::{whip_path, AimPath, Event, Projectile, WhipStyle, Worm, DT, WHIP_POINTS, WHIP_SWEEP};
+use sim::{whip_path, AimPath, Event, Projectile, Worm, DT, WHIP_POINTS};
 use std::f32::consts::TAU;
 
 /// The renderer holds `MAX_CAPSULES` (256) primitives in total, and worms,
@@ -85,6 +85,12 @@ pub fn charging(worm: &Worm) -> Vec<DrawPrim> {
         return Vec::new();
     }
     let id = worm.weapons[worm.current].id;
+    // The whip is the one wind-up that is not a charge: its lash is part of the
+    // worm's own model, and the draw-back is drawn there (see `worms::lash`).
+    // A gathering ring around the muzzle would be a second, wrong idea.
+    if id == WHIP {
+        return Vec::new();
+    }
     let (colour, _) = flash(id);
     let at = worm.muzzle();
     let (dir, side, up) = frame(worm.aim_dir());
@@ -300,11 +306,6 @@ enum Shape {
     Ball { at: Vec3, radius: f32 },
     /// A beam or a tracer: a thin line that thins out.
     Line { from: Vec3, to: Vec3 },
-    /// A plasma whip's lash. The points come from the sim's own `whip_path`,
-    /// so the bright chain the player sees is the same curve that scars the
-    /// world. `style` lets the drawing swing a sweep in from the worm's left; a
-    /// smash already contains its overhead arc.
-    Whip { points: [Vec3; WHIP_POINTS], style: WhipStyle },
 }
 
 struct Effect {
@@ -365,23 +366,6 @@ impl Effect {
             width: 0.0,
             hot: false,
             inkless: false,
-        }
-    }
-
-    /// The lash itself: a glowing chain that snaps out to its full length and
-    /// then fades, with the segments brightening in a travelling pulse.
-    fn whip(points: [Vec3; WHIP_POINTS], style: WhipStyle) -> Effect {
-        Effect {
-            shape: Shape::Whip { points, style },
-            colour: PLASMA,
-            vel: Vec3::ZERO,
-            gravity: 0.0,
-            age: 0.0,
-            life: 0.42,
-            burst: false,
-            width: 0.075,
-            hot: true,
-            inkless: true,
         }
     }
 }
@@ -459,15 +443,14 @@ impl Effects {
                 self.push_burst(Effect::burst(Shape::Ball { at: from, radius: 0.24 }, BEAM, 0.09).glow());
                 self.push_burst(Effect::burst(Shape::Ball { at: to, radius: 0.55 }, BEAM, 0.16).glow());
             }
-            Event::Whip { from, dir, side, phase, length, style } => {
-                // The lash is a chain of glowing segments along the same curve
-                // the sim scars the world along. A bright crack and a few
-                // sparks at the tip sell the impact.
+            Event::Whip { from, dir, side, phase, length, style, .. } => {
+                // The lash itself is carried by the worm (see `worms.rs`), so
+                // the strike only needs to mark the crack: a hot flash at the
+                // tip and a few sparks thrown off the rock or the body it hit.
                 let points = whip_path(from, dir, side, phase, length, style);
-                self.push_burst(Effect::whip(points, style));
                 let tip = points[WHIP_POINTS - 1];
-                self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.26, PLASMA_HOT, 0.12, 0.0).glow());
-                for i in 0..4 {
+                self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.30, PLASMA_HOT, 0.15, 0.0).glow());
+                for i in 0..5 {
                     let a = i as f32 * 2.399 + phase;
                     let spark = Vec3::new(a.cos(), 0.35 + 0.4 * (a * 1.7).sin().abs(), a.sin());
                     self.push_burst(Effect::puff(
@@ -667,55 +650,6 @@ impl Effects {
                     let line = DrawPrim::capsule(*from, *to, e.width * (1.0 - u), e.colour, false);
                     out.push(styled(line, e));
                 }
-                Shape::Whip { points, style } => {
-                    // The lash snaps out from the handle, holds for a beat, then
-                    // fades. Segment brightness ripples along it, so the energy
-                    // reads as moving even though the path is fixed.
-                    let extend = (u / 0.18).clamp(0.0, 1.0);
-                    let head = (extend * (WHIP_POINTS - 1) as f32).max(1.0);
-                    let fade = if u < 0.65 { 1.0 } else { 1.0 - (u - 0.65) / 0.35 };
-                    if fade <= 0.02 {
-                        continue;
-                    }
-                    // A sweep is drawn as the pose it ends in, rotated in from
-                    // the worm's left. The tip therefore travels left to right
-                    // and lands on the aim line. A smash already has its
-                    // overhead arc baked into the points.
-                    let origin = points[0];
-                    let swing = match style {
-                        WhipStyle::Sweep => {
-                            let s = (u / 0.65).clamp(0.0, 1.0);
-                            let ease = s * s * (3.0 - 2.0 * s);
-                            // +WHIP_SWEEP (left) through the aim to -WHIP_SWEEP
-                            // (right): the full left-to-right follow-through.
-                            WHIP_SWEEP * (1.0 - 2.0 * ease)
-                        }
-                        WhipStyle::Smash => 0.0,
-                    };
-                    let (ss, cs) = swing.sin_cos();
-                    let place = |p: Vec3| {
-                        let d = p - origin;
-                        origin + Vec3::new(d.x * cs + d.z * ss, d.y, -d.x * ss + d.z * cs)
-                    };
-                    for k in 0..WHIP_POINTS - 1 {
-                        if k as f32 > head {
-                            break;
-                        }
-                        let t = k as f32 / (WHIP_POINTS - 1) as f32;
-                        // A travelling pulse of brighter segments, like current
-                        // running down the lash.
-                        let pulse = 0.78 + 0.32 * ((k as f32 * 0.9 - u * 18.0).sin() * 0.5 + 0.5);
-                        let colour = (e.colour * pulse).clamp(Vec3::ZERO, Vec3::ONE);
-                        let radius = (e.width * (1.0 - 0.45 * t) * fade).max(0.004);
-                        let seg = DrawPrim::capsule(place(points[k]), place(points[k + 1]), radius, colour, false);
-                        out.push(styled(seg, e));
-                    }
-                    // The bright head of the crack, riding out to the tip.
-                    let k = (head as usize).min(WHIP_POINTS - 1);
-                    let p = place(points[k]);
-                    let tip = DrawPrim::capsule(p, p + Vec3::Y * 0.004, (0.10 * fade).max(0.004), PLASMA_HOT, false);
-                    out.push(styled(tip, e));
-                }
             }
         }
         out
@@ -900,9 +834,10 @@ mod tests {
     }
 
     #[test]
-    fn a_whip_lashes_a_curve_that_snaps_out_then_fades() {
+    fn a_whip_crack_flashes_at_the_tip_and_fades_fast() {
         let mut e = Effects::default();
         e.add(&Event::Whip {
+            worm: 0,
             from: Vec3::ZERO,
             dir: Vec3::Z,
             side: Vec3::NEG_X,
@@ -910,8 +845,10 @@ mod tests {
             length: 9.5,
             style: sim::WhipStyle::Sweep,
         });
+        // The lash itself is part of the worm (see `worms::lash`); the event
+        // only adds the crack at the far end and the sparks it throws.
         let prims = e.capsules();
-        assert!(prims.len() >= 8, "a chain of segments, not a dash: {}", prims.len());
+        assert!(prims.len() >= 5, "a flash and sparks: {}", prims.len());
         for p in &prims {
             match *p {
                 DrawPrim::Capsule { a, b, radius, .. } | DrawPrim::Cylinder { a, b, radius, .. } => {
@@ -920,10 +857,8 @@ mod tests {
                 DrawPrim::Cuboid { centre, half, .. } => assert!(centre.is_finite() && half.max_element() > 0.0),
             }
         }
-        e.update(0.1);
-        assert!(count(&e) >= 8, "the whole lash is out");
-        e.update(0.4);
-        assert_eq!(count(&e), 0, "and then it is gone");
+        e.update(0.3);
+        assert_eq!(count(&e), 0, "the sparks are gone in a blink");
     }
 
     #[test]

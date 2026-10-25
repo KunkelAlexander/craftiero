@@ -396,7 +396,10 @@ pub static WEAPONS: [WeaponDef; 13] = [
         damage: 34.0,
         speed: 0.0,
         lifetime: 0.0,
-        cooldown: 0.42,
+        // A lash is a whole-body swing, not a flick of the wrist: a third of a
+        // second to draw it back (the tell), then the crack, then a long beat
+        // before the next. The old instant strike had no weight at all.
+        cooldown: 0.45,
         mag: 15,
         reload: 1.8,
         spread: 0.0,
@@ -411,7 +414,9 @@ pub static WEAPONS: [WeaponDef; 13] = [
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
-        windup: 0.0,
+        // Draw the lash back before it cracks. The commitment is the point:
+        // step into range and accept that the swing is coming.
+        windup: 0.30,
     },
     // Not in anyone's arsenal: what the Cluster shell splits into.
     WeaponDef {

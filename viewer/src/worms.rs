@@ -9,9 +9,9 @@
 use crate::renderer::DrawPrim;
 use glam::Vec3;
 use sim::weapons::{
-    BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+    BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WEAPONS, WHIP,
 };
-use sim::{whip_path, Action, WhipStyle, Worm, WHIP_POINTS, WORM_HEIGHT};
+use sim::{whip_path, Action, WhipStyle, Worm, WHIP_POINTS, WHIP_SWEEP, WORM_HEIGHT};
 use std::f32::consts::TAU;
 
 /// One colour per player (as picked in a paint program).
@@ -46,6 +46,12 @@ pub struct Anim {
     /// Seconds since this worm last fired, for the gun's recoil and the face's
     /// reaction. Starts old, so a freshly spawned worm does not kick.
     fire: f32,
+    /// Seconds since this worm's whip cracked, and the swing it is drawing.
+    /// The lash is carried by the worm every frame, so this is what turns the
+    /// draw-back into a strike without spawning a whole new weapon effect.
+    whip: f32,
+    whip_phase: f32,
+    whip_style: WhipStyle,
 }
 
 impl Default for Anim {
@@ -58,6 +64,9 @@ impl Default for Anim {
             landed: false,
             was_grounded: true,
             fire: 1.0,
+            whip: 1.0,
+            whip_phase: 0.0,
+            whip_style: WhipStyle::Sweep,
         }
     }
 }
@@ -77,6 +86,7 @@ impl Anim {
         self.was_grounded = worm.on_ground;
         self.clock = (self.clock + dt) % 1000.0;
         self.fire = (self.fire + dt).min(10.0);
+        self.whip = (self.whip + dt).min(10.0);
         // Running makes the undulation quicker; idle keeps a slow ripple.
         let gait = if worm.on_ground {
             3.0 + worm.forward_vel.abs() * 0.55
@@ -89,6 +99,22 @@ impl Anim {
     /// The worm pulled the trigger: reset the recoil clock.
     pub fn fired(&mut self) {
         self.fire = 0.0;
+    }
+
+    /// The plasma whip cracked: start the swing that the carried lash follows.
+    /// `phase` is the sim's ripple, so the drawn lash and the scar agree.
+    pub fn struck(&mut self, style: WhipStyle, phase: f32) {
+        self.whip = 0.0;
+        self.whip_style = style;
+        self.whip_phase = phase;
+    }
+
+    /// Start the swing `age` seconds in. The screenshot path knows how many
+    /// ticks it has stepped, so it can place the lash mid-crack without
+    /// stepping the animation clock through the wind-up as well.
+    pub fn struck_at(&mut self, style: WhipStyle, phase: f32, age: f32) {
+        self.struck(style, phase);
+        self.whip = age.max(0.0);
     }
 }
 
@@ -117,6 +143,9 @@ const HOTSPOT: Vec3 = Vec3::new(1.0, 0.98, 0.85);
 /// The plasma whip's energy: hot violet, close to the magenta of the Swarm
 /// without being the same weapon's colour.
 const PLASMA: Vec3 = Vec3::new(0.55, 0.28, 1.0);
+/// The white-hot core of the lash, used sparingly: a whip made entirely of it
+/// reads as a flat ribbon.
+const PLASMA_TIP: Vec3 = Vec3::new(0.95, 0.82, 1.0);
 
 /// A local frame for laying out a gun. `t` runs along the barrel from the hand,
 /// `x` is sideways and `y` is up; every length is in metres before `s`, so a
@@ -232,7 +261,9 @@ fn recoil_style(id: u8) -> (f32, f32) {
         SWARM => (0.09, 0.06),
         BOUNCER => (0.07, 0.06),
         TELEPORT => (0.07, 0.06),
-        WHIP => (0.06, 0.04),
+        // The lash is not a gun: the whole strike is the animation, and a
+        // second recoil on the handle fights it.
+        WHIP => (0.0, 0.0),
         BLASTER => (0.06, 0.05),
         BOMB => (0.05, 0.04),
         BUILD | TRACTOR => (0.035, 0.02),
@@ -250,6 +281,46 @@ fn recoil_curve(age: f32) -> f32 {
     (-age * 9.0).exp() * (age * 20.0).cos()
 }
 
+/// How long each part of a plasma-whip strike takes, in seconds. The unfurl is
+/// the tip travelling out to the target, the swing is the lash crossing the arc
+/// with the body, and the recovery is the follow-through. Together they are a
+/// little shorter than the sim's cycle (0.30 s draw-back + 0.45 s cooldown), so
+/// the lash is back in hand before the next strike.
+const LASH_UNFURL: f32 = 0.10;
+const LASH_SWING: f32 = 0.22;
+const LASH_RECOVER: f32 = 0.26;
+const LASH_LIFE: f32 = LASH_UNFURL + LASH_SWING + LASH_RECOVER;
+
+/// The whip state the model needs: how far it is drawn back, and how long ago
+/// it cracked.
+#[derive(Clone, Copy)]
+struct Lash {
+    /// 0..1: how far the lash is cocked over the shoulder. It stays at 1
+    /// through the crack, then relaxes, so the strike does not snap the arm
+    /// back to rest on the frame the sim fires.
+    cock: f32,
+    /// Seconds since the strike; `LASH_LIFE` or more when the lash is at rest.
+    age: f32,
+    /// The sim's ripple, so the drawn lash and the scar it leaves agree.
+    phase: f32,
+    style: WhipStyle,
+}
+
+/// Smoothstep, for poses and for the lash's travel. Linear motion over a few
+/// frames reads as a slide; a smooth one reads as a swing.
+fn smooth(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How far the body is thrown into the strike, 0..1: up on the swing, then
+/// back down through the follow-through.
+fn strike_body(age: f32) -> f32 {
+    let lead = smooth(age / (LASH_UNFURL + LASH_SWING));
+    let back = smooth((age - LASH_UNFURL - LASH_SWING) / LASH_RECOVER);
+    lead * (1.0 - back)
+}
+
 /// One weapon: an oversized, distinct silhouette made of the same primitives
 /// as the body. `kick_back` and `kick_rise` are the current recoil (metres and
 /// radians); they do not affect where the sim starts the shot, only how the
@@ -263,7 +334,7 @@ fn weapon(
     rs: f32,
     colour: Vec3,
     clock: f32,
-    fire: f32,
+    lash: Lash,
     out: &mut Vec<DrawPrim>,
 ) {
     // A touch larger than the worm's scale. R&C guns are chunky; a weapon that
@@ -434,38 +505,94 @@ fn weapon(
             out.push(g.ball((0.38, 0.0, 0.0), 0.10, HOTSPOT).glowing());
             out.push(g.plate((0.04, 0.0, -0.19), (0.05, 0.08, 0.12), DARKMETAL));
             out.push(g.plate((0.16, 0.10, 0.02), (0.012, 0.05, 0.10), trim));
-            // Between strikes the lash hangs from the emitter and undulates,
-            // so the weapon reads as a whip even when it is not cracking. A
-            // strike replaces it with the sim's full-length lash (see
-            // `effects.rs`), which is why it hides for the first few frames.
-            if fire > 0.30 {
-                let from = g.at(0.46, 0.0, 0.0);
-                // Bias the idle lash forwards and down so it droops from the
-                // handle without poking through the ground.
-                let idle = (g.fwd * 0.8 - Vec3::Y * 0.65).normalize_or_zero();
-                let path = whip_path(from, idle, g.side, clock * 4.5, 1.45 * rs, WhipStyle::Sweep);
-                for k in 0..WHIP_POINTS - 1 {
-                    let t = k as f32 / (WHIP_POINTS - 1) as f32;
-                    let r = (0.055 - 0.028 * t) * rs;
-                    let col = if k % 3 == 0 { PLASMA } else { lighten(PLASMA, 1.2) };
-                    out.push(
-                        DrawPrim::capsule(path[k], path[k + 1], r, col, false)
-                            .glowing()
-                            .inkless(),
-                    );
-                }
-                let tip = path[WHIP_POINTS - 1];
-                out.push(
-                    DrawPrim::capsule(tip, tip + Vec3::Y * 0.004, 0.06 * rs, HOTSPOT, false)
-                        .glowing()
-                        .inkless(),
-                );
-            }
+            // The lash is carried, not spawned: the same energy sits in the
+            // hand at rest, is drawn back by the wind-up, and cracks out with
+            // the strike. See `lash`.
+            lash_draw(&g, lash, rs, clock, out);
         }
         _ => {
             // BOMBLET is never held; unknown ids draw nothing.
         }
     }
+}
+
+/// The plasma lash: one continuous piece of energy, carried by the worm.
+///
+/// It is never spawned by a shot. At rest it hangs from the emitter and
+/// undulates; as the sim's wind-up runs it is drawn back over the shoulder;
+/// when the strike fires the tip snaps out to the weapon's reach, crosses the
+/// arc with the body, then falls back to whatever the hand is doing (which may
+/// already be the next draw-back).
+fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, out: &mut Vec<DrawPrim>) {
+    let from = g.at(0.46, 0.0, 0.0);
+    // Carried: hangs forward and down, out of the way.
+    let idle_dir = (g.fwd * 0.8 - Vec3::Y * 0.65).normalize_or_zero();
+    let idle_len = 1.45 * rs;
+    // Cocked: drawn up and back over the shoulder, gathered behind the worm.
+    let cock_dir = (g.up * 0.65 - g.fwd * 0.55 - g.side * 0.40).normalize_or_zero();
+    let cock_len = 2.00 * rs;
+
+    let wind = l.cock;
+    let base_dir = idle_dir.lerp(cock_dir, wind).normalize_or_zero();
+    let base_len = idle_len + (cock_len - idle_len) * wind;
+    let mut dir = base_dir;
+    let mut len = base_len;
+    let mut swing = 0.0;
+    let mut heat = 0.30 + 0.70 * wind;
+
+    if l.age < LASH_LIFE {
+        // Unfurl: the tip travels from the hand out to the aim.
+        let u = smooth(l.age / LASH_UNFURL);
+        dir = dir.lerp(g.fwd, u).normalize_or_zero();
+        len += (WEAPONS[WHIP as usize].range - len) * u;
+        // Swing: the lash crosses the arc. The sim's fan covers the whole
+        // left-to-right sweep, exactly as this rotation does.
+        let s = smooth((l.age - LASH_UNFURL) / LASH_SWING);
+        swing = match l.style {
+            WhipStyle::Sweep => WHIP_SWEEP * (1.0 - 2.0 * s),
+            WhipStyle::Smash => 0.0,
+        };
+        // Follow-through: fall back to the carried pose. Squaring the ease
+        // leaves the lash hanging at full length for a beat before it drops.
+        let back = smooth((l.age - LASH_UNFURL - LASH_SWING) / LASH_RECOVER);
+        let back = back * back;
+        dir = dir.lerp(base_dir, back).normalize_or_zero();
+        len += (base_len - len) * back;
+        swing *= 1.0 - back;
+        heat = heat.max(1.0 - 0.55 * back);
+    }
+
+    // The same curve the sim uses, swung around the vertical axis from the
+    // emitter: that rotation is the sweep the hit test covers.
+    let path = whip_path(from, dir, g.side, l.phase + clock * 1.2, len, l.style);
+    let (ss, cs) = swing.sin_cos();
+    let place = |p: Vec3| {
+        let d = p - from;
+        from + Vec3::new(d.x * cs + d.z * ss, d.y, -d.x * ss + d.z * cs)
+    };
+
+    for k in 0..WHIP_POINTS - 1 {
+        let t = k as f32 / (WHIP_POINTS - 1) as f32;
+        // A travelling pulse of brighter segments, like current running down
+        // the lash, so it looks alive even held still.
+        let pulse = (clock * 7.0 - t * 9.0).sin() * 0.5 + 0.5;
+        let base = if k % 3 == 0 { PLASMA } else { lighten(PLASMA, 1.15) };
+        let col = base.lerp(PLASMA_TIP, heat * (0.12 + 0.20 * pulse));
+        let r = (0.044 - 0.020 * t) * rs * (1.0 + 0.70 * heat);
+        out.push(
+            DrawPrim::capsule(place(path[k]), place(path[k + 1]), r, col, false)
+                .glowing()
+                .inkless(),
+        );
+    }
+    // The hot tip: a small ball of energy that leads the crack.
+    let tip = place(path[WHIP_POINTS - 1]);
+    let size = (0.055 + 0.055 * heat) * rs;
+    out.push(
+        DrawPrim::capsule(tip, tip + Vec3::Y * 0.004, size, PLASMA_TIP, false)
+            .glowing()
+            .inkless(),
+    );
 }
 
 /// The capsules for `worms`, each drawn at `positions[i]` (the sim's position
@@ -504,6 +631,19 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         let gun_id = worm.weapons[worm.current].id;
         let (kick_back, kick_rise) = recoil_style(gun_id);
         let kick = recoil_curve(anim.fire);
+        // The plasma whip is the one weapon whose whole body is the animation:
+        // it draws back during the wind-up, then throws the shoulder through
+        // the strike. Both are state, so they show in a screenshot too.
+        let whip_charge = if gun_id == WHIP { smooth(worm.charge_fraction()) } else { 0.0 };
+        // The sim spends the charge on the firing tick. Keep the draw-back pose
+        // for the first beat of the strike anyway, or the arm would snap back
+        // to rest on the very frame the lash cracks.
+        let whip_cock = if gun_id == WHIP && anim.whip < LASH_LIFE {
+            whip_charge.max(1.0 - smooth(anim.whip / (LASH_UNFURL + LASH_SWING)))
+        } else {
+            whip_charge
+        };
+        let whip_strike = if gun_id == WHIP { strike_body(anim.whip) } else { 0.0 };
 
         let mut pose = Pose::default();
         pose.lean = match action {
@@ -557,6 +697,15 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         // the gun's own kick, but it is what stops the arm looking like a stick
         // waving a prop about.
         pose.lean -= kick_rise * 0.28 * kick;
+        if gun_id == WHIP {
+            // Coil away from the target as the lash is cocked, then lean and
+            // twist through it as it cracks. This is the "full strike": the
+            // shoulder does the work, not the wrist.
+            pose.lean += -0.22 * whip_cock + 0.28 * whip_strike;
+            pose.roll += 0.16 * whip_cock - 0.20 * whip_strike;
+            pose.twist += 0.20 * whip_cock - 0.24 * whip_strike;
+            pose.wide *= 1.0 + 0.04 * whip_strike;
+        }
 
         let rig = Rig::new(pos, worm.face_yaw, &pose, rs);
 
@@ -734,6 +883,14 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
         };
         // The kick travels through the arm: the hand snaps back and up, and the
         // spring brings it forward past rest a moment later.
+        let mut hand_r = hand_r;
+        if gun_id == WHIP {
+            // Cock the lash up and back over the shoulder, then throw the arm
+            // across the front of the body. The arm and the lash move together,
+            // so the weapon never looks like it is waving itself.
+            hand_r += Vec3::new(0.18, 0.24, -0.34) * whip_cock;
+            hand_r += Vec3::new(-0.75, -0.10, 0.38) * whip_strike;
+        }
         let hand_r = hand_r - look * (kick_back * 0.55 * kick) + Vec3::Y * (kick_rise * 0.10 * kick);
         let shoulder_l = Vec3::new(-0.30, 1.18, 0.02);
         let shoulder_r = Vec3::new(0.30, 1.18, 0.02);
@@ -775,7 +932,12 @@ pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawP
             rs,
             colour,
             anim.clock,
-            anim.fire,
+            Lash {
+                cock: whip_cock,
+                age: anim.whip,
+                phase: anim.whip_phase,
+                style: anim.whip_style,
+            },
             &mut out,
         );
 
@@ -863,6 +1025,9 @@ struct Pose {
     flip: f32,
     /// Barrel roll around the body's facing axis, for a wall kick or a dangle.
     roll: f32,
+    /// Twist around the body's own up axis: the shoulders turning through a
+    /// melee swing. Unlike `lean`, this keeps the feet planted.
+    twist: f32,
     /// Vertical scale, with the feet planted.
     stretch: f32,
     wide: f32,
@@ -871,7 +1036,7 @@ struct Pose {
 
 impl Default for Pose {
     fn default() -> Pose {
-        Pose { lean: 0.0, flip: 0.0, roll: 0.0, stretch: 1.0, wide: 1.0, deep: 1.0 }
+        Pose { lean: 0.0, flip: 0.0, roll: 0.0, twist: 0.0, stretch: 1.0, wide: 1.0, deep: 1.0 }
     }
 }
 
@@ -897,6 +1062,11 @@ impl Rig {
         let face = rot(base_face, base_right, turn);
         let right = rot(base_right, face, pose.roll);
         let up = rot(up, face, pose.roll);
+        // Last, the twist: the whole upper body turns to throw a melee strike.
+        // It comes after the lean and roll so it turns around the body's own
+        // vertical, not the world's.
+        let face = rot(face, up, pose.twist);
+        let right = rot(right, up, pose.twist);
         let pivot_y = 0.95 * scale;
         Rig {
             pivot: pos + Vec3::Y * pivot_y,
@@ -962,6 +1132,18 @@ mod tests {
                 centre.is_finite() && half.is_finite() && forward.is_finite() && half.max_element() > 0.0
             }
         }
+    }
+
+    /// The farthest point of any primitive from `from`, for measuring reach.
+    fn furthest(caps: &[DrawPrim], from: Vec3) -> f32 {
+        caps.iter()
+            .map(|c| match *c {
+                DrawPrim::Capsule { a, b, .. } | DrawPrim::Cylinder { a, b, .. } => {
+                    a.distance(from).max(b.distance(from))
+                }
+                DrawPrim::Cuboid { centre, half, .. } => centre.distance(from) + half.length(),
+            })
+            .fold(f32::MIN, f32::max)
     }
 
     #[test]
@@ -1050,6 +1232,60 @@ mod tests {
         assert!(recoil_style(NOVA).0 > recoil_style(ROCKET).0);
         assert!(recoil_style(ROCKET).0 > recoil_style(BLASTER).0);
         assert!(recoil_style(BLASTER).0 > 0.0);
+        assert_eq!(recoil_style(WHIP), (0.0, 0.0), "the swing is the recoil");
+    }
+
+    #[test]
+    fn the_plasma_lash_is_carried_and_then_cracks_out() {
+        let mut w = worm(Action::Idle, true);
+        w.current = WHIP as usize;
+        let pos = w.pos;
+        let mut anim = Anim::default();
+
+        // At rest the lash is in the hand, short and drooping, never a full
+        // nine-metre weapon waiting to appear.
+        let idle = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
+        assert!(furthest(&idle, pos) < 4.0, "carried short: {}", furthest(&idle, pos));
+        assert!(idle.iter().all(sane));
+
+        // Drawn back: still carried, but gathered up towards the shoulder.
+        w.weapons[WHIP as usize].charge = WEAPONS[WHIP as usize].windup;
+        let cocked = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
+        assert!(furthest(&cocked, pos) < 4.0, "still in hand while cocked");
+        assert!(cocked.iter().all(sane));
+
+        // The strike: the tip reaches almost the whole 9.5 m.
+        anim.struck(WhipStyle::Sweep, 0.0);
+        anim.whip = LASH_UNFURL + LASH_SWING * 0.5;
+        let strike = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
+        assert!(furthest(&strike, pos) > 8.0, "the crack reaches out: {}", furthest(&strike, pos));
+        assert!(strike.iter().all(sane));
+
+        // And it is gone again by the time the next strike can start, so the
+        // carried pose is continuous across the cycle.
+        anim.whip = LASH_LIFE + 0.01;
+        let settled = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
+        assert!(furthest(&settled, pos) < 4.0);
+        for c in &settled {
+            assert!(sane(c), "settled lash");
+        }
+    }
+
+    #[test]
+    fn a_whole_arsenal_of_whips_still_fits_in_one_frame() {
+        let worms: Vec<Worm> = (0..4)
+            .map(|i| {
+                let mut w = worm(Action::Idle, true);
+                w.pos = Vec3::new(i as f32 * 3.0, 5.0, 0.0);
+                w.current = WHIP as usize;
+                w.weapons[WHIP as usize].charge = WEAPONS[WHIP as usize].windup;
+                w
+            })
+            .collect();
+        let positions: Vec<Vec3> = worms.iter().map(|w| w.pos).collect();
+        let anims: Vec<Anim> = worms.iter().map(|_| Anim::default()).collect();
+        let caps = capsules(&worms, &positions, &anims);
+        assert!(caps.len() <= crate::renderer::MAX_CAPSULES, "{} capsules", caps.len());
     }
 
     #[test]

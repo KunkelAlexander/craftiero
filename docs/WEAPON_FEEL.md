@@ -10,8 +10,9 @@ first and how to check each step.
 
 > **Status:** Phase 1 (sound) is implemented in `viewer/src/audio.rs`: a small
 > oscillator/noise synth with the three layers, a voice per weapon, distance
-> muffle and delay, pitch variance, and a Nova wind-up hum. Phases 2-6 remain
-> open.
+> muffle and delay, pitch variance, and a Nova wind-up hum. The mix is
+> deliberately hot (soft-clipped) and the heavy weapons have 2-4 s tails, so a
+> Nova is a wall of sound rather than a click. Phases 2-6 remain open.
 
 ## 1. The claim
 
@@ -117,7 +118,7 @@ at 2 must stay quiet even when it is the newest thing in the game.
 | 8 | Nova | the cavern eraser | a 1.2 s charge: the view narrows, a ring of light gathers and spins | white-out, a fireball that fills the crater, the ground rolling | a 3 s smoke column and a crater rim glowing orange, cooling to black | **5** |
 | 9 | Block | the wall | none: it is instant | the rock *slams* into place, a dust ring, one hard thud | dust settling off the new face | **2** |
 | 10 | Tractor | the bridge | a grinding hum while held | a continuous stream of lumps, each with a small impact | the new span, still dusty | **2** |
-| 11 | Plasma Whip | the scar | a short wind-up, the plasma brightening | the crack, a sine-wave scar, sparks along the arc | the groove cooling white → red → black over ~2 s | **3** |
+| 11 | Plasma Whip | the scar | a 0.3 s draw-back: the lash is carried, cocked over the shoulder, the plasma brightens | the crack, a sine-wave scar, sparks along the arc | the groove cooling white → red → black over ~2 s | **3** |
 
 Two of these are already the best in the game and should be the template: the
 **Whip** (its scar is shaped by the weapon: a sine wave burned into the rock)
@@ -274,6 +275,12 @@ the press, cancelled by a weapon swap, drawn as a charge ring and a narrowing
 view. And the per-weapon camera recoil (phase 4, partly): a shot now shoves the
 view up, climbs the muzzle and punches the lens, instead of the old slide
 straight back along the aim — a dolly, which is why the recoil was invisible.
+
+The Plasma Whip now carries its lash (phase 6, the ritual): the lash is part of
+the worm's own model, hangs from the hand at rest, is cocked over the shoulder
+for 0.3 s, and then cracks out to its full 9.5 m reach over a 0.32 s swing that
+the whole body follows. Nothing is spawned by the shot, so the weapon is never a
+thing that "appears" — it is either in the hand or mid-swing.
 
 ## 9. Open questions for the owner
 

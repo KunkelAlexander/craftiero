@@ -184,7 +184,7 @@ pub fn whip_path(
                 // the hand, curves out to the worm's left, and returns to the
                 // aim line at the tip, so it keeps its full reach where the
                 // crosshair points and still leaves a whip-shaped scar.
-                let bow = -0.11 * length * (t * std::f32::consts::PI).sin();
+                let bow = -0.16 * length * (t * std::f32::consts::PI).sin();
                 let wave = (phase + t * std::f32::consts::TAU * 1.5).sin()
                     * 0.05
                     * length
@@ -668,6 +668,7 @@ impl World {
         let phase = self.rng.range(0.0, std::f32::consts::TAU);
         let path = whip_path(origin, dir, side, phase, def.range, style);
         self.events.push(Event::Whip {
+            worm: owner as u8,
             from: origin,
             dir,
             side,
@@ -1111,13 +1112,17 @@ mod tests {
     /// what a real client does (the chosen weapon is sent every tick). A charge
     /// that has started runs on its own, so the fire bit is only set on the
     /// first tick.
-    fn hold(w: &mut World, weapon: u8, pitch: f32, ticks: usize) -> Vec<Event> {
+    fn hold_at(w: &mut World, weapon: u8, yaw: f32, pitch: f32, ticks: usize) -> Vec<Event> {
         let mut events = Vec::new();
         for t in 0..ticks {
-            w.step(&[Input { fire: t == 0, weapon, pitch, ..Input::default() }]);
+            w.step(&[Input { fire: t == 0, weapon, yaw, pitch, ..Input::default() }]);
             events.extend(w.drain_events());
         }
         events
+    }
+
+    fn hold(w: &mut World, weapon: u8, pitch: f32, ticks: usize) -> Vec<Event> {
+        hold_at(w, weapon, 0.0, pitch, ticks)
     }
 
     fn explosions(events: &[Event]) -> usize {
@@ -1586,7 +1591,7 @@ mod tests {
     fn the_plasma_whip_hurts_a_worm_it_lashes() {
         let mut w = arena(flat, &[(16.0, 16.0), (16.0, 20.0)]);
         w.worms[0].current = WHIP as usize;
-        let events = shoot(&mut w, WHIP, LEVEL);
+        let events = hold(&mut w, WHIP, LEVEL, 24);
         assert!(w.worms[1].hp < MAX_HP, "the lash reached it: {}", w.worms[1].hp);
         assert!(
             events
@@ -1597,11 +1602,25 @@ mod tests {
     }
 
     #[test]
+    fn the_plasma_whip_draws_back_before_it_cracks() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 20.0)]);
+        // Most of the wind-up: the lash is cocked and the target is untouched.
+        let mut events = hold(&mut w, WHIP, LEVEL, 15);
+        assert!(w.worms[0].charge_fraction() > 0.5, "the lash is drawn back");
+        assert_eq!(w.worms[1].hp, MAX_HP, "nothing has been hit yet");
+        assert!(!events.iter().any(|e| matches!(e, Event::Whip { .. })), "no swing has started");
+        // Let the charge finish: the strike is committed, not a click.
+        events.extend(hold(&mut w, WHIP, LEVEL, 10));
+        assert!(w.worms[1].hp < MAX_HP, "then the crack lands");
+        assert!(events.iter().any(|e| matches!(e, Event::Whip { .. })));
+    }
+
+    #[test]
     fn the_whip_sweeps_a_long_arc_in_front() {
         // One worm near the far end of the reach, one well out to the left.
         let mut w = arena(flat, &[(16.0, 16.0), (16.0, 25.0), (19.5, 22.06)]);
         w.worms[0].current = WHIP as usize;
-        shoot(&mut w, WHIP, LEVEL);
+        hold(&mut w, WHIP, LEVEL, 24);
         assert!(w.worms[1].hp < MAX_HP, "the full 9 m reach is hit: {}", w.worms[1].hp);
         assert!(w.worms[2].hp < MAX_HP, "and the sweep covers the left side: {}", w.worms[2].hp);
     }
@@ -1610,7 +1629,7 @@ mod tests {
     fn the_plasma_whip_leaves_a_scar_in_the_rock() {
         let mut w = arena(flat, &[(16.0, 16.0)]);
         let before = w.grid.checksum();
-        let events = shoot_at(&mut w, WHIP, 0.0, -0.7); // down at the ground
+        let events = hold_at(&mut w, WHIP, 0.0, -0.7, 24); // down at the ground
         assert_ne!(w.grid.checksum(), before, "the rock is scarred");
         assert!(events.iter().any(|e| matches!(e, Event::Edit { op: Op::Carve, .. })));
     }
@@ -1624,7 +1643,7 @@ mod tests {
         w.worms[0].pos.y += 6.0;
         w.worms[0].on_ground = false;
         w.worms[0].action = Action::DoubleJump;
-        let events = shoot(&mut w, WHIP, LEVEL);
+        let events = hold(&mut w, WHIP, LEVEL, 24);
         assert!(
             events
                 .iter()
