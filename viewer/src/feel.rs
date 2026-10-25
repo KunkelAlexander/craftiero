@@ -150,7 +150,7 @@ pub fn blast(weapon: u8) -> Blast {
             smoke_life: 3.6,
             smoke_rise: 3.0,
             dust: 14.0,
-            rings: 1,
+            rings: 0,
             ring_life: 0.24,
             shake: 0.075,
             fov: 2.2,

@@ -44,6 +44,23 @@ an idle dummy to practise on. The M1 fly camera and brush are still there (press
 
 *Craters in a mountain flank. The orange disc is the brush.*
 
+### The worm
+
+The body is one signed distance field: a tapered spine, a head with a snout,
+sockets, a cut grin, a curling tail and two arms holding the gun. There are no
+seams between parts, so it gets one ink outline and the belly is painted as a
+material instead of being a second capsule stuck to the chest. The development
+sheet renders eight yaws at gameplay size, then the same silhouettes at 60 px.
+
+| | |
+|---|---|
+| ![Eight yaws of the grumpy SDF worm, shaded and in silhouette.](screenshots/worm_sdf_sheet.png) | ![Close-up of the worm's grumpy face.](screenshots/worm_sdf_head.png) |
+| *The body sheet used to tune the sculpt.* | *Grumpy brows, lidded bead eyes, cut grin.* |
+
+![The grumpy SDF worm in the game, holding the teleport gun.](screenshots/worm_in_game.png)
+
+*In the game: the same SDF body, with the existing guns, health bar, hit flash and ink outline.*
+
 ## Run it
 
 You need Rust (stable) and a GPU with a DX12, Vulkan or Metal driver.

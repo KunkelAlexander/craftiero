@@ -1,5 +1,10 @@
 // A studio for the worm's body, separate from the game.
 //
+// The game draws this same sculpt from `WORM_SDF` in `shaders.rs`; this file is
+// the authoring sheet. Keep the body constants in sync: the sheet is rendered
+// from eight angles before the shape is wired in, so a change belongs here
+// first, then in `WORM_SDF`.
+//
 // The point is to judge the sculpt before it is wired into the sim: one image
 // with eight yaws, shaded and in flat silhouette, at gameplay size and at the
 // size where a worm is a dozen pixels. No terrain, no gun code, no animation.

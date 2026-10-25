@@ -66,6 +66,9 @@ pub struct FrameParams<'a> {
     /// Gameplay primitives: worms, guns, ropes, projectiles, aim aids and
     /// non-blood effects. At most `MAX_CAPSULES`; the rest are dropped.
     pub capsules: &'a [DrawPrim],
+    /// The worm bodies, one SDF each (up to `MAX_WORMS`). Their shadow proxies
+    /// live in `capsules`; the bodies themselves are traced in the shader.
+    pub worms: &'a [WormSdf],
     /// Cosmetic blood droplets and stains, in their own `MAX_BLOOD_CAPSULES`
     /// pool. They can never push a gameplay primitive out.
     pub blood: &'a [DrawPrim],
@@ -167,23 +170,22 @@ impl Sprite {
         s
     }
 
-    /// An expanding shockwave: a camera-facing ring, not a solid disc. Drawn in
-    /// front of the terrain, because the blast that made it is inside its own
-    /// crater. `thickness` is in metres.
+    /// A flame: like a ball, but with a ragged, boiling edge and a white-hot
+    /// centre. A smooth disc reads as a glowing balloon; fire needs a silhouette.
+    /// It is still depth-tested against the terrain.
+    pub fn flame(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, soft: f32) -> Sprite {
+        let mut s = Sprite::ball(at, radius, colour, opacity, seed, soft);
+        s.c[2] = 4.0; // turbulent
+        s
+    }
+
+    /// An expanding shockwave. Depth-tested: a ring behind a hill stays behind it.
     pub fn shock(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, thickness: f32) -> Sprite {
         Sprite {
             a: [at.x, at.y, at.z, radius.max(0.05)],
             b: [colour.x, colour.y, colour.z, opacity],
-            c: [seed, 0.1, 3.0, thickness.max(0.005)],
+            c: [seed, 0.1, 2.0, thickness.max(0.005)],
         }
-    }
-
-    /// A flame: like a ball, but with a ragged, boiling edge and a white-hot
-    /// centre. A smooth disc reads as a glowing balloon; fire needs a silhouette.
-    pub fn flame(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32, soft: f32) -> Sprite {
-        let mut s = Sprite::ball(at, radius, colour, opacity, seed, soft);
-        s.c[2] = 5.0; // in front, and turbulent
-        s
     }
 }
 
@@ -229,6 +231,64 @@ impl Soot {
     }
 }
 
+/// One worm body, evaluated as a signed distance field in the march shader.
+/// The sculpt itself lives in `worm_preview.rs` (the studio sheet); this is the
+/// frame it is placed in: position, pose axes, the two hands the arms follow,
+/// and the skin colour.
+pub const MAX_WORMS: usize = 4;
+
+#[derive(Clone, Copy)]
+pub struct WormSdf {
+    /// The rig pivot in world space.
+    pub pivot: Vec3,
+    /// Local y at the pivot, in model units. See `Rig::at`.
+    pub y_offset: f32,
+    /// The rig's three unit axes in world space.
+    pub right: Vec3,
+    pub up: Vec3,
+    pub face: Vec3,
+    /// 1 / (rig scale * pose scale * model scale) along each axis.
+    pub inv_scale: Vec3,
+    /// The right and left hands, in model units (the SDF local frame).
+    pub hand_r: Vec3,
+    pub hand_l: Vec3,
+    /// Skin colour (sRGB) and the white hit flash, 0..1.
+    pub skin: Vec3,
+    pub flash: f32,
+    /// World bounding sphere for the cheap reject.
+    pub bound: Vec3,
+    pub radius: f32,
+}
+
+// Must match `struct Worm` in shaders.rs.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuWorm {
+    pivot: [f32; 4],  // xyz + y_offset
+    right: [f32; 4],  // xyz + 1/scale along it
+    up: [f32; 4],
+    face: [f32; 4],
+    hand_r: [f32; 4],
+    hand_l: [f32; 4],
+    skin: [f32; 4],   // rgb + flash
+    bound: [f32; 4],  // xyz + radius
+}
+
+impl WormSdf {
+    fn gpu(self) -> GpuWorm {
+        GpuWorm {
+            pivot: self.pivot.extend(self.y_offset).to_array(),
+            right: self.right.extend(self.inv_scale.x).to_array(),
+            up: self.up.extend(self.inv_scale.y).to_array(),
+            face: self.face.extend(self.inv_scale.z).to_array(),
+            hand_r: self.hand_r.extend(0.0).to_array(),
+            hand_l: self.hand_l.extend(0.0).to_array(),
+            skin: self.skin.extend(self.flash.clamp(0.0, 1.0)).to_array(),
+            bound: self.bound.extend(self.radius.max(0.0)).to_array(),
+        }
+    }
+}
+
 /// One primitive the raymarcher intersects in closed form (no sphere tracing),
 /// so each stays a handful of multiplications per pixel. Worms are mostly
 /// capsules; a gun is boxes and cylinders, because flat faces and hard edges are
@@ -236,22 +296,39 @@ impl Soot {
 #[derive(Clone, Copy)]
 pub enum DrawPrim {
     /// A line segment swept by a sphere (rounded ends).
-    Capsule { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool, inkless: bool },
+    Capsule { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool, inkless: bool, proxy: bool },
     /// A line segment swept by a disc (flat ends), for a crisp gun barrel.
-    Cylinder { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool, inkless: bool },
+    Cylinder { a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool, glow: bool, inkless: bool, proxy: bool },
     /// A hard-edged box, long axis along `forward`, its "up" taken from world up.
-    Cuboid { centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool, glow: bool, inkless: bool },
+    Cuboid { centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool, glow: bool, inkless: bool, proxy: bool },
 }
 
 impl DrawPrim {
     pub fn capsule(a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool) -> DrawPrim {
-        DrawPrim::Capsule { a, b, radius, colour, shadow, glow: false, inkless: false }
+        DrawPrim::Capsule { a, b, radius, colour, shadow, glow: false, inkless: false, proxy: false }
     }
     pub fn cylinder(a: Vec3, b: Vec3, radius: f32, colour: Vec3, shadow: bool) -> DrawPrim {
-        DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: false, inkless: false }
+        DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: false, inkless: false, proxy: false }
     }
     pub fn cuboid(centre: Vec3, half: Vec3, forward: Vec3, colour: Vec3, shadow: bool) -> DrawPrim {
-        DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: false, inkless: false }
+        DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: false, inkless: false, proxy: false }
+    }
+
+    /// Shadow-only: it blocks the sun on the terrain but is not drawn. The SDF
+    /// worm uses a handful of these instead of tracing itself for every terrain
+    /// shadow ray.
+    pub fn proxy(self) -> DrawPrim {
+        match self {
+            DrawPrim::Capsule { a, b, radius, colour, shadow, glow, inkless, .. } => {
+                DrawPrim::Capsule { a, b, radius, colour, shadow, glow, inkless, proxy: true }
+            }
+            DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, inkless, .. } => {
+                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, inkless, proxy: true }
+            }
+            DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, inkless, .. } => {
+                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, inkless, proxy: true }
+            }
+        }
     }
 
     /// Make it self-lit: the shader skips shading and draws the colour flat and
@@ -259,14 +336,14 @@ impl DrawPrim {
     /// painted plastic.
     pub fn glowing(self) -> DrawPrim {
         match self {
-            DrawPrim::Capsule { a, b, radius, colour, shadow, inkless, .. } => {
-                DrawPrim::Capsule { a, b, radius, colour, shadow, glow: true, inkless }
+            DrawPrim::Capsule { a, b, radius, colour, shadow, inkless, proxy, .. } => {
+                DrawPrim::Capsule { a, b, radius, colour, shadow, glow: true, inkless, proxy }
             }
-            DrawPrim::Cylinder { a, b, radius, colour, shadow, inkless, .. } => {
-                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: true, inkless }
+            DrawPrim::Cylinder { a, b, radius, colour, shadow, inkless, proxy, .. } => {
+                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow: true, inkless, proxy }
             }
-            DrawPrim::Cuboid { centre, half, forward, colour, shadow, inkless, .. } => {
-                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: true, inkless }
+            DrawPrim::Cuboid { centre, half, forward, colour, shadow, inkless, proxy, .. } => {
+                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow: true, inkless, proxy }
             }
         }
     }
@@ -276,14 +353,14 @@ impl DrawPrim {
     /// is wider than the shape, and a glowing dot turns into a dark pebble.
     pub fn inkless(self) -> DrawPrim {
         match self {
-            DrawPrim::Capsule { a, b, radius, colour, shadow, glow, .. } => {
-                DrawPrim::Capsule { a, b, radius, colour, shadow, glow, inkless: true }
+            DrawPrim::Capsule { a, b, radius, colour, shadow, glow, proxy, .. } => {
+                DrawPrim::Capsule { a, b, radius, colour, shadow, glow, inkless: true, proxy }
             }
-            DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, .. } => {
-                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, inkless: true }
+            DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, proxy, .. } => {
+                DrawPrim::Cylinder { a, b, radius, colour, shadow, glow, inkless: true, proxy }
             }
-            DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, .. } => {
-                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, inkless: true }
+            DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, proxy, .. } => {
+                DrawPrim::Cuboid { centre, half, forward, colour, shadow, glow, inkless: true, proxy }
             }
         }
     }
@@ -311,6 +388,14 @@ impl DrawPrim {
             DrawPrim::Capsule { inkless, .. }
             | DrawPrim::Cylinder { inkless, .. }
             | DrawPrim::Cuboid { inkless, .. } => *inkless,
+        }
+    }
+
+    fn is_proxy(&self) -> bool {
+        match self {
+            DrawPrim::Capsule { proxy, .. }
+            | DrawPrim::Cylinder { proxy, .. }
+            | DrawPrim::Cuboid { proxy, .. } => *proxy,
         }
     }
 
@@ -366,6 +451,7 @@ struct Uniforms {
     fx: [f32; 4],
     lights: [Light; MAX_LIGHTS],
     soot: [Soot; MAX_SOOT],
+    worms: [GpuWorm; MAX_WORMS],
     capsules: [GpuPrim; MAX_PRIMS],
     tiles: [[u32; 4]; TILE_WORDS * TILES_X * TILES_Y / 4],
 }
@@ -389,6 +475,11 @@ fn tile_masks(cam: &Camera, aspect: f32, prims: &[&DrawPrim]) -> [[u32; 4]; TILE
     let fwd = cam.forward();
     let (hy, hx) = ((cam.fov_y * 0.5).tan(), (cam.fov_y * 0.5).tan() * aspect);
     for (i, c) in prims.iter().enumerate() {
+        // Shadow proxies are never drawn, so they do not need a tile bit. The
+        // cap array still holds them for `caps_block` on the sun ray.
+        if c.is_proxy() {
+            continue;
+        }
         // A sphere around the whole primitive, then the sphere's rectangle on screen.
         let (mid, r) = c.bounds();
         let rel = mid - cam.pos;
@@ -440,6 +531,9 @@ fn pack(c: &DrawPrim) -> GpuPrim {
     }
     if c.is_inkless() {
         flags += 2.0;
+    }
+    if c.is_proxy() {
+        flags += 4.0;
     }
     let (a, b, radius, colour, kind) = match *c {
         DrawPrim::Capsule { a, b, radius, colour, .. } => (a, b, radius, colour, KIND_CAPSULE),
@@ -936,7 +1030,16 @@ impl Renderer {
             .collect();
         let casters = core.iter().filter(|c| c.shadow()).count();
         let blood = &f.blood[..f.blood.len().min(MAX_BLOOD_CAPSULES)];
-        let ordered: Vec<&DrawPrim> = core.iter().copied().chain(blood.iter()).collect();
+        // `counts.y` means "the first y primitives cast shadows", so the casters
+        // have to be a prefix. Put them first; the draw pass takes the nearest
+        // hit, so its order does not matter.
+        let ordered: Vec<&DrawPrim> = core
+            .iter()
+            .copied()
+            .filter(|c| c.shadow())
+            .chain(core.iter().copied().filter(|c| !c.shadow()))
+            .chain(blood.iter())
+            .collect();
         let tiles = tile_masks(cam, aspect, &ordered);
         let mut capsules = [GpuPrim::zeroed(); MAX_PRIMS];
         let used = ordered.len();
@@ -967,6 +1070,13 @@ impl Renderer {
                     *slot = *src;
                 }
                 s
+            },
+            worms: {
+                let mut w = [GpuWorm::zeroed(); MAX_WORMS];
+                for (slot, src) in w.iter_mut().zip(f.worms.iter().take(MAX_WORMS)) {
+                    *slot = src.gpu();
+                }
+                w
             },
             capsules,
             tiles,

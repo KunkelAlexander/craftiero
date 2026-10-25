@@ -454,7 +454,7 @@ fn run_shot(cfg: &Config, path: &str) {
             anim.update(worm, 0.03);
         }
     }
-    let (mut capsules, whip_glow) = worms::draw(&world.worms, &positions, &anims);
+    let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&world.worms, &positions, &anims);
     for worm in &world.worms {
         capsules.extend(effects::charging(worm));
     }
@@ -473,6 +473,7 @@ fn run_shot(cfg: &Config, path: &str) {
     let params = FrameParams {
         camera: &cam,
         capsules: &capsules,
+        worms: &worm_sdfs,
         blood: &blood,
         glow: &sprites.glow,
         smoke: &sprites.smoke,
@@ -590,6 +591,7 @@ fn run_bench(cfg: &Config) {
             let params = FrameParams {
                 camera: cam,
                 capsules: &[],
+                worms: &[],
                 blood: &[],
                 glow: &[],
                 smoke: &[],
@@ -621,10 +623,11 @@ fn run_bench(cfg: &Config) {
     worms[1].rope = Some(sim::Rope { anchor: Vec3::new(64.0, 60.0, 44.0), length: 10.0 });
     let positions: Vec<Vec3> = worms.iter().map(|w| w.pos).collect();
     let anims: Vec<worms::Anim> = worms.iter().map(|_| worms::Anim::default()).collect();
-    let capsules = worms::capsules(&worms, &positions, &anims);
+    let (capsules, _whip_glow, sdfs) = worms::draw(&worms, &positions, &anims);
     let with = FrameParams {
         camera: &views[0].1,
         capsules: &capsules,
+        worms: &sdfs,
         blood: &[],
         glow: &[],
         smoke: &[],
@@ -639,7 +642,7 @@ fn run_bench(cfg: &Config) {
         flash: 0.0,
         grade: WORLD_GRADE,
     };
-    let without = FrameParams { capsules: &[], ..with };
+    let without = FrameParams { capsules: &[], worms: &[], ..with };
     // Alternate the two, best of five rounds each: a clock change on this GPU is
     // slow and large, and measured one after the other it would land on one variant.
     let (mut a, mut b) = (None::<Timing>, None::<Timing>);
@@ -658,6 +661,7 @@ fn run_bench(cfg: &Config) {
     let params = FrameParams {
         camera: cam,
         capsules: &[],
+        worms: &[],
         blood: &[],
         glow: &[],
         smoke: &[],
@@ -1319,7 +1323,7 @@ impl Viewer {
             }
         }
 
-        let (mut capsules, whip_glow) = worms::draw(&self.world.worms, &draw_pos, &self.anims);
+        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.world.worms, &draw_pos, &self.anims);
         // A charge is state, not an event: draw it for every worm, so a Nova
         // spin-up is a warning you can see coming.
         for worm in &self.world.worms {
@@ -1367,6 +1371,7 @@ impl Viewer {
         let params = FrameParams {
             camera: &render_camera,
             capsules: &capsules,
+            worms: &worm_sdfs,
             blood: &blood,
             glow: &sprites.glow,
             smoke: &sprites.smoke,

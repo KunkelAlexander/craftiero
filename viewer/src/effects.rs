@@ -633,11 +633,11 @@ impl Effects {
                     let t = trail[WHIP_POINTS - 1];
                     let life = 0.38 - 0.16 * s;
                     self.push_burst(
-                        Effect::puff(t, Vec3::ZERO, 0.13 + 0.04 * (1.0 - s), PLASMA, life, 0.0).glow().front(),
+                        Effect::puff(t, Vec3::ZERO, 0.13 + 0.04 * (1.0 - s), PLASMA, life, 0.0).glow(),
                     );
                     let mid = trail[WHIP_POINTS * 2 / 3];
                     self.push_burst(
-                        Effect::puff(mid, Vec3::ZERO, 0.09, PLASMA, life * 0.8, 0.0).glow().front(),
+                        Effect::puff(mid, Vec3::ZERO, 0.09, PLASMA, life * 0.8, 0.0).glow(),
                     );
                 }
                 for i in 0..5 {                    let a = i as f32 * 2.399 + phase;
@@ -716,19 +716,18 @@ impl Effects {
     fn blast(&mut self, weapon: u8, pos: Vec3, normal: Vec3, radius: f32) {
         let look = feel::blast(weapon);
         let up = if normal.length_squared() > 1.0e-4 { normal.normalize_or_zero() } else { Vec3::Y };
-        // Lift the fire out of the crater the blast just carved. A fireball
-        // centred at the impact point sits at the bottom of its own bowl, where
-        // the near rim hides every pixel of it from a normal camera. Rising out
-        // of the hole is also what a real explosion does.
-        let lift = 0.05 * radius;
+        // Fire must obey the terrain: a blast in a cave may not paint flames on
+        // the rock in front of it. But a fireball centred at the impact point
+        // sits at the bottom of the crater it just carved, where the near rim
+        // hides every pixel. The answer is to erupt: put the fireball above the
+        // hole, with a column of flame connecting it to the ground. The part of
+        // the column still inside the pit is correctly hidden by the rim.
+        let lift = 0.5 + radius * 0.55;
         let base = pos + up * lift;
 
-        // A white-hot core that stays in front of everything: the first frames
-        // of a blast are the frame the player remembers.
+        // A white-hot core, depth-tested like everything else.
         self.push_burst(
-            Effect::burst(Shape::Ball { at: base + up * 0.15, radius: radius * look.core_size }, look.core, 0.11)
-                .glow()
-                .front(),
+            Effect::burst(Shape::Ball { at: base, radius: radius * look.core_size }, look.core, 0.11).glow(),
         );
         self.push_light(
             pos + up * (lift + 0.4),
@@ -750,47 +749,53 @@ impl Effects {
             life: 24.0,
         });
 
-        // The body of the fireball: seven lobes of different sizes and colours,
-        // thrown out and up and slowing as they rise. One sphere per colour
-        // reads as a balloon; a ragged cluster reads as fire.
         let fire_life = (0.34 + radius * 0.09) * look.fire_life;
         // One big fire body with smaller lobes around it. All-lobes reads as a
         // string of glowing beads; one big sphere reads as a balloon. Together
         // they make a ragged, connected fireball.
         let mut body = Effect::burst(
-            Shape::Ball { at: base + up * radius * 0.15, radius: radius * 0.80 },
+            Shape::Ball { at: base + up * radius * 0.12, radius: radius * 0.55 },
             look.fire[1],
             fire_life * 1.15,
         );
-        body.vel = up * (1.8 + radius * 0.40);
-        body.gravity = 4.0;
+        body.vel = up * (6.0 + radius * 0.70);
+        body.gravity = 5.0;
         body.hot = true;
         body.inkless = true;
-        body.front = true;
         self.push_burst(body);
         for k in 0..7 {
             let a = k as f32 * 2.399 + pos.x * 1.3 + pos.z * 0.7;
             let out = Vec3::new(a.cos(), 0.0, a.sin());
             let reach = radius * look.fire_reach[k % 3] * (0.55 + 0.40 * k as f32);
-            let rise = radius * (0.10 + 0.08 * ((k * 2 + 1) as f32).sin().abs());
-            let size = radius * look.fire_size[k % 3] * (0.42 + 0.20 * (a * 1.7).sin().abs());
+            let rise = radius * (0.10 + 0.14 * ((k * 2 + 1) as f32).sin().abs());
+            let size = radius * look.fire_size[k % 3] * (0.38 + 0.20 * (a * 1.7).sin().abs());
             let mut fire = Effect::burst(
                 Shape::Ball { at: base + out * reach + up * rise, radius: size },
                 look.fire[k % 3],
                 fire_life * (0.90 + 0.12 * k as f32),
             );
-            // The fire keeps climbing after the flash, so its top is above the
-            // crater rim within a frame or two.
-            fire.vel = up * (2.0 + radius * 0.55) + out * (0.8 + radius * 0.22);
-            fire.gravity = 5.0;
+            fire.vel = up * (6.0 + radius * 0.70) + out * (0.8 + radius * 0.22);
+            fire.gravity = 6.0;
             fire.hot = true;
             fire.inkless = true;
-            // Fire is drawn in front of the terrain. A blast carves its own pit,
-            // and from a shoulder-height camera the near rim would otherwise hide
-            // the entire fireball. The fire is light: letting it spill over the
-            // rim is what an explosion looks like.
-            fire.front = true;
             self.push_burst(fire);
+        }
+        // The flame column: five burning puffs from the crater floor to the
+        // fireball. The lower ones are inside the pit and hidden; the upper ones
+        // are the visible eruption rising over the rim.
+        for k in 0..5 {
+            let t = (k as f32 + 1.0) / 5.0;
+            let at = pos + up * (lift * t);
+            let mut flame = Effect::burst(
+                Shape::Ball { at, radius: radius * 0.26 * (0.65 + 0.35 * t) },
+                look.fire[(k + 1) % 3],
+                fire_life * (0.55 + 0.12 * t),
+            );
+            flame.vel = up * (4.0 + radius * 0.45);
+            flame.gravity = 5.0;
+            flame.hot = true;
+            flame.inkless = true;
+            self.push_burst(flame);
         }
 
         // A short-lived white flash around the whole thing, so the blast reads
@@ -802,11 +807,10 @@ impl Effects {
         );
         flare.hot = true;
         flare.inkless = true;
-        flare.front = true;
         self.push_burst(flare);
 
-        self.debris(pos + up * (lift * 0.5), radius, &look);
-        self.rocks(pos + up * (lift * 0.5), radius);
+        self.debris(pos + up * (lift * 0.35), radius, &look);
+        self.rocks(pos + up * (lift * 0.35), radius);
 
         // The smoke is a separate, longer-lived thing: it is what the player
         // sees after the fire has gone, and what makes a bomb feel dirty. A
@@ -817,7 +821,7 @@ impl Effects {
             let a = k as f32 * 2.399 + pos.z * 0.9;
             let out = Vec3::new(a.cos(), 0.0, a.sin()) * radius * (0.05 + 0.08 * (k % 3) as f32);
             let mut smoke = Effect::puff(
-                base + out + up * radius * (0.10 + 0.06 * (k % 4) as f32),
+                base + out + up * radius * (0.30 + 0.07 * (k % 4) as f32),
                 Vec3::ZERO,
                 radius * look.smoke_size * (1.15 + 0.20 * (k % 3) as f32),
                 look.smoke,
@@ -827,9 +831,6 @@ impl Effects {
             smoke.vel = up * (look.smoke_rise * (1.2 + 0.25 * (k % 3) as f32)) + out * 0.35;
             smoke.gravity = -0.15;
             smoke.inkless = true;
-            // Smoke from a blast is drawn over the rim too: it is the cloud that
-            // tells you where the blast was after the fire is gone.
-            smoke.front = true;
             self.push_dust(smoke);
         }
         // A ring of dust along the ground, so the blast meets the crater it made
@@ -847,7 +848,6 @@ impl Effects {
                 2.5,
             );
             d.inkless = true;
-            d.front = true;
             self.push_dust(d);
         }
         // Fire-lit smoke right over the flames: dark, warm, and low, so it does
@@ -864,7 +864,6 @@ impl Effects {
                 0.0,
             );
             d.inkless = true;
-            d.front = true;
             self.push_dust(d);
         }
         if look.dust > 0.0 {
@@ -1403,13 +1402,17 @@ fn ball_sprite(e: &Effect, glow: bool) -> Option<Sprite> {
         return None;
     }
     let seed = at.x * 1.7 + at.y * 0.9 + at.z * 1.3;
-    // A glow sprite fades over a longer distance so a muzzle flash is not
-    // swallowed by the gun it is in front of; smoke hugs the surface it hides.
-    let soft = if glow { (size * 1.5 + 0.25).max(0.12) } else { (size * 0.6 + 0.12).max(0.05) };
-    Some(if e.front && e.burst {
-        Sprite::flame(*at, size, e.colour, alpha, seed, soft)
+    // Small softness: this is the fade distance at the terrain edge, and a large
+    // one makes a sprite bleed visibly through a wall.
+    let soft = if glow { (0.15 + size * 0.25).min(0.9) } else { (0.12 + size * 0.15).min(0.7) };
+    Some(if e.front && glow && e.burst {
+        let mut s = Sprite::flame(*at, size, e.colour, alpha, seed, soft);
+        s.c[2] = 5.0; // turbulent + in front
+        s
     } else if e.front {
         Sprite::front_ball(*at, size, e.colour, alpha, seed, soft)
+    } else if glow && e.burst {
+        Sprite::flame(*at, size, e.colour, alpha, seed, soft)
     } else {
         Sprite::ball(*at, size, e.colour, alpha, seed, soft)
     })

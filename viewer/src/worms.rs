@@ -6,13 +6,20 @@
 // and the gun. There are no legs: it gets around by undulating, which is also
 // what most of the animation below is about.
 
-use crate::renderer::{DrawPrim, Sprite};
+use crate::renderer::{DrawPrim, Sprite, WormSdf};
 use glam::Vec3;
 use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WEAPONS, WHIP,
 };
 use sim::{whip_path, Action, WhipStyle, Worm, MAX_HP, WHIP_POINTS, WHIP_SWEEP, WORM_HEIGHT};
 use std::f32::consts::TAU;
+
+/// How tall the preview sculpt is, in its own units. The game worm is 1.8 m;
+/// the SDF is scaled by `WORM_HEIGHT / SDF_MODEL` so it fills the same box.
+const SDF_MODEL: f32 = 1.52;
+/// The hands the SDF arms are built around, in the preview's local frame.
+const SDF_HAND_R: Vec3 = Vec3::new(0.108, 0.868, 0.682);
+const SDF_HAND_L: Vec3 = Vec3::new(0.100, 0.870, 0.850);
 
 /// One colour per player (as picked in a paint program).
 const COLOURS: [Vec3; 4] = [
@@ -559,8 +566,8 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
     let from = g.at(0.18, 0.0, 0.0);
     // Carried: hangs forward and down, out of the way. Long enough to read as a
     // weapon you are holding, not a spark in the hand.
-    let idle_dir = (g.side * 0.75 - Vec3::Y * 0.70 + g.fwd * 0.25).normalize_or_zero();
-    let idle_len = 2.2 * rs;
+    let idle_dir = (g.side * 0.85 - Vec3::Y * 0.35 + g.fwd * 0.18).normalize_or_zero();
+    let idle_len = 2.0 * rs;
     // Cocked: drawn up and back over the shoulder, gathered behind the worm.
     let cock_dir = (g.up * 0.65 - g.fwd * 0.55 - g.side * 0.40).normalize_or_zero();
     let cock_len = 3.6 * rs;
@@ -621,7 +628,7 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
         // continuous ribbon instead of a string of beads.
         let p = place(path[k]);
         let halo = (r * 2.2).max(0.10);
-        glow.push(Sprite::front_ball(
+        glow.push(Sprite::ball(
             p,
             halo,
             PLASMA.lerp(PLASMA_TIP, 0.08 + 0.22 * heat),
@@ -638,15 +645,16 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
             .glowing()
             .inkless(),
     );
-    glow.push(Sprite::front_ball(tip, size * 2.2, PLASMA_TIP, 0.35 + 0.45 * heat, tip.x + tip.z, size * 2.0));
+    glow.push(Sprite::ball(tip, size * 2.2, PLASMA_TIP, 0.35 + 0.45 * heat, tip.x + tip.z, size * 2.0));
 }
 
 /// The capsules for `worms`, each drawn at `positions[i]` (the sim's position
 /// smoothed between two ticks, see `Viewer::frame`), plus the glow sprites the
 /// plasma whip emits. Most rigs produce no sprites; the whip is the exception.
-pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim>, Vec<Sprite>) {
+pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim>, Vec<Sprite>, Vec<WormSdf>) {
     let mut out = Vec::new();
     let mut glow = Vec::new();
+    let mut sdfs = Vec::new();
     for (i, (worm, &pos)) in worms.iter().zip(positions).enumerate() {
         if !worm.alive {
             continue; // (the death flash is an effect, see `effects.rs`)
@@ -793,6 +801,11 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
         // make the segmentation read even on the flat toon bands. A narrow body
         // and a big head is the Dr Nefarious silhouette: it makes the gun beside
         // it look enormous.
+        //
+        // The SDF body is the one that is drawn. These capsules stay as shadow
+        // proxies (and for the tests that inspect the old rig); `proxy` makes the
+        // shader skip them in the colour pass but still use them for sun shadows.
+        let body_start = out.len();
         let body_y = [0.28, 0.76, 1.15, 1.50];
         let body_r = [0.30, 0.26, 0.23, 0.20];
         let mut prev = rig.at(sway(0.0), body_y[0] + lift, surge(0.0));
@@ -921,6 +934,10 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
             false,
         ));
 
+        for c in &mut out[body_start..] {
+            *c = c.proxy();
+        }
+
         // Health bar: a chunky vertical bar over a wounded worm. It is vertical
         // so every camera angle sees its full length, and it only appears once
         // there is damage to report. A fresh hit makes it jump under the flash,
@@ -1004,6 +1021,9 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
         let shoulder_r = Vec3::new(0.30, 1.18, 0.02);
         let arm = darken(colour, 0.84);
         let glove = darken(colour, 0.68);
+        // The SDF body has its own arms. These old capsules are kept as
+        // invisible proxies for the existing rig tests; they cast no shadow.
+        let arms_start = out.len();
         for (shoulder, hand) in [(shoulder_l, hand_l), (shoulder_r, hand_r)] {
             out.push(caps(
                 rig.at(shoulder.x, shoulder.y, shoulder.z),
@@ -1021,12 +1041,31 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
                 false,
             ));
         }
+        for c in &mut out[arms_start..] {
+            *c = c.proxy();
+        }
+
+        // The SDF body's hands, in the preview's model units. The gun still uses
+        // world space, so both are derived from the same rig. Recoil and the
+        // whip move the right hand; the arm follows it in the shader.
+        let ms = WORM_HEIGHT / SDF_MODEL;
+        let mut sdf_hand_r = SDF_HAND_R;
+        if gun_id == WHIP {
+            sdf_hand_r += Vec3::new(0.18, 0.24, -0.34) * whip_cock / ms;
+            sdf_hand_r += Vec3::new(-0.75, -0.10, 0.38) * whip_strike / ms;
+        }
+        sdf_hand_r += -look * (kick_back * 0.55 * kick / ms) + Vec3::Y * (kick_rise * 0.10 * kick / ms);
+        let sdf_hand_l = SDF_HAND_L;
 
         // The weapon. Each id gets its own oversized, distinct silhouette built
         // from the same three primitives, so the per-pixel cost stays one cheap
         // closed-form raycast per piece. `fwd` is the aim in the rig's rotated
         // frame, so the gun flips with the body on a double jump.
-        let hand_r_world = rig.at(hand_r.x, hand_r.y, hand_r.z);
+        //
+        // The SDF body bobs and sways with the gait. The gun rides the same
+        // offset, so the hands and the weapon never separate.
+        let sdf_off = Vec3::Y * lift + rig.right * sway(0.5);
+        let hand_r_world = rig.at(sdf_hand_r.x * ms, sdf_hand_r.y * ms, sdf_hand_r.z * ms) + sdf_off;
         let fwd = (rig.right * look.x + rig.up * look.y + rig.face * look.z).normalize_or_zero();
         // The gun itself travels the rest of the kick, and the muzzle climbs as
         // it does. The hand above took the first half, so the arm compresses
@@ -1051,7 +1090,9 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
         );
 
         // Tail: two tapering segments behind the body, wagging out of phase.
-        // It is the clearest cue for which way the body faces.
+        // It is the clearest cue for which way the body faces. Like the old
+        // arms, these are invisible test proxies; the SDF tail is the one drawn.
+        let tail_start = out.len();
         let wag = (anim.phase * 1.1 + 1.3).sin() * (0.10 + 0.08 * run);
         let tail_base = Vec3::new(sway(0.0) * 0.8, 0.42, -0.30);
         let tail_mid = Vec3::new(
@@ -1090,6 +1131,35 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
             darken(colour, 0.72),
             false,
         ));
+        for c in &mut out[tail_start..] {
+            *c = c.proxy();
+        }
+
+        // The SDF body. `ms` maps the preview's 1.52 m sculpt onto WORM_HEIGHT;
+        // the inverse of the rig (including the squash) is what the shader uses
+        // to put a ray into the model's frame.
+        let sdf_inv = Vec3::new(
+            1.0 / (rig.scale * rig.wide * ms),
+            1.0 / (rig.scale * rig.stretch * ms),
+            1.0 / (rig.scale * rig.deep * ms),
+        );
+        let sdf_y = rig.pivot_y / (rig.scale * rig.stretch * ms);
+        let sdf_bound = rig.at(0.0, 0.76 * ms, 0.08 * ms);
+        let sdf_radius = 1.12 * ms * rig.scale * rig.wide.max(rig.stretch).max(rig.deep) + 0.06;
+        sdfs.push(WormSdf {
+            pivot: rig.pivot + sdf_off,
+            y_offset: sdf_y,
+            right: rig.right,
+            up: rig.up,
+            face: rig.face,
+            inv_scale: sdf_inv,
+            hand_r: sdf_hand_r,
+            hand_l: sdf_hand_l,
+            skin: COLOURS[i % COLOURS.len()],
+            flash,
+            bound: sdf_bound + sdf_off,
+            radius: sdf_radius,
+        });
 
         if let Some(rope) = worm.rope {
             if (rope.anchor - hand_r_world).length() > 0.1 {
@@ -1097,10 +1167,11 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
             }
         }
     }
-    (out, glow)
+    (out, glow, sdfs)
 }
 
 /// Capsules only, for tests that do not inspect the whip's glow.
+#[cfg(test)]
 pub fn capsules(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> Vec<DrawPrim> {
     draw(worms, positions, anims).0
 }
@@ -1509,5 +1580,21 @@ mod tests {
         let normal = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
         let normal_tallest = normal.iter().map(top).fold(f32::MIN, f32::max);
         assert!(tallest < normal_tallest, "squash is shorter: {tallest} vs {normal_tallest}");
+    }
+
+    #[test]
+    fn the_sdf_body_has_one_block_per_worm_and_a_sane_frame() {
+        let w = worm(Action::Idle, true);
+        let pos = w.pos;
+        let anim = Anim::default();
+        let (_, _, sdfs) = draw(std::slice::from_ref(&w), &[pos], &[anim]);
+        assert_eq!(sdfs.len(), 1, "one SDF block per live worm");
+        let s = sdfs[0];
+        assert!(s.pivot.is_finite() && s.pivot.y > 0.0);
+        assert!(s.right.is_normalized() && s.up.is_normalized() && s.face.is_normalized());
+        assert!(s.inv_scale.min_element() > 0.0 && s.inv_scale.is_finite());
+        assert!(s.hand_r.length() > 0.2 && s.hand_l.length() > 0.2);
+        assert!(s.radius > 0.5 && s.radius.is_finite());
+        assert!(s.bound.distance(pos) < 3.0, "the bound is on the worm");
     }
 }

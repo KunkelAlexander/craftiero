@@ -19,6 +19,7 @@ fn f(x: f32) -> String {
 fn uniforms() -> String {
     let groups = TILES_X * TILES_Y / 4;
     COMMON_UNIFORMS
+        .replace("$WORMS", &crate::renderer::MAX_WORMS.to_string())
         .replace("$CAPS", &MAX_PRIMS.to_string())
         .replace("$TILES", &(crate::renderer::TILE_WORDS * groups).to_string())
         .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
@@ -28,13 +29,14 @@ fn uniforms() -> String {
 pub fn march(world_chunks: IVec3) -> String {
     let dims = (world_chunks * sdf::CHUNK).as_vec3();
     let metres = dims * sdf::VOX;
-    format!("{}{MARCH}", uniforms())
+    format!("{}{WORM_SDF}{MARCH}", uniforms())
         .replace("$VOX", &f(sdf::VOX))
         .replace("$BAND", &f(sdf::BAND))
         .replace("$CHUNK_M", &f(sdf::CHUNK as f32 * sdf::VOX))
         .replace("$DIMS", &format!("{}, {}, {}", f(dims.x), f(dims.y), f(dims.z)))
         .replace("$WORLD_M", &format!("{}, {}, {}", f(metres.x), f(metres.y), f(metres.z)))
         .replace("$CHUNKS", &format!("{}, {}, {}", world_chunks.x, world_chunks.y, world_chunks.z))
+        .replace("$WORMS", &crate::renderer::MAX_WORMS.to_string())
         .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
         .replace("$GROUPS", &(TILES_X * TILES_Y / 4).to_string())
 }
@@ -74,6 +76,20 @@ struct Soot {
     b: vec4<f32>,           // x: strength 0..1
 }
 
+// One worm body, evaluated as a signed distance field. Must match `GpuWorm`
+// in renderer.rs. The sculpt is duplicated from `worm_preview.rs`, where the
+// studio sheet is rendered; the body there is the source of truth.
+struct Worm {
+    pivot: vec4<f32>,       // xyz: rig pivot, w: local y at the pivot
+    right: vec4<f32>,       // xyz: unit right, w: 1 / scale along it
+    up: vec4<f32>,          // xyz: unit up
+    face: vec4<f32>,        // xyz: unit forward
+    hand_r: vec4<f32>,      // xyz: right hand, in model units
+    hand_l: vec4<f32>,      // xyz: left hand
+    skin: vec4<f32>,        // rgb: sRGB skin, w: hit flash 0..1
+    bound: vec4<f32>,       // xyz: centre, w: radius (0 = empty slot)
+}
+
 struct U {
     cam_pos: vec4<f32>,
     cam_right: vec4<f32>,   // right * tan(fov/2) * aspect
@@ -87,6 +103,7 @@ struct U {
     fx: vec4<f32>,          // x: screen flash 0..1, y: world desaturation 0..1 (zw free)
     lights: array<Light, 8>,
     soot: array<Soot, 8>,
+    worms: array<Worm, $WORMS>,
     caps: array<Prim, $CAPS>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
     // which capsules can be seen in the tile. With up to $CAPS capsules each
@@ -126,6 +143,246 @@ fn vnoise3(p: vec3<f32>) -> f32 {
     let b = mix(mix(hash31(i + vec3<f32>(0.0, 0.0, 1.0)), hash31(i + vec3<f32>(1.0, 0.0, 1.0)), w.x),
                 mix(hash31(i + vec3<f32>(0.0, 1.0, 1.0)), hash31(i + vec3<f32>(1.0, 1.0, 1.0)), w.x), w.y);
     return mix(a, b, w.z);
+}
+"#;
+
+const WORM_SDF: &str = r#"
+// --- the worm body ---------------------------------------------------------
+//
+// This is the game copy of the sculpt in `worm_preview.rs` (the sheet in
+// screenshots/worm_sdf_sheet.png). The local frame is the model frame: x right,
+// y up from the feet, z forward. The CPU maps it through the animation rig, so
+// the same body leans, flips, squashes and gets hit like the capsules did.
+//
+// Keep the numbers in sync with the preview: it exists so this can be judged
+// from eight angles before it is wired in.
+
+fn w_smin(a: f32, b: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+fn w_smax(a: f32, b: f32, k: f32) -> f32 {
+    return -w_smin(-a, -b, k);
+}
+
+fn w_sphere(p: vec3<f32>, c: vec3<f32>, r: f32) -> f32 {
+    return length(p - c) - r;
+}
+
+fn w_ellipsoid(p: vec3<f32>, c: vec3<f32>, r: vec3<f32>) -> f32 {
+    let q = (p - c) / r;
+    let k0 = length(q);
+    let k1 = length(q / r);
+    return k0 * (k0 - 1.0) / max(k1, 1.0e-6);
+}
+
+fn w_round_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r1: f32, r2: f32) -> f32 {
+    let ba = b - a;
+    let l2 = dot(ba, ba);
+    let rr = r1 - r2;
+    let a2 = l2 - rr * rr;
+    let il2 = 1.0 / l2;
+    let pa = p - a;
+    let y = dot(pa, ba);
+    let z = y - l2;
+    let x2 = dot(pa * l2 - ba * y, pa * l2 - ba * y);
+    let y2 = y * y * l2;
+    let z2 = z * z * l2;
+    let k = sign(rr) * rr * rr * x2;
+    if (sign(z) * a2 * z2 > k) { return sqrt(x2 + z2) * il2 - r2; }
+    if (sign(y) * a2 * y2 < k) { return sqrt(x2 + y2) * il2 - r1; }
+    return (sqrt(x2 * a2 * il2) + y * rr) * il2 - r1;
+}
+
+const W_EYE_L = vec3<f32>(-0.175, 1.300, 0.520);
+const W_EYE_R = vec3<f32>( 0.175, 1.300, 0.520);
+const W_EYE_RADIUS: f32 = 0.062;
+const W_NOSTRIL_L = vec3<f32>(-0.033, 1.180, 0.735);
+const W_NOSTRIL_R = vec3<f32>( 0.033, 1.180, 0.735);
+
+fn w_mouth(p: vec3<f32>) -> f32 {
+    return w_ellipsoid(p, vec3<f32>(0.0, 1.100, 0.710), vec3<f32>(0.110, 0.040, 0.055));
+}
+
+fn w_tongue(p: vec3<f32>) -> f32 {
+    return w_ellipsoid(p, vec3<f32>(0.0, 1.082, 0.725), vec3<f32>(0.060, 0.018, 0.028));
+}
+
+fn w_lower_lip(p: vec3<f32>) -> f32 {
+    return w_ellipsoid(p, vec3<f32>(0.0, 1.070, 0.710), vec3<f32>(0.088, 0.020, 0.038));
+}
+
+fn w_socket(p: vec3<f32>) -> f32 {
+    var d = w_ellipsoid(p, W_EYE_L, vec3<f32>(0.078, 0.078, 0.070));
+    d = min(d, w_ellipsoid(p, W_EYE_R, vec3<f32>(0.078, 0.078, 0.070)));
+    return d;
+}
+
+fn w_brow(p: vec3<f32>) -> f32 {
+    // 12's grumpy brow: inner end high, outer end low.
+    var d = w_round_cone(p, vec3<f32>(-0.060, 1.365, 0.535), vec3<f32>(-0.250, 1.350, 0.485), 0.030, 0.020);
+    d = min(d, w_round_cone(p, vec3<f32>(0.060, 1.365, 0.535), vec3<f32>(0.250, 1.350, 0.485), 0.030, 0.020));
+    return d;
+}
+
+fn w_eyelid(p: vec3<f32>) -> f32 {
+    var d = w_ellipsoid(p, vec3<f32>(-0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062));
+    d = min(d, w_ellipsoid(p, vec3<f32>( 0.175, 1.347, 0.535), vec3<f32>(0.080, 0.013, 0.062)));
+    return d;
+}
+
+fn w_arms(p: vec3<f32>, w: Worm) -> f32 {
+    // The hands are the only moving parts: recoil and the whip pull the right
+    // hand, and the arm follows. The left stays on the foregrip.
+    let hr = w.hand_r.xyz;
+    let hl = w.hand_l.xyz;
+    var d = w_round_cone(p, vec3<f32>(0.230, 0.980, 0.180), vec3<f32>(0.345, 0.910, 0.370), 0.098, 0.076);
+    d = w_smin(d, w_round_cone(p, vec3<f32>(0.345, 0.910, 0.370), hr + vec3<f32>(0.007, 0.007, -0.022), 0.076, 0.058), 0.018);
+    d = w_smin(d, w_sphere(p, hr, 0.086), 0.018);
+
+    var l = w_round_cone(p, vec3<f32>(-0.230, 0.980, 0.180), vec3<f32>(-0.335, 0.915, 0.375), 0.098, 0.076);
+    l = w_smin(l, w_round_cone(p, vec3<f32>(-0.335, 0.915, 0.375), hl + vec3<f32>(-0.015, 0.012, -0.012), 0.076, 0.055), 0.018);
+    l = w_smin(l, w_sphere(p, hl, 0.078), 0.018);
+    return min(d, l);
+}
+
+fn w_map(p: vec3<f32>, w: Worm) -> f32 {
+    // Spine: hips on the ground, chest forward, head well in front. A C.
+    var d = w_round_cone(p, vec3<f32>(0.0, 0.280, -0.080), vec3<f32>(0.0, 0.520, 0.030), 0.220, 0.240);
+    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 0.520, 0.030), vec3<f32>(0.0, 0.800, 0.140), 0.240, 0.230), 0.055);
+    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 0.800, 0.140), vec3<f32>(0.0, 1.020, 0.260), 0.230, 0.180), 0.050);
+    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 1.020, 0.260), vec3<f32>(0.0, 1.120, 0.300), 0.180, 0.180), 0.035);
+
+    // Skull, cheeks, snout.
+    d = w_smin(d, w_ellipsoid(p, vec3<f32>(0.0, 1.270, 0.350), vec3<f32>(0.250, 0.240, 0.240)), 0.038);
+    d = w_smin(d, w_sphere(p, vec3<f32>(-0.130, 1.210, 0.400), 0.130), 0.036);
+    d = w_smin(d, w_sphere(p, vec3<f32>( 0.130, 1.210, 0.400), 0.130), 0.036);
+    d = w_smin(d, w_round_cone(p, vec3<f32>(0.0, 1.200, 0.410), vec3<f32>(0.0, 1.140, 0.640), 0.170, 0.090), 0.032);
+    d = w_smin(d, w_ellipsoid(p, vec3<f32>(0.0, 1.130, 0.680), vec3<f32>(0.090, 0.080, 0.075)), 0.022);
+    d = w_smin(d, w_ellipsoid(p, vec3<f32>(0.0, 1.020, 0.520), vec3<f32>(0.115, 0.060, 0.090)), 0.026);
+    d = w_smin(d, w_lower_lip(p), 0.015);
+
+    // Sockets, grumpy brows, thin lids.
+    d = w_smax(d, -w_socket(p), 0.010);
+    d = w_smin(d, w_brow(p), 0.020);
+    d = w_smin(d, w_eyelid(p), 0.012);
+
+    // Cut grin with a tongue.
+    d = w_smax(d, -w_mouth(p), 0.011);
+    d = min(d, w_tongue(p));
+
+    // Tail: lies on the ground and curls up at the tip.
+    var t = w_round_cone(p, vec3<f32>(0.0, 0.280, -0.100), vec3<f32>(0.050, 0.150, -0.320), 0.160, 0.110);
+    t = w_smin(t, w_round_cone(p, vec3<f32>(0.050, 0.150, -0.320), vec3<f32>(0.160, 0.090, -0.500), 0.110, 0.070), 0.028);
+    t = w_smin(t, w_round_cone(p, vec3<f32>(0.160, 0.090, -0.500), vec3<f32>(0.240, 0.080, -0.620), 0.070, 0.045), 0.022);
+    t = w_smin(t, w_round_cone(p, vec3<f32>(0.240, 0.080, -0.620), vec3<f32>(0.180, 0.120, -0.700), 0.045, 0.025), 0.018);
+    d = w_smin(d, t, 0.035);
+    d = w_smin(d, w_arms(p, w), 0.030);
+
+    // Eyes: hard union, so they stay round in their sockets.
+    d = min(d, w_sphere(p, W_EYE_L, W_EYE_RADIUS));
+    d = min(d, w_sphere(p, W_EYE_R, W_EYE_RADIUS));
+    return d;
+}
+
+fn w_normal(p: vec3<f32>, w: Worm) -> vec3<f32> {
+    let e = 0.0015;
+    return normalize(vec3<f32>(
+        w_map(p + vec3<f32>(e, 0.0, 0.0), w) - w_map(p - vec3<f32>(e, 0.0, 0.0), w),
+        w_map(p + vec3<f32>(0.0, e, 0.0), w) - w_map(p - vec3<f32>(0.0, e, 0.0), w),
+        w_map(p + vec3<f32>(0.0, 0.0, e), w) - w_map(p - vec3<f32>(0.0, 0.0, e), w),
+    ));
+}
+
+fn w_colour(p: vec3<f32>, n: vec3<f32>, w: Worm) -> vec3<f32> {
+    let skin = w.skin.rgb;
+    let skin_dark = skin * 0.84;
+    let belly = mix(skin, vec3<f32>(1.0, 0.93, 0.82), 0.55);
+
+    // Black bead eyes, one catchlight.
+    let dl = length(p - W_EYE_L);
+    let dr = length(p - W_EYE_R);
+    if (min(abs(dl - W_EYE_RADIUS), abs(dr - W_EYE_RADIUS)) < 0.003) {
+        let c = select(W_EYE_R, W_EYE_L, dl < dr);
+        let dir = normalize(p - c);
+        let hl = normalize(vec3<f32>(-0.35, 0.55, 0.75));
+        if (dot(dir, hl) > 0.940) { return vec3<f32>(1.0); }
+        return vec3<f32>(0.045, 0.055, 0.085);
+    }
+
+    // Cut grin: dark inside, with the tongue.
+    if (w_mouth(p) < 0.018) {
+        if (w_tongue(p) < 0.006) { return vec3<f32>(0.93, 0.42, 0.45); }
+        return vec3<f32>(0.30, 0.075, 0.095);
+    }
+
+    var c = skin;
+    // Cream belly, painted by the local normal: no second capsule, no seam.
+    let belly_x = smoothstep(0.30, 0.12, abs(p.x));
+    let belly_y = smoothstep(1.04, 0.94, p.y) * smoothstep(0.28, 0.62, n.z);
+    let belly_m = belly_x * belly_y;
+    c = mix(c, belly, belly_m);
+
+    let band = abs(fract((p.y - 0.25) * 5.5) - 0.5);
+    let crease = smoothstep(0.40, 0.47, band) * belly_m;
+    c = mix(c, belly * 0.88, crease * 0.55);
+
+    let seg = abs(fract((p.y * 0.9 - p.z * 0.7) * 5.0) - 0.5);
+    let ring = smoothstep(0.44, 0.49, seg) * smoothstep(1.02, 0.94, p.y);
+    c *= 1.0 - 0.10 * ring * (1.0 - belly_m);
+
+    let muzzle = smoothstep(1.25, 1.16, p.y) * smoothstep(0.48, 0.58, p.z) * smoothstep(0.94, 1.01, p.y);
+    c = mix(c, belly, muzzle * 0.60);
+    if ((length(p - W_NOSTRIL_L) < 0.013 || length(p - W_NOSTRIL_R) < 0.013) && p.z > 0.690) {
+        c = vec3<f32>(0.70, 0.27, 0.25);
+    }
+    if (w_brow(p) < 0.010) { c *= 0.86; }
+    if (w_eyelid(p) < 0.008) { c *= 0.94; }
+    if (w_arms(p, w) < 0.008 && p.z > 0.55) { c = mix(c, skin_dark, 0.45); }
+    if (p.y < 0.10) { c = mix(c, skin_dark, 0.25); }
+    return c;
+}
+
+// The world -> model transform. The CPU bakes the rig and the model's 1.8 m
+// scale into these three axes and inverse scales, so this stays a few dots.
+fn w_local(p: vec3<f32>, w: Worm) -> vec3<f32> {
+    let q = p - w.pivot.xyz;
+    return vec3<f32>(
+        dot(q, w.right.xyz) * w.right.w,
+        dot(q, w.up.xyz) * w.up.w + w.pivot.w,
+        dot(q, w.face.xyz) * w.face.w);
+}
+
+fn w_local_dir(rd: vec3<f32>, w: Worm) -> vec3<f32> {
+    return vec3<f32>(
+        dot(rd, w.right.xyz) * w.right.w,
+        dot(rd, w.up.xyz) * w.up.w,
+        dot(rd, w.face.xyz) * w.face.w);
+}
+
+fn w_ray(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, r: f32) -> vec2<f32> {
+    let oc = ro - c;
+    let b = dot(oc, rd);
+    let q = dot(oc, oc) - r * r;
+    let h = b * b - q;
+    if (h < 0.0) { return vec2<f32>(1.0, -1.0); }
+    let s = sqrt(h);
+    return vec2<f32>(-b - s, -b + s);
+}
+
+fn w_trace(ro: vec3<f32>, rd: vec3<f32>, w: Worm, t0: f32, t1: f32) -> f32 {
+    let rol = w_local(ro, w);
+    let rdl = w_local_dir(rd, w);
+    let inv = 1.0 / max(length(rdl), 1.0e-5);
+    var t = t0;
+    for (var i = 0; i < 80; i++) {
+        let d = w_map(rol + rdl * t, w);
+        if (d < 0.0008) { return t; }
+        t += max(d * 0.85 * inv, 0.0008 * inv);
+        if (t > t1) { break; }
+    }
+    return -1.0;
 }
 "#;
 
@@ -497,7 +754,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     let ro = u.cam_pos.xyz;
     let rd = normalize(u.cam_fwd.xyz + ndc.x * u.cam_right.xyz + ndc.y * u.cam_up.xyz);
 
-    var kind = 0;   // 0 sky, 1 terrain, 2 arena wall (the box edge counts as rock), 3 capsule
+    var kind = 0;   // 0 sky, 1 terrain, 2 arena wall, 3 capsule, 4 worm SDF
     // The nearest capsule on this ray. Done first because it also shortens the
     // terrain march: no need to look for rock behind a worm. Only the capsules
     // whose bit is set for this pixel's tile are tested, usually none.
@@ -514,10 +771,27 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         while (mask != 0u) {
             let i = i32(firstTrailingBit(mask)) + i32(w * 32u);
             mask = mask & (mask - 1u);   // clear the lowest set bit
+            let flags = i32(u.caps[i].c.w + 0.5);
+            if ((flags & 4) != 0) { continue; } // shadow proxy: not drawn
             let h = prim_hit(ro, rd, i);
             if (h > 0.0 && h < tc) { tc = h; ci = i; }
         }
     }
+
+    // Worm bodies are traced separately: one bounding-sphere test per slot, and
+    // only the pixels inside pay for the SDF. A max of four is plenty.
+    var tw = 1.0e9;
+    var wi = -1;
+    for (var i = 0; i < $WORMS; i++) {
+        let w = u.worms[i];
+        if (w.bound.w <= 0.0) { continue; }
+        let b = w_ray(ro, rd, w.bound.xyz, w.bound.w);
+        let start = max(b.x, 0.0);
+        if (b.y <= start) { continue; }
+        let h = w_trace(ro, rd, w, start, min(b.y, tc));
+        if (h > 0.0 && h < tw) { tw = h; wi = i; }
+    }
+    let nearest = min(tc, tw);
     var t = 400.0;
     var n = vec3<f32>(0.0);
 
@@ -532,13 +806,16 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             t = 0.01;
             n = -rd;
         } else {
-            let th = trace(ro, rd, t_start, min(bx.y, tc), 160, 0.003, 0.5 * pix_angle());
+            let th = trace(ro, rd, t_start, min(bx.y, nearest), 160, 0.003, 0.5 * pix_angle());
             if (th >= 0.0) {
                 kind = 1;
                 t = th;
-            } else if (ci >= 0 && tc < bx.y) {
+            } else if (tc <= tw && ci >= 0 && tc < bx.y) {
                 kind = 3;   // the march gave up at the capsule: nothing nearer
                 t = tc;
+            } else if (wi >= 0 && tw < bx.y) {
+                kind = 4;
+                t = tw;
             } else if (!(bx.z == 1.0 && rd.y > 0.0)) {
                 // Left through a side or the floor: that is the closed arena's wall.
                 // (Out through the top is open sky, purely for looks.)
@@ -560,15 +837,23 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
     // never the bright sky or pale rock. A capsule drawn self-lit sets it.
     var emit = 0.0;
     let fog_col = srgb(vec3<f32>(0.93, 0.86, 0.72));
-    if (kind == 1 || kind == 3) {
+    if (kind == 1 || kind == 3 || kind == 4) {
         let p = ro + rd * t;
         var base = vec3<f32>(0.0);
         if (kind == 1) {
             n = normal_at(p);
             base = albedo(p, n);
-        } else {
+        } else if (kind == 3) {
             n = prim_normal(p, ci);
             base = srgb(u.caps[ci].col.rgb);
+        } else {
+            // The body is one SDF: one normal, one material, one outline.
+            let wp = u.worms[wi];
+            let pl = w_local(p, wp);
+            let nl = w_normal(pl, wp);
+            n = normalize(wp.right.xyz * nl.x + wp.up.xyz * nl.y + wp.face.xyz * nl.z);
+            base = srgb(w_colour(pl, nl, wp));
+            base = mix(base, srgb(vec3<f32>(1.0, 0.90, 0.90)), wp.skin.w);
         }
         // Fresh craters are burnt: darken the albedo wherever a recent blast
         // left soot. This follows the bowl's walls for free, which decals on a
@@ -602,7 +887,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
 
         let tint = mix(vec3<f32>(0.42, 0.45, 0.70), vec3<f32>(1.10, 1.0, 0.86), toon(lit));
         // Draw flags ride in `c.w` (see `pack` in renderer.rs): bit 0 self-lit,
-        // bit 1 no ink outline.
+        // bit 1 no ink outline. The SDF body has neither.
         let cap_flags = select(0, i32(u.caps[max(ci, 0)].c.w + 0.5), kind == 3);
         let self_lit = (cap_flags & 1) != 0;
         inkless = (cap_flags & 2) != 0;
@@ -629,7 +914,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         // A glossy skin: capsules catch a small highlight and a cool rim, which
         // is what separates a "drawn" prop from flat toon bands. Terrain stays
         // matte. It is a few multiplications on worm pixels only.
-        if (kind == 3 && !self_lit) {
+        if ((kind == 3 || kind == 4) && !self_lit) {
             let v = to_cam / lamp_d;
             let h = normalize(u.sun.xyz + v);
             let spec = pow(max(dot(n, h), 0.0), 36.0) * lit;
@@ -735,15 +1020,23 @@ fn vs_sprite(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
 }
 
 // Fade a sprite that is behind the nearest surface, so a fireball behind a hill
-// is occluded without a hard pop. The sprite is treated as a volume: its near
-// face (not its centre) is compared with the scene, so a fireball rising out of
-// the crater it just made is not sliced in half by the rim.
+// is occluded without a hard pop. The sprite is treated as a sphere: the depth
+// tested is the near surface of that sphere along this pixel's ray, not the flat
+// billboard's centre depth. Without the sphere a fireball sitting in its own
+// crater is erased wholesale by the near rim, even the part that should rise
+// above it.
 fn occlude(ndc: vec2<f32>, centre: vec3<f32>, radius: f32, soft: f32) -> f32 {
     let px = (ndc * 0.5 + 0.5) * u.size.xy;
     let t_scene = textureLoad(gbuf_tex, vec2<i32>(floor(px)), 0).w;
     let rd = sprite_rd(ndc);
-    let t_sprite = dot(centre - u.cam_pos.xyz, rd) - radius * 0.55;
-    return 1.0 - smoothstep(0.0, soft, t_sprite - t_scene);
+    let rel = centre - u.cam_pos.xyz;
+    let t_centre = dot(rel, rd);
+    // Perpendicular distance from the ray to the sphere centre, then the near
+    // root of the ray/sphere quadratic.
+    let d2 = max(dot(rel, rel) - t_centre * t_centre, 0.0);
+    let near = t_centre - sqrt(max(radius * radius - d2, 0.0));
+    let fade = clamp(soft, 0.08, 0.35);
+    return 1.0 - smoothstep(0.0, fade, near - t_scene);
 }
 
 @fragment
