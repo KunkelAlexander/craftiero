@@ -29,8 +29,9 @@ const SOUND_SPEED: f32 = 343.0;
 /// Sounds further than this are inaudible. The arena is 128 m across.
 const MAX_AUDIBLE: f32 = 90.0;
 /// Overall output level. The mix is soft-clipped, so layers can sum above 1.0
-/// without turning into digital distortion.
-const MASTER: f32 = 0.55;
+/// without turning into digital distortion. This is deliberately hot: a weapon
+/// should move air, not sit politely under the rest of the mix.
+const MASTER: f32 = 1.35;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Wave {
@@ -150,6 +151,16 @@ impl Voice {
         self
     }
 
+    fn gain(mut self, gain: f32) -> Voice {
+        self.gain = gain;
+        self
+    }
+
+    fn pan(mut self, pan: f32) -> Voice {
+        self.pan = pan;
+        self
+    }
+
     fn next(&mut self, dt: f32, rate: f32) -> (f32, f32) {
         if self.delay > 0.0 {
             self.delay -= dt;
@@ -244,6 +255,11 @@ impl Sfx {
     pub fn play(&mut self, event: &Event, listener: Vec3, right: Vec3) {
         match *event {
             Event::Shot { weapon, pos, .. } => {
+                // A beam and a lash each have their own event with the impact
+                // or curve, so the Shot event must not double their voice.
+                if weapon == RAILGUN || weapon == WHIP {
+                    return;
+                }
                 let p = Place::at(pos, listener, right);
                 self.shot(weapon, p);
             }
@@ -252,11 +268,15 @@ impl Sfx {
                 self.explosion(radius, p);
             }
             Event::Beam { from, to } => {
-                let p = Place::at(to, listener, right);
-                self.beam(p);
-                // The muzzle end is quieter, but it still exists.
-                let p = Place::at(from, listener, right);
-                self.add(Voice::new(vec![Layer::noise(0.18, 0.0005, 90.0, 0.03, 10_000.0)]), p);
+                // The impact end carries the body; the muzzle still cracks.
+                self.beam(Place::at(to, listener, right));
+                self.add(
+                    Voice::new(vec![
+                        Layer::noise(0.50, 0.0003, 100.0, 0.05, 15_000.0),
+                        Layer::sine(0.22, 0.001, 12.0, 0.40, 120.0, 50.0),
+                    ]),
+                    Place::at(from, listener, right),
+                );
             }
             Event::Whip { from, .. } => {
                 let p = Place::at(from, listener, right);
@@ -311,103 +331,114 @@ impl Sfx {
     fn shot(&mut self, weapon: u8, p: Place) {
         let voices = match weapon {
             BLASTER => vec![
-                // The metronome: a dry brass tick and a small hot flash. No tail:
-                // the Blaster must stay at the quiet end of the mix.
+                // The metronome, but a heavy one: a dry crack over a short
+                // chest thump. Still the quiet end of the arsenal, just no
+                // longer a click.
                 Voice::new(vec![
-                    Layer::noise(0.26, 0.0004, 95.0, 0.025, 7_500.0),
-                    Layer::sine(0.14, 0.001, 46.0, 0.055, 820.0, 470.0),
+                    Layer::noise(0.30, 0.0003, 85.0, 0.045, 9_000.0),
+                    Layer::sine(0.26, 0.001, 26.0, 0.14, 230.0, 80.0),
+                    Layer::sine(0.16, 0.001, 34.0, 0.10, 900.0, 360.0),
                 ]),
             ],
             ROCKET => vec![
+                // The rocket jump: a crack and a sub-bass shove as it leaves,
+                // then a long dirty tail of exhaust and dust.
                 Voice::new(vec![
-                    Layer::noise(0.34, 0.001, 26.0, 0.10, 3_200.0),
-                    Layer::sine(0.50, 0.002, 5.0, 0.40, 150.0, 48.0),
+                    Layer::noise(0.55, 0.0005, 30.0, 0.12, 4_500.0),
+                    Layer::sine(0.70, 0.002, 3.5, 1.0, 130.0, 34.0),
                 ]),
                 Voice::new(vec![
-                    Layer::noise(0.22, 0.010, 3.2, 0.70, 620.0),
-                    Layer::sine(0.24, 0.050, 2.0, 1.35, 48.0, 32.0),
+                    Layer::noise(0.40, 0.008, 2.4, 1.4, 520.0),
+                    Layer::sine(0.45, 0.030, 1.4, 2.2, 48.0, 24.0),
+                    Layer::noise(0.22, 0.050, 0.8, 2.4, 160.0),
                 ]),
-            ],
-            RAILGUN => vec![
-                Voice::new(vec![
-                    Layer::noise(0.48, 0.0004, 110.0, 0.03, 13_000.0),
-                    Layer::sine(0.17, 0.001, 12.0, 0.35, 2_600.0, 1_850.0),
-                    Layer::sine(0.09, 0.002, 18.0, 0.45, 4_200.0, 3_900.0),
-                ]),
-                // The ringing ear arrives a beat later.
-                Voice::new(vec![Layer::sine(0.045, 0.010, 3.0, 0.90, 5_600.0, 5_200.0)]).delayed(0.045),
             ],
             BOUNCER => vec![
+                // A bright metal ping with enough body to read as a ball, not a
+                // UI blip.
                 Voice::new(vec![
-                    Layer::sine(0.25, 0.001, 22.0, 0.20, 690.0, 1_240.0),
-                    Layer::sine(0.10, 0.001, 30.0, 0.12, 1_360.0, 1_980.0),
-                    Layer::noise(0.10, 0.001, 70.0, 0.025, 8_000.0),
+                    Layer::noise(0.30, 0.0004, 70.0, 0.05, 9_000.0),
+                    Layer::sine(0.42, 0.001, 12.0, 0.50, 620.0, 1_500.0),
+                    Layer::sine(0.22, 0.001, 16.0, 0.40, 1_500.0, 2_400.0),
+                    Layer::sine(0.18, 0.002, 7.0, 0.35, 140.0, 60.0),
                 ]),
             ],
             BOMB => vec![
-                // The throw is just a soft clunk; the boom comes from the
-                // projectile's Explosion a second later.
+                // The throw is a clunk; the boom comes from the projectile's
+                // Explosion a second later.
                 Voice::new(vec![
-                    Layer::noise(0.14, 0.001, 30.0, 0.06, 1_500.0),
-                    Layer::sine(0.10, 0.001, 12.0, 0.12, 180.0, 90.0),
+                    Layer::noise(0.24, 0.001, 24.0, 0.10, 2_000.0),
+                    Layer::sine(0.22, 0.001, 8.0, 0.35, 150.0, 55.0),
                 ]),
             ],
             CLUSTER => vec![
+                // A mortar leaves the tube with a low thump and keeps rumbling.
                 Voice::new(vec![
-                    Layer::noise(0.30, 0.005, 8.0, 0.32, 520.0),
-                    Layer::sine(0.26, 0.005, 6.0, 0.38, 150.0, 70.0),
-                    Layer::noise(0.12, 0.020, 3.0, 0.65, 300.0),
+                    Layer::noise(0.50, 0.002, 7.0, 0.45, 700.0),
+                    Layer::sine(0.55, 0.003, 4.0, 1.0, 120.0, 42.0),
+                ]),
+                Voice::new(vec![
+                    Layer::noise(0.28, 0.020, 2.2, 1.5, 240.0),
+                    Layer::sine(0.24, 0.060, 1.1, 2.0, 42.0, 25.0),
                 ]),
             ],
-            SWARM => (0..6)
-                .map(|k| {
+            SWARM => {
+                let mut voices = vec![
+                    Voice::new(vec![Layer::sine(0.40, 0.002, 4.5, 0.7, 110.0, 36.0)]),
+                ];
+                voices.extend((0..6).map(|k| {
                     Voice::new(vec![
-                        Layer::noise(0.09, 0.005, 14.0, 0.18, 2_600.0),
-                        Layer::sine(0.045, 0.005, 12.0, 0.15, 480.0, 920.0),
+                        Layer::noise(0.16, 0.003, 10.0, 0.30, 3_200.0),
+                        Layer::sine(0.10, 0.003, 9.0, 0.25, 320.0, 1_100.0),
                     ])
-                    .delayed(k as f32 * 0.035)
-                })
-                .collect(),
+                    .delayed(k as f32 * 0.032)
+                }));
+                voices
+            }
             TELEPORT => vec![
                 Voice::new(vec![
-                    Layer::noise(0.30, 0.001, 16.0, 0.12, 9_000.0),
-                    Layer::sine(0.26, 0.002, 5.0, 0.45, 1_400.0, 180.0),
+                    Layer::noise(0.45, 0.0005, 20.0, 0.14, 11_000.0),
+                    Layer::sine(0.48, 0.002, 4.5, 0.90, 1_600.0, 130.0),
                 ]),
-                Voice::new(vec![Layer::sine(0.07, 0.010, 2.5, 0.85, 2_600.0, 320.0)]).delayed(0.03),
+                Voice::new(vec![
+                    Layer::sine(0.18, 0.010, 1.5, 1.8, 2_600.0, 180.0),
+                    Layer::noise(0.12, 0.020, 1.2, 1.4, 1_200.0),
+                ])
+                .delayed(0.04),
             ],
             NOVA => vec![
                 // The cavern eraser: a crack, a body below the speakers, and a
                 // tail that keeps going after the flash.
                 Voice::new(vec![
-                    Layer::noise(0.55, 0.001, 20.0, 0.16, 6_000.0),
-                    Layer::sine(0.62, 0.005, 2.4, 0.85, 90.0, 26.0),
+                    Layer::noise(0.85, 0.0005, 18.0, 0.22, 7_000.0),
+                    Layer::sine(0.95, 0.003, 2.0, 1.4, 90.0, 22.0),
                 ]),
                 Voice::new(vec![
-                    Layer::noise(0.34, 0.020, 1.3, 2.1, 240.0),
-                    Layer::sine(0.26, 0.050, 1.0, 2.6, 40.0, 28.0),
+                    Layer::noise(0.60, 0.015, 1.1, 3.2, 240.0),
+                    Layer::sine(0.55, 0.040, 0.65, 2.8, 38.0, 20.0),
                 ]),
             ],
             BUILD => vec![
+                // Rock slams into place: a hard crack over a floor-shaking thud.
                 Voice::new(vec![
-                    Layer::noise(0.34, 0.001, 32.0, 0.10, 2_200.0),
-                    Layer::sine(0.34, 0.001, 9.0, 0.24, 120.0, 55.0),
+                    Layer::noise(0.52, 0.0005, 24.0, 0.18, 3_500.0),
+                    Layer::sine(0.50, 0.001, 6.0, 0.80, 110.0, 40.0),
                 ]),
+                Voice::new(vec![
+                    Layer::noise(0.25, 0.020, 2.5, 1.4, 300.0),
+                ])
+                .delayed(0.02),
             ],
             TRACTOR => vec![
                 // One soft lump of clay. The 16/s placement is absorbed by the
                 // short, quiet envelope so it reads as a stream, not a rattle.
                 Voice::new(vec![
-                    Layer::noise(0.075, 0.002, 30.0, 0.055, 900.0),
-                    Layer::sine(0.05, 0.002, 25.0, 0.075, 180.0, 120.0),
+                    Layer::noise(0.13, 0.001, 26.0, 0.08, 1_200.0),
+                    Layer::sine(0.10, 0.001, 18.0, 0.16, 170.0, 80.0),
                 ]),
             ],
-            WHIP => vec![
-                Voice::new(vec![
-                    Layer::noise(0.48, 0.0004, 80.0, 0.045, 12_000.0),
-                    Layer::sine(0.16, 0.001, 10.0, 0.38, 900.0, 180.0),
-                    Layer::noise(0.12, 0.010, 4.0, 0.32, 3_500.0),
-                ]),
-            ],
+            // The railgun and the whip are heard through their own `Beam` and
+            // `Whip` events, which carry the impact point and the swing.
             _ => vec![Voice::new(vec![Layer::sine(0.15, 0.001, 20.0, 0.12, 500.0, 200.0)])],
         };
         for voice in voices {
@@ -421,31 +452,52 @@ impl Sfx {
         // sizes: bomblet/swarm, rocket/bomb, Nova.
         let voices = if radius >= 6.0 {
             vec![
+                // The cavern eraser: a white-hot crack, a body below the
+                // speakers, then a low rolling tail that outlives the flash.
                 Voice::new(vec![
-                    Layer::noise(0.60, 0.001, 18.0, 0.18, 5_500.0),
-                    Layer::sine(0.62, 0.005, 2.0, 0.95, 78.0, 24.0),
+                    Layer::noise(0.90, 0.0004, 16.0, 0.22, 6_000.0),
+                    Layer::sine(0.98, 0.003, 1.5, 1.5, 84.0, 20.0),
                 ]),
                 Voice::new(vec![
-                    Layer::noise(0.40, 0.020, 1.2, 2.3, 220.0),
-                    Layer::sine(0.30, 0.050, 0.9, 2.8, 38.0, 26.0),
+                    Layer::noise(0.70, 0.010, 1.0, 2.8, 220.0),
+                    Layer::sine(0.65, 0.040, 0.45, 4.5, 36.0, 18.0),
                 ]),
+                // Delayed, darker copies to either side read as the room
+                // answering back: the tail is wider than the blast.
+                Voice::new(vec![
+                    Layer::noise(0.32, 0.020, 0.8, 3.2, 120.0),
+                    Layer::sine(0.30, 0.060, 0.40, 3.6, 28.0, 20.0),
+                ])
+                .gain(0.85)
+                .pan(-0.35)
+                .delayed(0.16),
+                Voice::new(vec![
+                    Layer::noise(0.30, 0.022, 0.8, 3.4, 110.0),
+                    Layer::sine(0.28, 0.065, 0.38, 3.8, 26.0, 19.0),
+                ])
+                .gain(0.85)
+                .pan(0.35)
+                .delayed(0.19),
             ]
         } else if radius >= 2.5 {
             vec![
                 Voice::new(vec![
-                    Layer::noise(0.46, 0.001, 28.0, 0.12, 4_000.0),
-                    Layer::sine(0.48, 0.004, 4.5, 0.55, 100.0, 36.0),
+                    Layer::noise(0.70, 0.0005, 24.0, 0.16, 4_500.0),
+                    Layer::sine(0.80, 0.003, 3.0, 1.1, 100.0, 28.0),
                 ]),
                 Voice::new(vec![
-                    Layer::noise(0.22, 0.015, 3.5, 1.0, 360.0),
-                    Layer::sine(0.20, 0.04, 2.2, 1.3, 45.0, 30.0),
+                    Layer::noise(0.48, 0.010, 1.8, 2.2, 300.0),
+                    Layer::sine(0.42, 0.030, 0.9, 3.0, 40.0, 22.0),
                 ]),
             ]
         } else {
             vec![
                 Voice::new(vec![
-                    Layer::noise(0.22, 0.001, 55.0, 0.07, 4_500.0),
-                    Layer::sine(0.20, 0.002, 18.0, 0.22, 180.0, 75.0),
+                    Layer::noise(0.35, 0.0005, 45.0, 0.08, 5_000.0),
+                    Layer::sine(0.34, 0.002, 12.0, 0.45, 180.0, 60.0),
+                ]),
+                Voice::new(vec![
+                    Layer::noise(0.18, 0.010, 4.0, 0.9, 400.0),
                 ]),
             ]
         };
@@ -455,46 +507,80 @@ impl Sfx {
     }
 
     fn beam(&mut self, p: Place) {
-        let voice = Voice::new(vec![
-            Layer::noise(0.50, 0.0004, 110.0, 0.03, 14_000.0),
-            Layer::sine(0.16, 0.001, 10.0, 0.38, 2_500.0, 1_800.0),
-        ]);
-        self.add(voice, p);
+        // The line through the room: the same voice as the railgun's shot, with
+        // the impact point carrying the weight.
+        self.add(
+            Voice::new(vec![
+                Layer::noise(0.62, 0.0003, 100.0, 0.06, 15_000.0),
+                Layer::sine(0.30, 0.001, 9.0, 0.55, 2_600.0, 1_100.0),
+                Layer::sine(0.20, 0.001, 13.0, 0.80, 4_200.0, 2_900.0),
+                Layer::sine(0.22, 0.002, 4.0, 0.45, 100.0, 40.0),
+            ]),
+            p,
+        );
+        self.add(
+            Voice::new(vec![Layer::sine(0.13, 0.010, 1.4, 2.2, 5_800.0, 4_800.0)]).delayed(0.05),
+            p,
+        );
     }
 
     fn whip(&mut self, p: Place) {
-        let voice = Voice::new(vec![
-            Layer::noise(0.50, 0.0004, 80.0, 0.045, 12_000.0),
-            Layer::sine(0.17, 0.001, 10.0, 0.40, 950.0, 170.0),
-            Layer::noise(0.13, 0.010, 4.0, 0.34, 3_800.0),
-        ]);
-        self.add(voice, p);
+        self.add(
+            Voice::new(vec![
+                Layer::noise(0.68, 0.0003, 90.0, 0.06, 14_000.0),
+                Layer::sine(0.30, 0.001, 10.0, 0.55, 230.0, 55.0),
+            ]),
+            p,
+        );
+        self.add(
+            Voice::new(vec![
+                Layer::noise(0.28, 0.008, 2.8, 0.90, 3_800.0),
+                Layer::sine(0.15, 0.010, 3.0, 1.1, 820.0, 100.0),
+            ])
+            .delayed(0.03),
+            p,
+        );
     }
 
     fn hit(&mut self, damage: f32, p: Place) {
-        let level = (damage / 70.0).clamp(0.25, 1.15);
+        let level = (damage / 70.0).clamp(0.30, 1.30);
         let voice = Voice::new(vec![
-            Layer::noise(0.22 * level, 0.0005, 60.0, 0.055, 6_000.0),
-            Layer::sine(0.12 * level, 0.001, 26.0, 0.10, 320.0, 190.0),
+            Layer::noise(0.38 * level, 0.0004, 60.0, 0.09, 7_000.0),
+            Layer::sine(0.28 * level, 0.001, 18.0, 0.28, 260.0, 80.0),
+            Layer::sine(0.22 * level, 0.002, 10.0, 0.35, 95.0, 45.0),
         ]);
         self.add(voice, p);
     }
 
     fn died(&mut self, p: Place) {
         let voice = Voice::new(vec![
-            Layer::noise(0.30, 0.001, 25.0, 0.12, 5_000.0),
-            Layer::sine(0.26, 0.002, 5.0, 0.55, 620.0, 90.0),
-            Layer::sine(0.10, 0.020, 2.0, 1.0, 180.0, 60.0),
+            Layer::noise(0.50, 0.0004, 20.0, 0.18, 6_000.0),
+            Layer::sine(0.45, 0.002, 4.5, 0.90, 700.0, 60.0),
+            Layer::sine(0.30, 0.020, 1.5, 2.0, 140.0, 28.0),
         ]);
         self.add(voice, p);
+        self.add(
+            Voice::new(vec![Layer::noise(0.20, 0.020, 1.2, 2.2, 180.0)]).delayed(0.10),
+            p,
+        );
     }
 
     fn teleport(&mut self, p: Place) {
-        let voice = Voice::new(vec![
-            Layer::noise(0.28, 0.001, 16.0, 0.11, 9_000.0),
-            Layer::sine(0.24, 0.002, 5.0, 0.42, 1_400.0, 180.0),
-        ]);
-        self.add(voice, p);
+        self.add(
+            Voice::new(vec![
+                Layer::noise(0.45, 0.0005, 20.0, 0.14, 11_000.0),
+                Layer::sine(0.48, 0.002, 4.5, 0.90, 1_600.0, 130.0),
+            ]),
+            p,
+        );
+        self.add(
+            Voice::new(vec![
+                Layer::sine(0.18, 0.010, 1.5, 1.8, 2_600.0, 180.0),
+                Layer::noise(0.12, 0.020, 1.2, 1.4, 1_200.0),
+            ])
+            .delayed(0.04),
+            p,
+        );
     }
 
     /// Mix one stereo frame. `dt` is `1 / rate`.
@@ -761,16 +847,34 @@ mod tests {
         Event::Shot { worm: 0, weapon, pos: at }
     }
 
+    /// The event a real shot makes: a beam and a lash have their own, carrying
+    /// the impact point or the swing.
+    fn trigger(weapon: u8) -> Event {
+        match weapon {
+            RAILGUN => Event::Beam { from: Vec3::ZERO, to: Vec3::Z * 20.0 },
+            WHIP => Event::Whip {
+                worm: 0,
+                from: Vec3::ZERO,
+                dir: Vec3::Z,
+                side: Vec3::NEG_X,
+                phase: 0.0,
+                length: 9.5,
+                style: sim::WhipStyle::Sweep,
+            },
+            _ => shot(weapon, Vec3::ZERO),
+        }
+    }
+
     #[test]
     fn every_weapon_makes_a_sound_and_then_stops() {
         for &weapon in &sim::ARSENAL {
             let mut sfx = Sfx::new(48_000.0);
-            sfx.play(&shot(weapon, Vec3::ZERO), Vec3::ZERO, Vec3::X);
+            sfx.play(&trigger(weapon), Vec3::ZERO, Vec3::X);
             let first = render(&mut sfx, 0.4);
             assert!(peak(&first) > 0.01, "weapon {weapon} is silent");
-            let tail = render(&mut sfx, 3.0);
+            let tail = render(&mut sfx, 5.0);
             // The tail may still be ringing, but it has to be over by the end
-            // of three seconds even for the Nova.
+            // even for the Nova.
             let end = &tail[tail.len() - 9_600..];
             assert!(
                 peak(end) < 1.0e-6,
@@ -835,6 +939,26 @@ mod tests {
         sfx.set_charge(0.0);
         let off = render(&mut sfx, 0.2);
         assert_eq!(peak(&off), 0.0);
+    }
+
+    #[test]
+    fn the_heavy_weapons_are_loud_and_long() {
+        let mut quiet = Sfx::new(48_000.0);
+        quiet.play(&trigger(BLASTER), Vec3::ZERO, Vec3::X);
+        let blaster = render(&mut quiet, 1.0);
+
+        let mut loud = Sfx::new(48_000.0);
+        loud.play(&trigger(NOVA), Vec3::ZERO, Vec3::X);
+        let nova = render(&mut loud, 1.0);
+        assert!(peak(&nova) > 0.80, "the Nova should hit the limiter: {}", peak(&nova));
+        assert!(rms(&nova) > rms(&blaster) * 6.0, "and dwarf the Blaster: {} vs {}", rms(&nova), rms(&blaster));
+
+        let mut boom = Sfx::new(48_000.0);
+        boom.play(&Event::Explosion { pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
+        let one_second = render(&mut boom, 1.0);
+        assert!(rms(&one_second) > 0.30, "a Nova is a wall of sound: {}", rms(&one_second));
+        // Still rolling two and a half seconds after the flash.
+        assert!(peak(&render(&mut boom, 2.5)) > 0.005);
     }
 
     #[test]
