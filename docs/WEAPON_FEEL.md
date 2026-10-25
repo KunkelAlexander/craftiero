@@ -124,9 +124,9 @@ at 2 must stay quiet even when it is the newest thing in the game.
 | 8 | Nova | the cavern eraser | a 1.2 s charge: the view narrows, a ring of light gathers and spins | white-out, a fireball that fills the crater, the ground rolling | a 3 s smoke column and a crater rim glowing orange, cooling to black | **5** |
 | 9 | Block | the wall | none: it is instant | the rock *slams* into place, a dust ring, one hard thud | dust settling off the new face | **2** |
 | 10 | Tractor | the bridge | a grinding hum while held | a continuous stream of lumps, each with a small impact | the new span, still dusty | **2** |
-| 11 | Plasma Whip | the scar | a 0.14 s coil: the carried lash tightens and brightens, the arm draws back | the crack, a fourteen-metre horizontal sweep, a white starburst at the rock, motion ghosts | a long groove cooling orange → red → dark over ~2 s | **3** |
+| 11 | Plasma Whip | the cut | a 0.14 s coil: the carried lash tightens and brightens, the arm draws back | the crack, a fourteen-metre horizontal sweep that alternates direction, a white starburst at the rock, motion ghosts | a long shallow groove dug into the rock; no heat line | **3** |
 Two of these are already the best in the game and should be the template: the
-**Whip** (its scar is shaped by the weapon: a horizontal groove burned by the
+**Whip** (its cut is shaped by the weapon: a horizontal groove dug by the
 sweep) and the **Nova's aim ring** (the choice is heavy before the shot).
 
 ## 6. The systems the feel needs
@@ -336,18 +336,20 @@ view up, climbs the muzzle and punches the lens, instead of the old slide
 straight back along the aim — a dolly, which is why the recoil was invisible.
 
 The Plasma Whip is now a carried melee weapon, not a gun (phase 6, the ritual).
-Its lash is part of the worm's own model and is never put away: at rest it
-reaches about six metres forward, arcing and rippling like a live cable. The
+Its lash is part of the worm's own model and is never put away: at rest it lies
+coiled across the front, roughly six metres of live cable that bends one way and
+then folds its tip back the other. It sways slowly, the worm takes a low wielding
+stance and its free arm counterbalances, and the whole pose breathes. The
 wind-up only coils it for 0.14 s; the strike extends it to fourteen metres and
-sweeps it flat across the front, then eases it back to the carried pose. It has
-no magazine and holding fire keeps it swinging. The plasma is a thick glowing
-core with an ink-dark edge, dark electric knots and additive halo billboards;
-the sweep leaves fading motion ghosts, and a crack against rock throws a white
-starburst. Where the sweep crosses rock, the sim samples the whole arc, stops
-the lash at the first surface (no tunnelling), carves a shallow groove and emits
-`Event::Scar`; the viewer cools that groove from orange through red to dark over
-two seconds. The old crescent of tip puffs is gone: the lash is drawn from the
-same `whip_path` curve the sim hits and scars.
+sweeps it flat across the front, alternating right-to-left and left-to-right so
+a held trigger never repeats one canned arc. It has no magazine. The plasma is a
+thick glowing core with an ink-dark edge and dark electric knots; the lash tapers
+to a thin point with no bright bulb at the end, and the sweep leaves fading
+motion ghosts. A crack against rock throws a white starburst. Where the sweep
+crosses rock, the sim samples the whole arc, stops the lash at the first surface
+(no tunnelling) and carves a shallow groove with an ordinary `Event::Edit`; there
+is no heat line and no glowing scar, just dug rock. The old crescent of tip puffs
+is gone: the lash is drawn from the same `whip_path` curve the sim hits and digs.
 
 Hits now react (phase 3, mostly): the victim flashes white, flinches off its
 axis, sprays Liero-red blood that arcs out and stains the floor and walls, and a

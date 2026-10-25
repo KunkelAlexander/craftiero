@@ -19,7 +19,9 @@ use std::f32::consts::TAU;
 const SDF_MODEL: f32 = 1.52;
 /// The hands the SDF arms are built around, in the preview's local frame. The
 /// shader pastes these in as its rest pose; the live hands are derived from
-/// them below.
+/// them below. The sim's muzzle offset (`HAND_RIGHT`/`HAND_FORWARD`/
+/// `HAND_HEIGHT` in `sim/src/world.rs`) mirrors the right hand, so a shot
+/// starts at the drawn gun; move both together if the pose changes.
 pub(crate) const SDF_HAND_R: Vec3 = Vec3::new(0.108, 0.868, 0.682);
 pub(crate) const SDF_HAND_L: Vec3 = Vec3::new(0.100, 0.870, 0.850);
 
@@ -61,6 +63,10 @@ pub struct Anim {
     whip: f32,
     whip_phase: f32,
     whip_style: WhipStyle,
+    /// Which way the current swing crosses: false is right-to-left, true is
+    /// left-to-right. The sim alternates it on a held trigger, and the body
+    /// animation mirrors with it.
+    whip_flip: bool,
     /// Seconds since this worm was last hurt, and how hard. The flash and the
     /// flinch are drawn from this; the sim already moved the body.
     hurt: f32,
@@ -94,6 +100,7 @@ impl Default for Anim {
             whip: 1.0,
             whip_phase: 0.0,
             whip_style: WhipStyle::Sweep,
+            whip_flip: false,
             hurt: 10.0,
             hurt_damage: 0.0,
         }
@@ -139,18 +146,20 @@ impl Anim {
     }
 
     /// The plasma whip cracked: start the swing that the carried lash follows.
-    /// `phase` is the sim's ripple, so the drawn lash and the scar agree.
-    pub fn struck(&mut self, style: WhipStyle, phase: f32) {
+    /// `phase` is the sim's ripple, so the drawn lash and the groove agree;
+    /// `flip` mirrors the swing so a held trigger alternates direction.
+    pub fn struck(&mut self, style: WhipStyle, phase: f32, flip: bool) {
         self.whip = 0.0;
         self.whip_style = style;
         self.whip_phase = phase;
+        self.whip_flip = flip;
     }
 
     /// Start the swing `age` seconds in. The screenshot path knows how many
     /// ticks it has stepped, so it can place the lash mid-crack without
     /// stepping the animation clock through the wind-up as well.
-    pub fn struck_at(&mut self, style: WhipStyle, phase: f32, age: f32) {
-        self.struck(style, phase);
+    pub fn struck_at(&mut self, style: WhipStyle, phase: f32, flip: bool, age: f32) {
+        self.struck(style, phase, flip);
         self.whip = age.max(0.0);
     }
 }
@@ -341,9 +350,11 @@ struct Lash {
     cock: f32,
     /// Seconds since the strike; `LASH_LIFE` or more when the lash is at rest.
     age: f32,
-    /// The sim's ripple, so the drawn lash and the scar it leaves agree.
+    /// The sim's ripple, so the drawn lash and the groove it digs agree.
     phase: f32,
     style: WhipStyle,
+    /// True reverses the sweep: a held whip alternates left and right.
+    flip: bool,
 }
 
 /// Smoothstep, for poses and for the lash's travel. Linear motion over a few
@@ -359,6 +370,13 @@ fn strike_body(age: f32) -> f32 {
     let lead = smooth(age / (LASH_EXTEND + LASH_SWING));
     let back = smooth((age - LASH_EXTEND - LASH_SWING) / LASH_RECOVER);
     lead * (1.0 - back)
+}
+
+/// Where the carried lash lies across the front. It drifts slowly from one side
+/// to the other so the worm is visibly wielding a live thing, not holding a
+/// prop; the body and the free arm follow the same value.
+fn idle_whip_sweep(clock: f32) -> f32 {
+    -0.58 + 0.26 * (clock * 0.55).sin()
 }
 
 /// One weapon: an oversized, distinct silhouette made of the same primitives
@@ -594,26 +612,31 @@ fn weapon(
 
 /// The plasma lash: one continuous piece of energy, carried by the worm.
 ///
-/// It is never spawned by a shot and it is never put away. At rest it reaches
-/// forward about five metres, bowing and rippling like a live cable. The sim's
-/// wind-up only coils it; the strike extends it to fourteen metres and sweeps it
-/// across the front. The shape comes from `sim::whip_path`, the same curve the
-/// sim scars and hits, so the picture and the rules cannot drift apart.
+/// It is never spawned by a shot and it is never put away. At rest it lies
+/// coiled across the front, undulating like a live cable; the strike extends it
+/// to fourteen metres and sweeps it across the front. The shape comes from
+/// `sim::whip_path`, the same curve the sim digs and hits, so the picture and
+/// the rules cannot drift apart.
 fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out: &mut Vec<DrawPrim>) {
     let from = g.at(0.22, 0.0, 0.0);
     let strike_len = WEAPONS[WHIP as usize].range;
     let idle_len = WHIP_IDLE * rs;
     // Breathing length and a slow wander, so the carried lash is never a prop.
     let breath = 1.0 + 0.035 * (clock * 1.7).sin();
-    // Carried to one side, not straight down the crosshair: a lash that points
-    // directly away from a shoulder camera collapses to a dot. A slow wander
-    // keeps it alive and makes the five metres readable.
-    let idle_sweep = -0.40 + 0.10 * (clock * 0.7).sin();
+    // Carried across the front, not straight down the crosshair: a lash that
+    // points directly away from a shoulder camera collapses to a dot. The slow
+    // sway plus the coil in `whip_path` makes it read as a loose, live whip.
+    let idle_sweep = idle_whip_sweep(clock);
+    // A held trigger alternates the swing. `start` is the bearing the sweep
+    // leaves from, `end` the bearing it finishes on.
+    let start = if l.flip { -WHIP_SWEEP } else { WHIP_SWEEP };
+    let end = -start;
     let len;
     let curl;
     let mut sweep = idle_sweep;
     let heat;
     let arch;
+    let mut lag = 0.0;
     let mut ghosts = false;
     let age = l.age;
 
@@ -625,17 +648,26 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
             let u = smooth(age / LASH_EXTEND);
             let coiled = idle_len * breath * (1.0 - 0.14 * l.cock);
             len = coiled + (strike_len - coiled) * u;
-            sweep = idle_sweep + (WHIP_SWEEP - idle_sweep) * u;
+            sweep = idle_sweep + (start - idle_sweep) * u;
             curl = 1.0 - 0.45 * u;
             heat = 0.70 + 0.30 * u;
             arch = 1.0 - u;
         } else if age < LASH_EXTEND + LASH_SWING {
-            // The sweep: the whole pose rotates from the worm's left to its
-            // right. That is the fan the sim's hit test covers.
+            // The sweep: the whole pose rotates across the front. The sim's
+            // fan is symmetric, so the same hit test covers either direction.
             let s = smooth((age - LASH_EXTEND) / LASH_SWING);
             len = strike_len;
             sweep = match l.style {
-                WhipStyle::Sweep => WHIP_SWEEP * (1.0 - 2.0 * s),
+                WhipStyle::Sweep => start + (end - start) * s,
+                WhipStyle::Smash => 0.0,
+            };
+            // The tip is still catching up while the handle crosses. It trails
+            // behind the direction of travel, then straightens at the end.
+            lag = match l.style {
+                WhipStyle::Sweep => {
+                    let behind = if l.flip { -1.0 } else { 1.0 };
+                    behind * 0.45 * (std::f32::consts::PI * s).sin()
+                }
                 WhipStyle::Smash => 0.0,
             };
             curl = 0.55;
@@ -649,7 +681,7 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
             let settle = back * back;
             len = strike_len + (idle_len * breath - strike_len) * settle;
             sweep = match l.style {
-                WhipStyle::Sweep => -WHIP_SWEEP + (idle_sweep + WHIP_SWEEP) * back,
+                WhipStyle::Sweep => end + (idle_sweep - end) * back,
                 WhipStyle::Smash => 0.0,
             };
             curl = 0.55 + 0.25 * back;
@@ -665,16 +697,28 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
     }
 
     let phase = l.phase + clock * (1.2 + 2.2 * heat);
-    let pose = WhipPose { dir: g.fwd, side: g.side, phase, length: len, sweep, curl, arch, style: l.style };
+    let pose = WhipPose {
+        dir: g.fwd,
+        side: g.side,
+        phase,
+        length: len,
+        sweep,
+        curl,
+        arch,
+        lag,
+        style: l.style,
+    };
     let path = whip_path(from, pose);
 
     // Motion ghosts: the arc the sweep just crossed, replaying at a few older
-    // bearings. Sprites, not capsules, so a busy frame keeps its budget.
+    // bearings behind the direction of travel. Sprites, not capsules, so a busy
+    // frame keeps its budget.
     if ghosts {
+        let behind = if l.flip { -1.0 } else { 1.0 };
         for gh in 1..=3 {
-            let trail = WhipPose { sweep: sweep + gh as f32 * 0.11, ..pose };
+            let trail = WhipPose { sweep: sweep + behind * gh as f32 * 0.11, ..pose };
             let trail_path = whip_path(from, trail);
-            let alpha = 0.16 / gh as f32;
+            let alpha = 0.14 / gh as f32;
             for k in (2..WHIP_POINTS).step_by(3) {
                 let p = trail_path[k];
                 glow.push(Sprite::ball(
@@ -695,11 +739,18 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
         // the lash, so it looks alive even held still.
         let pulse = (clock * 7.0 - t * 9.0).sin() * 0.5 + 0.5;
         let base = if k % 3 == 0 { PLASMA } else { lighten(PLASMA, 1.15) };
-        // The body stays blue-violet even at the crack; only the tip and the
-        // travelling pulse go white. A fully white lash loses its silhouette.
-        let whiten = (0.04 + 0.18 * heat + 0.06 * pulse).clamp(0.0, 0.36);
-        let col = base.lerp(PLASMA_TIP, whiten);
-        let r = (0.190 - 0.110 * t) * rs * (1.0 + 0.28 * heat);
+        // The body stays blue-violet even at the crack; only a faint travelling
+        // pulse lightens it. A fully white lash loses its silhouette.
+        let whiten = (0.02 + 0.08 * heat + 0.03 * pulse).clamp(0.0, 0.13);
+        // The last fifth goes dark, so the lash ends in a thin electric point
+        // instead of a pale bulb. Any bright terminal pixel reads as a sword
+        // tip, which is exactly what this weapon is not.
+        let tip_ink = smooth((t - 0.78) / 0.22);
+        let col = base.lerp(PLASMA_TIP, whiten).lerp(LASH_DARK, tip_ink * 0.80);
+        // Taper all the way to a point. There is deliberately no bright tip
+        // ball: the reference lash ends in a thin, dark-edged flick, and a
+        // white bulb at the end read as a glowing sword point.
+        let r = (0.020 + 0.175 * (1.0 - t).powf(0.55)) * rs * (1.0 + 0.28 * heat);
         // The ink outline on a glowing capsule is the dark jagged edge of the
         // ribbon. The halo below softens it into plasma instead of a black rim.
         out.push(
@@ -718,31 +769,21 @@ fn lash_draw(g: &Gun, l: Lash, rs: f32, clock: f32, glow: &mut Vec<Sprite>, out:
             );
         }
         // Soft plasma around the core. A halo on every segment keeps the lash a
-        // continuous ribbon instead of a string of beads.
-        let p = path[k];
-        let halo = (r * 2.4).max(0.12);
-        glow.push(Sprite::ball(
-            p,
-            halo,
-            PLASMA.lerp(PLASMA_TIP, 0.04 + 0.12 * heat),
-            0.09 + 0.24 * heat,
-            p.x * 1.7 + p.z * 0.9,
-            halo * 0.9,
-        ));
+        // continuous ribbon instead of a string of beads. The last few segments
+        // get none: they are the thin dark flick at the end.
+        if k + 3 < WHIP_POINTS {
+            let p = path[k];
+            let halo = (r * 2.4).max(0.10);
+            glow.push(Sprite::ball(
+                p,
+                halo,
+                PLASMA.lerp(PLASMA_TIP, 0.04 + 0.12 * heat),
+                0.09 + 0.24 * heat,
+                p.x * 1.7 + p.z * 0.9,
+                halo * 0.9,
+            ));
+        }
     }
-    // The hot tip: a small ball of energy that leads the crack, plus the two
-    // short prongs that make the last metre look like a claw of plasma.
-    let tip = path[WHIP_POINTS - 1];
-    let size = (0.13 + 0.15 * heat) * rs;
-    out.push(DrawPrim::capsule(tip, tip + Vec3::Y * 0.004, size, PLASMA_TIP, false).glowing().inkless());
-    let back = path[WHIP_POINTS - 2];
-    let dir = (tip - back).normalize_or_zero();
-    for k in 0..2 {
-        let a = l.phase + k as f32 * 2.4;
-        let prong = tip + (dir * 0.45 + g.side * 0.28 * a.cos() + g.up * 0.20 * a.sin()) * rs;
-        out.push(DrawPrim::capsule(tip, prong, 0.018 * rs, PLASMA_TIP, false).glowing().inkless());
-    }
-    glow.push(Sprite::ball(tip, size * 2.6, PLASMA_TIP, 0.40 + 0.42 * heat, tip.x + tip.z, size * 2.0));
 }
 
 /// The capsules for `worms`, each drawn at `positions[i]` (the sim's position
@@ -804,6 +845,16 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
             whip_charge
         };
         let whip_strike = if gun_id == WHIP { strike_body(anim.whip) } else { 0.0 };
+        // Wielding the whip is a stance of its own: weight low, shoulders turned
+        // slightly, free arm out. The carried lash sways across the front, and
+        // the body follows it a little, so the worm is always doing something
+        // with the weapon even before the first strike.
+        let whip_ready = if gun_id == WHIP {
+            (1.0 - whip_cock.max(whip_strike)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let whip_flip = if anim.whip_flip { -1.0 } else { 1.0 };
 
         let mut pose = Pose::default();
         pose.lean = match action {
@@ -858,12 +909,21 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
         // waving a prop about.
         pose.lean -= kick_rise * 0.28 * kick;
         if gun_id == WHIP {
+            let stance = whip_ready * if ground { 1.0 } else { 0.35 };
+            let side_pose = idle_whip_sweep(anim.clock) / WHIP_SWEEP;
+            // Ready stance, with the shoulders riding the lash's slow sway.
+            pose.lean += 0.050 * stance;
+            pose.twist += 0.14 * stance * side_pose;
+            pose.roll += 0.022 * stance * (anim.clock * 1.7).sin();
+            pose.wide *= 1.0 + 0.025 * stance;
             // Coil away from the target as the lash is cocked, then lean and
             // twist through it as it cracks. This is the "full strike": the
-            // shoulder does the work, not the wrist.
+            // shoulder does the work, not the wrist. Roll and twist mirror with
+            // the swing, so a left-handed and right-handed strike do not look
+            // like the same animation played backwards.
             pose.lean += -0.22 * whip_cock + 0.28 * whip_strike;
-            pose.roll += 0.14 * whip_cock - 0.16 * whip_strike;
-            pose.twist += 0.16 * whip_cock - 0.16 * whip_strike;
+            pose.roll += 0.14 * whip_cock - 0.16 * whip_strike * whip_flip;
+            pose.twist += 0.16 * whip_cock - 0.16 * whip_strike * whip_flip;
             pose.wide *= 1.0 + 0.04 * whip_strike;
         }
         if flinch > 0.0 {
@@ -1105,13 +1165,24 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
         };
         // The kick travels through the arm: the hand snaps back and up, and the
         // spring brings it forward past rest a moment later.
+        let mut hand_l = hand_l;
         let mut hand_r = hand_r;
         if gun_id == WHIP {
-            // Cock the lash up and back over the shoulder, then throw the arm
-            // across the front of the body. The arm and the lash move together,
-            // so the weapon never looks like it is waving itself.
+            let stance = whip_ready * if ground { 1.0 } else { 0.35 };
+            let side_pose = idle_whip_sweep(anim.clock) / WHIP_SWEEP;
+            // The free arm counterbalances the lash; the whip arm is held out
+            // and slightly low, ready to throw. Cock the lash up and back over
+            // the shoulder, then throw the arm across the front of the body.
+            // The arm and the lash move together, so the weapon never looks
+            // like it is waving itself.
+            hand_l += Vec3::new(-0.14 * stance * side_pose, 0.22 * stance, 0.12 * stance);
+            hand_r += Vec3::new(
+                0.04 * stance + 0.07 * stance * side_pose,
+                -0.02 * stance + 0.02 * stance * (anim.clock * 1.7).sin(),
+                0.10 * stance + 0.04 * stance * side_pose,
+            );
             hand_r += Vec3::new(0.18, 0.24, -0.34) * whip_cock;
-            hand_r += Vec3::new(-0.75, -0.10, 0.38) * whip_strike;
+            hand_r += Vec3::new(-0.75 * whip_flip, -0.10, 0.38) * whip_strike;
         }
         let hand_r = hand_r - look * (kick_back * 0.55 * kick) + Vec3::Y * (kick_rise * 0.10 * kick);
         let shoulder_l = Vec3::new(-0.30, 1.18, 0.02);
@@ -1148,11 +1219,24 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
         let ms = WORM_HEIGHT / SDF_MODEL;
         let mut sdf_hand_r = SDF_HAND_R;
         if gun_id == WHIP {
+            let stance = whip_ready * if ground { 1.0 } else { 0.35 };
+            let side_pose = idle_whip_sweep(anim.clock) / WHIP_SWEEP;
+            sdf_hand_r += Vec3::new(
+                0.04 * stance + 0.07 * stance * side_pose,
+                -0.02 * stance + 0.02 * stance * (anim.clock * 1.7).sin(),
+                0.10 * stance + 0.04 * stance * side_pose,
+            ) / ms;
             sdf_hand_r += Vec3::new(0.18, 0.24, -0.34) * whip_cock / ms;
-            sdf_hand_r += Vec3::new(-0.75, -0.10, 0.38) * whip_strike / ms;
+            sdf_hand_r += Vec3::new(-0.75 * whip_flip, -0.10, 0.38) * whip_strike / ms;
         }
         sdf_hand_r += -look * (kick_back * 0.55 * kick / ms) + Vec3::Y * (kick_rise * 0.10 * kick / ms);
-        let sdf_hand_l = SDF_HAND_L;
+        let mut sdf_hand_l = SDF_HAND_L;
+        if gun_id == WHIP {
+            let stance = whip_ready * if ground { 1.0 } else { 0.35 };
+            let side_pose = idle_whip_sweep(anim.clock) / WHIP_SWEEP;
+            sdf_hand_l +=
+                Vec3::new(-0.14 * stance * side_pose, 0.22 * stance, 0.12 * stance) / ms;
+        }
 
         // The weapon. Each id gets its own oversized, distinct silhouette built
         // from the same three primitives, so the per-pixel cost stays one cheap
@@ -1181,6 +1265,7 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &[Anim]) -> (Vec<DrawPrim
                 age: anim.whip,
                 phase: anim.whip_phase,
                 style: anim.whip_style,
+                flip: anim.whip_flip,
             },
             &mut glow,
             &mut out,
@@ -1583,7 +1668,7 @@ mod tests {
         // never hidden behind the shoulder.
         let idle = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
         let idle_reach = furthest(&idle, pos);
-        assert!(idle_reach > 5.0 && idle_reach < 8.0, "carried out: {idle_reach}");
+        assert!(idle_reach > 6.0 && idle_reach < 9.0, "carried out: {idle_reach}");
         assert!(idle.iter().all(sane));
 
         // Coiled: still carried, but gathered in and brightened.
@@ -1593,7 +1678,7 @@ mod tests {
         assert!(cocked.iter().all(sane));
 
         // The strike: the tip reaches the whole fourteen metres.
-        anim.struck(WhipStyle::Sweep, 0.0);
+        anim.struck(WhipStyle::Sweep, 0.0, false);
         anim.whip = LASH_EXTEND + LASH_SWING * 0.5;
         let strike = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
         assert!(furthest(&strike, pos) > 12.0, "the crack reaches out: {}", furthest(&strike, pos));

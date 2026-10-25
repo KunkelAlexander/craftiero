@@ -55,7 +55,7 @@ pub enum Kind {
     /// Adds one rectangular wall of terrain just ahead of the worm.
     Wall,
     /// A melee lash: a left-to-right sweep that damages what it touches and
-    /// carves a scar along its path. Fired after a double jump, it becomes an
+    /// digs a shallow groove along its path. Fired after a double jump, it becomes an
     /// overhead smash instead.
     Whip,
 }
@@ -130,11 +130,15 @@ pub struct WeaponState {
     /// Seconds of wind-up built up for this weapon. Kept per weapon so a
     /// charge cannot be carried across a swap; switching cancels it.
     pub charge: f32,
+    /// How many times this weapon has fired. The whip uses it to alternate the
+    /// direction of its swings: a held trigger lashes left, then right, then
+    /// left, so it never reads as the same canned swing on repeat.
+    pub swings: u16,
 }
 
 impl WeaponState {
     pub fn full(id: u8) -> WeaponState {
-        WeaponState { id, ammo: WEAPONS[id as usize].mag, cooldown: 0.0, reload: 0.0, charge: 0.0 }
+        WeaponState { id, ammo: WEAPONS[id as usize].mag, cooldown: 0.0, reload: 0.0, charge: 0.0, swings: 0 }
     }
 }
 
@@ -449,13 +453,14 @@ pub static WEAPONS: [WeaponDef; 13] = [
         reload: 0.0,
         spread: 0.0,
         // The carried lash is about six metres; a strike extends it to
-        // fourteen. `terrain` is the radius of the shallow groove it burns
-        // across whatever rock the sweep crosses.
+        // fourteen. `terrain` is the radius of the groove it digs across
+        // whatever rock the sweep crosses. Deep enough to see after the strike,
+        // now that there is no glowing scar to mark it.
         range: 14.0,
         blast_radius: 0.0,
         blast_damage: 0.0,
         knockback: 18.0,
-        terrain: 0.30,
+        terrain: 0.35,
         pellets: 1,
         gravity: 0.0,
         bounce: 0.0,

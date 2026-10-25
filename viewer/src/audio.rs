@@ -282,7 +282,6 @@ impl Sfx {
                 let p = Place::at(from, listener, right);
                 self.whip(p);
             }
-            Event::Scar { .. } => {}
             Event::Hit { pos, damage, weapon, .. } => {
                 let p = Place::at(pos, listener, right);
                 self.hit(damage, weapon, p);
@@ -914,6 +913,7 @@ mod tests {
                 phase: 0.0,
                 length: 9.5,
                 style: sim::WhipStyle::Sweep,
+                flip: false,
             },
             _ => shot(weapon, Vec3::ZERO),
         }

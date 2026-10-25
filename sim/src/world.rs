@@ -32,12 +32,15 @@ pub const WORM_HEIGHT: f32 = 1.8;
 /// Eye (and aim origin) above the feet.
 pub const EYE_HEIGHT: f32 = 1.5;
 /// Height of the hand: where the rope and the gun are.
-const HAND_HEIGHT: f32 = 1.15;
-/// How far out to the body's right and forward the gun hand sits. These are the
-/// viewer's standing arm pose, repeated here because the sim decides where a
-/// shot starts (and that has to be the barrel, not the chest).
-const HAND_RIGHT: f32 = 0.72;
-const HAND_FORWARD: f32 = 0.26;
+const HAND_HEIGHT: f32 = 1.028;
+/// How far out to the body's right and forward the gun hand sits. These mirror
+/// the viewer's standing arm pose (`SDF_HAND_R` in `viewer/src/worms.rs`, in
+/// model units, scaled by `WORM_HEIGHT / SDF_MODEL`), because the sim decides
+/// where a shot starts (and that has to be the barrel, not the chest). Keep the
+/// two in step: if the sculpt's hand moves and this does not, shots leave from
+/// thin air beside the worm instead of from the gun.
+const HAND_RIGHT: f32 = 0.128;
+const HAND_FORWARD: f32 = 0.808;
 /// Pattern: Spatial approximation. The collision shape is a capsule, tested as
 /// three spheres up its axis (feet, middle, head). A sphere against a distance
 /// field is one lookup: `distance < radius` means touching, and the gradient
@@ -357,16 +360,23 @@ pub enum Event {
     Shot { worm: u8, weapon: u8, pos: Vec3 },
     /// A beam weapon's line, for drawing.
     Beam { from: Vec3, to: Vec3 },
-    /// `worm`'s plasma whip has cracked. `dir`, `side`, `phase` and `style` are
-    /// what the viewer needs to rebuild the same curve the sim scars (and, for
-    /// a smash, hits) the world along (see `whip_path`); `length` is the reach.
-    /// The worm itself carries the lash every frame, so this event is what
-    /// starts the swing animation, not what makes the weapon appear.
-    Whip { worm: u8, from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
-    /// A segment of the groove a plasma-whip sweep burned into the rock. The
-    /// terrain edit is already in the grid; this is the visible heat that cools
-    /// from white to red to dark over a couple of seconds.
-    Scar { from: Vec3, to: Vec3, normal: Vec3 },
+    /// `worm`'s plasma whip has cracked. `dir`, `side`, `phase`, `style` and
+    /// `flip` are what the viewer needs to rebuild the same curve the sim digs
+    /// (and, for a smash, hits) the world along (see `whip_path`); `length` is
+    /// the reach. The worm itself carries the lash every frame, so this event is
+    /// what starts the swing animation, not what makes the weapon appear.
+    /// `flip` reverses the swing, so a held trigger alternates right-to-left and
+    /// left-to-right instead of repeating one canned arc.
+    Whip {
+        worm: u8,
+        from: Vec3,
+        dir: Vec3,
+        side: Vec3,
+        phase: f32,
+        length: f32,
+        style: WhipStyle,
+        flip: bool,
+    },
     /// `weapon` made the blast: the viewer, the audio and the camera each have
     /// their own signature for it (see `docs/WEAPON_FEEL.md`). `radius` is the
     /// damage reach, not the size of the fireball. `normal` is the surface the

@@ -430,7 +430,7 @@ fn run_shot(cfg: &Config, path: &str) {
                 if weapon == WHIP {
                     // The strike lands after the draw-back; start its swing
                     // clock at the tick the sim would have fired it.
-                    anim.struck_at(WhipStyle::Sweep, 0.0, elapsed - WEAPONS[WHIP as usize].windup);
+                    anim.struck_at(WhipStyle::Sweep, 0.0, false, elapsed - WEAPONS[WHIP as usize].windup);
                 }
             }
         }
@@ -1127,13 +1127,13 @@ impl Viewer {
                         self.feel.kick(&self.camera, shot_kick(weapon));
                     }
                 }
-                Event::Whip { worm, from, phase, style, .. } => {
+                Event::Whip { worm, from, phase, style, flip, .. } => {
                     // The lash is part of the worm's model, so the strike is an
                     // animation cue, not a spawned effect. The camera answers
                     // the crack, not a muzzle flash: a lateral shove with a
                     // small lens punch, timed to the swing.
                     if let Some(anim) = self.anims.get_mut(worm as usize) {
-                        anim.struck(style, phase);
+                        anim.struck(style, phase, flip);
                     }
                     if worm == 0 {
                         let away = (from - self.camera.pos).length();

@@ -85,7 +85,7 @@ pub const WHIP_SWEEP: f32 = 0.95;
 /// weapon, not a cable hanging from the hand.
 pub const WHIP_IDLE: f32 = 6.0;
 /// How many points the plasma whip's lash is sampled at. Fixed so the event
-/// that tells the viewer what to draw and the path the sim scars are literally
+/// that tells the viewer what to draw and the path the sim digs are literally
 /// the same array, not two implementations that can drift apart.
 pub const WHIP_POINTS: usize = 18;
 /// The overhead smash starts this far above the horizon (radians) and finishes
@@ -93,27 +93,27 @@ pub const WHIP_POINTS: usize = 18;
 /// front, which is what makes the double-jump follow-up read as a slam.
 const WHIP_SMASH_UP: f32 = 1.35;
 const WHIP_SMASH_DOWN: f32 = -1.20;
-/// How many bearings the strike samples when it burns its scar. Six degrees or
-/// so apart: the carved capsules bridge the gaps into one groove, and the heat
-/// stays a handful of segments rather than flooding the effect pool.
-const WHIP_SCAR_SAMPLES: usize = 17;
-/// Largest gap between two surface contacts that the scar will bridge. A larger
+/// How many bearings the strike samples when it cuts its groove. Six degrees or
+/// so apart: the carved capsules bridge the gaps into one groove, and the cut
+/// stays a handful of segments rather than flooding the edit stream.
+const WHIP_CUT_SAMPLES: usize = 17;
+/// Largest gap between two surface contacts that the groove will bridge. A larger
 /// jump means the lash left one rock face and found another, so the groove
 /// should stop rather than cut through the air between them.
-const WHIP_SCAR_BRIDGE: f32 = 3.0;
+const WHIP_CUT_BRIDGE: f32 = 3.0;
 
 /// The two ways the plasma whip can be swung. The sim picks one from what the
 /// worm is doing; the viewer rebuilds the same curve from the event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhipStyle {
-    /// A flat lash across the front, from the worm's left to its right.
+    /// A flat lash across the front, alternating direction with each swing.
     Sweep,
     /// The double-jump follow-up: an overhead arc that smashes down.
     Smash,
 }
 
 /// One pose of the lash. The sim samples the strike pose and the viewer plays
-/// the same curve through its animation, so the scar, the hit fan and the drawn
+/// the same curve through its animation, so the groove, the hit fan and the drawn
 /// lash all speak the same language.
 #[derive(Clone, Copy, Debug)]
 pub struct WhipPose {
@@ -132,8 +132,12 @@ pub struct WhipPose {
     pub curl: f32,
     /// 0 keeps the lash in the strike plane (a flat, horizontal sweep); 1 lets
     /// it arch over the hand. The carried pose is alive and arched; the strike
-    /// flattens so a wall gets a horizontal scar, not a smile.
+    /// flattens so a wall gets a horizontal cut, not a smile.
     pub arch: f32,
+    /// How far the tip trails the handle, in radians at the very end. The sim
+    /// leaves this at zero (its hit fan is symmetric); the viewer bends the lash
+    /// into the swing with it, so the tip follows rather than pivots rigidly.
+    pub lag: f32,
     pub style: WhipStyle,
 }
 
@@ -179,13 +183,13 @@ pub struct AimPath {
 /// Everything is built in a cylindrical frame around the worm: the lash reaches
 /// out along `dir`, bows to one side, and is rotated around world Y by `sweep`.
 /// That rotation is what makes a flat left-to-right strike read from the
-/// shoulder camera and what lets a wall carry a long horizontal scar.
+/// shoulder camera and what lets a wall carry a long horizontal cut.
 ///
 /// The last third curls back into a hook. A straight line into the screen is
 /// invisible from behind the worm; the hook and the lateral bow are what give
 /// fourteen metres a silhouette.
 ///
-/// The sim samples this once to carve the scar and to resolve a smash, and the
+/// The sim samples this once to carve the groove and to resolve a smash, and the
 /// viewer calls it every frame with the same arguments to draw the identical
 /// curve.
 pub fn whip_path(from: Vec3, pose: WhipPose) -> [Vec3; WHIP_POINTS] {
@@ -218,34 +222,63 @@ pub fn whip_path(from: Vec3, pose: WhipPose) -> [Vec3; WHIP_POINTS] {
         let t = k as f32 / (WHIP_POINTS - 1) as f32;
         match pose.style {
             WhipStyle::Sweep => {
+                let arch = pose.arch.clamp(0.0, 1.0);
+                // A carried lash is a loose coil lying across the front, not a
+                // sword pointing at the crosshair. Two slow lateral bends (one
+                // bulging out, one folding the tip back the other way) give a
+                // long S that reads from any camera. The strike flattens the
+                // coil out (`arch` goes to zero) so the sweep stays horizontal.
+                let coil = arch * pose.length
+                    * (0.50 * (t * std::f32::consts::PI * 1.15).sin() - 0.20 * t * t);
                 // A forward bow with a travelling ripple. The bow is the pose;
                 // the ripple is the living part that never stops.
-                let bow = -0.26 * pose.length * (t * std::f32::consts::PI).sin();
+                let bow = -0.26 * pose.length * (t * std::f32::consts::PI).sin() * (1.0 - 0.55 * arch);
                 let wave = (pose.phase + t * std::f32::consts::TAU * 1.5).sin()
                     * (0.055 + 0.035 * curl)
                     * pose.length
-                    * (t * std::f32::consts::PI).sin();
+                    * (t * std::f32::consts::PI).sin()
+                    * (0.65 + 0.35 * arch);
                 // The hook: the last third curls back and up, like a real whip
                 // whose tip overtakes the rest of the lash.
                 let h = ((t - 0.72) / 0.28).clamp(0.0, 1.0);
                 let hook = h * h * (3.0 - 2.0 * h);
-                let arch = pose.arch.clamp(0.0, 1.0);
                 // The carried lash keeps its curl open; the strike closes it
                 // into the hook that gives the sweep its silhouette.
                 let hook_side =
                     -0.15 * pose.length * hook * (0.65 + 0.35 * curl) * (1.0 - 0.55 * arch);
                 // The arch is a carried-pose flourish. It fades to zero for the
                 // strike, so the sweep stays in one plane and a wall carries a
-                // horizontal scar instead of a curve.
+                // horizontal cut instead of a curve.
                 let hook_up = arch * 0.060 * pose.length * hook * (pose.phase + t * 4.7).sin();
                 // A gentle arch through the whole lash, so the carried pose
-                // rises over the hand instead of lying flat on the screen.
-                let lift =
-                    arch * 0.10 * pose.length * (t * std::f32::consts::PI).sin() * (1.0 + 0.5 * curl);
-                *p = from
+                // rises over the hand, then a droop towards the tip. A lash
+                // that stays at one height reads as a blade; letting it fall
+                // and wave in the vertical plane keeps it alive from every
+                // camera angle.
+                let lift = arch
+                    * pose.length
+                    * (0.12 * (t * std::f32::consts::PI).sin() * (1.0 + 0.4 * curl)
+                        - 0.10 * t * t);
+                let vertical = arch
+                    * pose.length
+                    * 0.035
+                    * (t * std::f32::consts::TAU * 1.3 + pose.phase * 0.6).sin()
+                    * t;
+                let mut q = from
                     + dir * (pose.length * t)
-                    + side * (bow + wave + hook_side)
-                    + up * (lift + hook_up);
+                    + side * (coil + bow + wave + hook_side)
+                    + up * (lift + hook_up + vertical);
+                // The tip trails the hand through a swing. This is the bend a
+                // real whip has: the handle leads and the last few metres are
+                // still catching up, instead of the whole lash turning as one
+                // rigid blade.
+                let lag = pose.lag.clamp(-1.4, 1.4) * t * t;
+                if lag.abs() > 1.0e-4 {
+                    let off = q - from;
+                    let (s, c) = lag.sin_cos();
+                    q = from + Vec3::new(off.x * c + off.z * s, off.y, -off.x * s + off.z * c);
+                }
+                *p = q;
             }
             WhipStyle::Smash => {
                 // Over the shoulder and down: the elevation falls from near
@@ -777,17 +810,31 @@ impl World {
         Some((shape, centre))
     }
 
-    /// The plasma whip. On the ground it lashes from left to right across the
-    /// front; fired during the double jump it becomes an overhead smash that
-    /// comes down in front. It damages every worm the lash passes close to and
-    /// burns a shallow groove into whatever rock the sweep crosses.
+    /// The plasma whip. On the ground it lashes across the front, alternating
+    /// right-to-left and left-to-right with every swing; fired during the double
+    /// jump it becomes an overhead smash that comes down in front. It damages
+    /// every worm the lash passes close to and digs a shallow groove into
+    /// whatever rock the sweep crosses.
     fn whip_strike(&mut self, owner: usize, weapon: u8, def: &WeaponDef, origin: Vec3, aim: Vec3) {
-        let worm = &self.worms[owner];
-        let style = if worm.action == Action::DoubleJump && !worm.on_ground {
-            WhipStyle::Smash
-        } else {
-            WhipStyle::Sweep
+        let (style, slot) = {
+            let worm = &self.worms[owner];
+            let style = if worm.action == Action::DoubleJump && !worm.on_ground {
+                WhipStyle::Smash
+            } else {
+                WhipStyle::Sweep
+            };
+            (style, worm.current)
         };
+        // Alternate the direction of a held whip. A smash always comes straight
+        // down, so only a horizontal sweep flips.
+        let flip = if style == WhipStyle::Sweep {
+            let swings = self.worms[owner].weapons[slot].swings;
+            self.worms[owner].weapons[slot].swings = swings.wrapping_add(1);
+            swings % 2 == 1
+        } else {
+            false
+        };
+        let worm = &self.worms[owner];
         let dir = if aim.length_squared() > 1.0e-8 { aim.normalize() } else { Vec3::Z };
         // The swing is built around the worm's horizontal aim; when it looks
         // straight up or down, fall back to the way the body faces.
@@ -801,7 +848,17 @@ impl World {
         let side = fwd.cross(Vec3::Y).normalize_or_zero();
         let pitch = dir.y.clamp(-1.0, 1.0).asin();
         let phase = self.rng.range(0.0, std::f32::consts::TAU);
-        let pose = WhipPose { dir, side, phase, length: def.range, sweep: 0.0, curl: 0.0, arch: 0.0, style };
+        let pose = WhipPose {
+            dir,
+            side,
+            phase,
+            length: def.range,
+            sweep: 0.0,
+            curl: 0.0,
+            arch: 0.0,
+            lag: 0.0,
+            style,
+        };
         let path = whip_path(origin, pose);
         self.events.push(Event::Whip {
             worm: owner as u8,
@@ -811,6 +868,7 @@ impl World {
             phase,
             length: def.range,
             style,
+            flip,
         });
 
         // A lash is a melee sweep. A sweep catches every worm in the fan the
@@ -846,53 +904,59 @@ impl World {
             }
         }
 
-        // The scar. The lash only scars the first surface it meets: it stops at
-        // rock instead of tunnelling to its full length, so a wall gets a long
-        // horizontal groove rather than a fan of boreholes. The strike samples
+        // The groove. The lash only digs where it first meets rock: it stops at
+        // the surface instead of tunnelling to its full length, so a wall gets a
+        // long horizontal cut rather than a fan of boreholes. The strike samples
         // the whole sweep, not only the pose it ends in, which is what makes the
-        // scar follow the visible arc.
+        // cut follow the visible arc. There is no heat: this is a plain terrain
+        // edit, the same `Carve` the dig tool uses.
         let mut marks = Vec::new();
         match style {
             WhipStyle::Sweep => {
-                for k in 0..WHIP_SCAR_SAMPLES {
-                    let u = k as f32 / (WHIP_SCAR_SAMPLES - 1) as f32;
+                for k in 0..WHIP_CUT_SAMPLES {
+                    let u = k as f32 / (WHIP_CUT_SAMPLES - 1) as f32;
+                    // Walk the bearings in the direction the visible swing
+                    // travels, so the dug segments follow left-to-right or
+                    // right-to-left with the event.
+                    let u = if flip { 1.0 - u } else { u };
                     let sweep = WHIP_SWEEP * (1.0 - 2.0 * u);
                     let pose = WhipPose { sweep, ..pose };
                     let path = whip_path(origin, pose);
                     if let Some(at) = lash_contact(&self.grid, &path, def.terrain * 0.55) {
                         let n = self.grid.gradient(at);
                         let normal = if n.length_squared() > 1.0e-6 { n.normalize() } else { -dir };
-                        marks.push((sweep, at + normal * (def.terrain * 0.40), normal));
+                        // Sink the cut into the surface. Centring it on the
+                        // contact would leave half the capsule in the air and
+                        // barely notch the rock.
+                        marks.push((sweep, at - normal * (def.terrain * 0.25), normal));
                     }
                 }
             }
             WhipStyle::Smash => {
                 if let Some((at, normal, idx)) = lash_contact_index(&self.grid, &path, def.terrain * 0.55) {
                     let back = path[idx.saturating_sub(2)];
-                    marks.push((0.0, at + normal * (def.terrain * 0.40), normal));
+                    marks.push((0.0, at - normal * (def.terrain * 0.25), normal));
                     // The smash drives the lash into the surface; one short
                     // segment behind the contact reads as the groove.
                     let shape = Shape::Capsule { a: back, b: marks[0].1, radius: def.terrain };
                     self.grid.apply(shape, Op::Carve);
                     self.events.push(Event::Edit { shape, op: Op::Carve });
-                    self.events.push(Event::Scar { from: back, to: marks[0].1, normal });
                 }
             }
         }
         // Connect neighbouring contacts into one groove. A gap too large means
-        // the lash left one surface and found another; the scar stops there.
+        // the lash left one surface and found another, so the cut stops there.
         let mut impact: Option<(f32, Vec3, Vec3)> = None;
         for pair in marks.windows(2) {
             let (a0, a, n0) = pair[0];
             let (a1, b, _) = pair[1];
-            if a.distance(b) > WHIP_SCAR_BRIDGE || (a - b).length_squared() < 1.0e-4 {
+            if a.distance(b) > WHIP_CUT_BRIDGE || (a - b).length_squared() < 1.0e-4 {
                 continue;
             }
             let shape = Shape::Capsule { a, b, radius: def.terrain };
             self.grid.apply(shape, Op::Carve);
             self.events.push(Event::Edit { shape, op: Op::Carve });
-            self.events.push(Event::Scar { from: a, to: b, normal: n0 });
-            // Prefer the contact nearest the aim for the big crack effect.
+            // Prefer the contact nearest the aim for the crack effect.
             let score = a0.abs().min(a1.abs());
             if impact.map_or(true, |(best, ..)| score < best) {
                 impact = Some((score, (a + b) * 0.5, n0));
@@ -1916,7 +1980,17 @@ mod tests {
 
     #[test]
     fn a_whip_sweep_bows_left_and_reaches_the_aim_at_full_length() {
-        let pose = WhipPose { dir: Vec3::Z, side: Vec3::NEG_X, phase: 0.0, length: 9.5, sweep: 0.0, curl: 0.0, arch: 0.0, style: WhipStyle::Sweep };
+        let pose = WhipPose {
+            dir: Vec3::Z,
+            side: Vec3::NEG_X,
+            phase: 0.0,
+            length: 9.5,
+            sweep: 0.0,
+            curl: 0.0,
+            arch: 0.0,
+            lag: 0.0,
+            style: WhipStyle::Sweep,
+        };
         let path = whip_path(Vec3::ZERO, pose);
         assert_eq!(path[0], Vec3::ZERO, "it starts at the emitter");
         // The worm faces +Z, so its left is +X.
@@ -1929,7 +2003,17 @@ mod tests {
 
     #[test]
     fn a_whip_smash_goes_overhead_and_comes_down_in_front() {
-        let pose = WhipPose { dir: Vec3::Z, side: Vec3::NEG_X, phase: 0.0, length: 9.5, sweep: 0.0, curl: 0.0, arch: 0.0, style: WhipStyle::Smash };
+        let pose = WhipPose {
+            dir: Vec3::Z,
+            side: Vec3::NEG_X,
+            phase: 0.0,
+            length: 9.5,
+            sweep: 0.0,
+            curl: 0.0,
+            arch: 0.0,
+            lag: 0.0,
+            style: WhipStyle::Smash,
+        };
         let path = whip_path(Vec3::ZERO, pose);
         assert_eq!(path[0], Vec3::ZERO, "it starts at the emitter");
         assert!(path.iter().any(|p| p.y > 1.0), "it rises over the worm");
@@ -1998,16 +2082,16 @@ mod tests {
     }
 
     #[test]
-    fn the_plasma_whip_leaves_a_scar_in_the_rock() {
+    fn the_plasma_whip_digs_into_the_rock() {
         let mut w = arena(flat, &[(16.0, 16.0)]);
         let before = w.grid.checksum();
         let events = hold_at(&mut w, WHIP, 0.0, -0.7, 24); // down at the ground
-        assert_ne!(w.grid.checksum(), before, "the rock is scarred");
+        assert_ne!(w.grid.checksum(), before, "the rock is dug");
         assert!(events.iter().any(|e| matches!(e, Event::Edit { op: Op::Carve, .. })));
     }
 
     #[test]
-    fn the_whip_scars_a_wall_horizontally_without_tunnelling() {
+    fn the_whip_digs_a_horizontal_groove_in_a_wall_without_tunnelling() {
         // Flat ground and a wall 8 m ahead. Aim level, so the sweep crosses the
         // wall in one plane.
         let mut w = arena(walled, &[(16.0, 16.0)]);
@@ -2017,7 +2101,13 @@ mod tests {
         let events = hold_at(&mut w, WHIP, 0.0, 0.0, 24);
         let marks: Vec<(Vec3, Vec3)> = events
             .iter()
-            .filter_map(|e| if let Event::Scar { from, to, .. } = e { Some((*from, *to)) } else { None })
+            .filter_map(|e| {
+                if let Event::Edit { shape: Shape::Capsule { a, b, .. }, op: Op::Carve } = e {
+                    Some((*a, *b))
+                } else {
+                    None
+                }
+            })
             .collect();
         assert!(marks.len() >= 4, "the sweep leaves a groove, not a dot: {}", marks.len());
         let mut min = Vec3::splat(f32::MAX);
@@ -2026,9 +2116,9 @@ mod tests {
             min = min.min(*a).min(*b);
             max = max.max(*a).max(*b);
         }
-        // The wall is vertical, so a good scar runs sideways: a little height
+        // The wall is vertical, so a good cut runs sideways: a little height
         // spread from the lash's own shape, but a long x span.
-        assert!(max.y - min.y < 1.6, "the scar is horizontal: y {}..{}", min.y, max.y);
+        assert!(max.y - min.y < 1.6, "the groove is horizontal: y {}..{}", min.y, max.y);
         assert!(max.x - min.x > 5.0, "it runs along the wall: x {}..{}", min.x, max.x);
         assert!(w.grid.sample(Vec3::new(16.0, 5.5, 27.0)) < 0.0, "no tunnel through the wall");
     }
@@ -2054,6 +2144,25 @@ mod tests {
         let state = &w.worms[0].weapons[WHIP as usize];
         assert_eq!(state.ammo, 0, "the whip has no magazine");
         assert_eq!(state.reload, 0.0, "and never reloads");
+    }
+
+    #[test]
+    fn a_held_whip_alternates_left_and_right() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 24.0)]);
+        w.worms[0].current = WHIP as usize;
+        let mut flips = Vec::new();
+        for _ in 0..200 {
+            w.step(&[Input { fire: true, weapon: WHIP, yaw: 0.0, pitch: LEVEL, ..Input::default() }]);
+            for e in w.drain_events() {
+                if let Event::Whip { style: WhipStyle::Sweep, flip, .. } = e {
+                    flips.push(flip);
+                }
+            }
+        }
+        assert!(flips.len() >= 3, "several swings while held: {flips:?}");
+        for pair in flips.windows(2) {
+            assert_ne!(pair[0], pair[1], "each swing mirrors the last: {flips:?}");
+        }
     }
 
     #[test]

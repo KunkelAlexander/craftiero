@@ -14,8 +14,8 @@ world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
 integrated laptop GPU, and now fight: twelve weapons (rockets, a railgun, bombs,
 homing swarms, a teleport gun, a Nova that charges for a beat and then clears a
 cavern, a plasma whip whose living lash is always carried and cracks across a
-fourteen-metre horizontal arc before it smashes down after a double jump, a
-wall-thrower and a forming beam). Explosions carve the terrain,
+fourteen-metre horizontal arc, alternating left and right, before it smashes
+down after a double jump, a wall-thrower and a forming beam). Explosions carve the terrain,
 rock is cover, and a dead worm comes back
 after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
 arc to the point it will land on, a ricochet marks its first bounce, and a big

@@ -363,8 +363,6 @@ enum Shape {
     Ring { at: Vec3, normal: Vec3, radius: f32 },
     /// A blood splat lying on the rock: one flattened lozenge on `normal`.
     Splat { at: Vec3, normal: Vec3, radius: f32 },
-    /// A hot segment of a plasma scar, cooling from white through red to dark.
-    Scar { from: Vec3, to: Vec3 },
     /// A lump of rock thrown by a blast. Drawn as a solid capsule (with ink,
     /// shadow and shading), because flying rubble is what makes a crater look
     /// like it was torn open rather than painted on.
@@ -499,25 +497,6 @@ impl Effect {
             front: false,
         }
     }
-
-    /// A hot segment of the groove the sweep carved. It has no motion: it just
-    /// cools in place for a couple of seconds.
-    fn scar(from: Vec3, to: Vec3) -> Effect {
-        Effect {
-            shape: Shape::Scar { from, to },
-            colour: Vec3::ONE,
-            vel: Vec3::ZERO,
-            gravity: 0.0,
-            age: 0.0,
-            life: 2.0,
-            burst: false,
-            width: 0.0,
-            hot: true,
-            inkless: true,
-            paint: false,
-            front: false,
-        }
-    }
 }
 
 /// Apply an effect's draw flags to a primitive: self-lit, and/or no ink.
@@ -585,25 +564,6 @@ fn draw_effects<'a>(iter: impl Iterator<Item = &'a Effect>, out: &mut Vec<DrawPr
                     DrawPrim::capsule(a, b, *radius * 0.80 * dry.max(0.35), colour, false),
                     e,
                 ));
-            }
-            Shape::Scar { from, to } => {
-                // Orange-hot, then red, then a dark cooling line. White is
-                // reserved for the crack itself; a full white groove reads as a
-                // laser drawn over the rock.
-                let hot = Vec3::new(0.88, 0.50, 0.28);
-                let colour = if u < 0.04 {
-                    hot
-                } else if u < 0.24 {
-                    hot.lerp(EMBER, (u - 0.04) / 0.20)
-                } else {
-                    EMBER.lerp(Vec3::new(0.12, 0.030, 0.075), ((u - 0.24) / 0.76).clamp(0.0, 1.0))
-                };
-                let width = 0.006 + 0.020 * (1.0 - u).powf(0.75);
-                out.push(
-                    DrawPrim::capsule(*from, *to, width, colour, false)
-                        .glowing()
-                        .inkless(),
-                );
             }
             Shape::Rock { at, radius } => {
                 // A lump, not a sphere: the two ends differ a little so the
@@ -699,7 +659,17 @@ impl Effects {
                 // event only marks the crack: a hot tip, a light and a handful
                 // of sparks. The ghosts and the sweep live in the worm's own
                 // animation, so they stay in step with the drawn lash.
-                let pose = WhipPose { dir, side, phase, length, sweep: 0.0, curl: 0.0, arch: 0.0, style };
+                let pose = WhipPose {
+                    dir,
+                    side,
+                    phase,
+                    length,
+                    sweep: 0.0,
+                    curl: 0.0,
+                    arch: 0.0,
+                    lag: 0.0,
+                    style,
+                };
                 let points = whip_path(from, pose);
                 let tip = points[WHIP_POINTS - 1];
                 self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.24, PLASMA_HOT, 0.15, 0.0).glow());
@@ -716,12 +686,6 @@ impl Effects {
                         9.0,
                     ).glow());
                 }
-            }
-            Event::Scar { from, to, .. } => {
-                // One short-lived hot segment per piece of the groove. They are
-                // core capsules, not sprites, so the heat follows the rock
-                // instead of floating in front of it.
-                self.push_burst(Effect::scar(from, to));
             }
             Event::Shot { weapon, pos, .. } => {
                 // A hot flash at the muzzle in the weapon's own colour (the
@@ -1342,7 +1306,7 @@ impl Effects {
         let mut out = Vec::new();
         draw_effects(
             self.list.iter().filter(|e| {
-                matches!(&e.shape, Shape::Line { .. } | Shape::Rock { .. } | Shape::Scar { .. })
+                matches!(&e.shape, Shape::Line { .. } | Shape::Rock { .. })
             }),
             &mut out,
         );
@@ -1881,21 +1845,6 @@ mod tests {
     }
 
     #[test]
-    fn a_plasma_scar_burns_then_cools_away() {
-        let mut e = Effects::default();
-        e.add(&Event::Scar {
-            from: Vec3::new(-2.0, 2.0, 0.0),
-            to: Vec3::new(2.0, 2.0, 0.0),
-            normal: Vec3::Y,
-        });
-        assert!(!e.capsules().is_empty(), "the groove glows at first");
-        e.update(1.0);
-        assert!(!e.capsules().is_empty(), "and is still cooling a second later");
-        e.update(1.2);
-        assert!(e.capsules().is_empty(), "then the heat is gone");
-    }
-
-    #[test]
     fn a_whip_crack_flashes_at_the_tip_and_fades_fast() {
         let mut e = Effects::default();
         e.add(&Event::Whip {
@@ -1906,6 +1855,7 @@ mod tests {
             phase: 0.0,
             length: 9.5,
             style: sim::WhipStyle::Sweep,
+            flip: false,
         });
         // The lash itself is part of the worm (see `worms::lash`); the event
         // only adds the crack at the far end and the sparks it throws.
