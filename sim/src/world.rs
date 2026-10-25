@@ -365,8 +365,10 @@ pub enum Event {
     Whip { worm: u8, from: Vec3, dir: Vec3, side: Vec3, phase: f32, length: f32, style: WhipStyle },
     /// `weapon` made the blast: the viewer, the audio and the camera each have
     /// their own signature for it (see `docs/WEAPON_FEEL.md`). `radius` is the
-    /// damage reach, not the size of the fireball.
-    Explosion { weapon: u8, pos: Vec3, radius: f32 },
+    /// damage reach, not the size of the fireball. `normal` is the surface the
+    /// blast landed on, so the shock ring can lie on a wall or ceiling instead
+    /// of pretending every explosion happens on flat ground.
+    Explosion { weapon: u8, pos: Vec3, normal: Vec3, radius: f32 },
     /// `weapon` hurt `victim`. Carrying it lets a railgun hit spark differently
     /// from a blaster round. `dir` is the way the damage pushed the body (away
     /// from the shot or the blast), so the viewer can throw the blood that way.

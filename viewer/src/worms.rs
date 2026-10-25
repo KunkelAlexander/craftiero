@@ -365,6 +365,9 @@ fn weapon(
     lash: Lash,
     out: &mut Vec<DrawPrim>,
 ) {
+    // A mortar is carried pointing up: the same loft the sim uses to launch its
+    // shell, so the barrel and the arc agree.
+    let fwd = WEAPONS[id as usize].launch_dir(fwd);
     // A touch larger than the worm's scale. R&C guns are chunky; a weapon that
     // is small next to the character reads as a toy.
     let g = Gun::new(hand, fwd, kick_back, kick_rise, rs * 1.25);

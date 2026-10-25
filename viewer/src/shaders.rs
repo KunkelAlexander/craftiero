@@ -7,7 +7,7 @@
 // The world constants are pasted in from the `sdf` crate, so the shader can
 // never disagree with the CPU about voxel size or world extent.
 
-use crate::renderer::{MAX_CAPSULES, TILES_X, TILES_Y};
+use crate::renderer::{MAX_PRIMS, TILES_X, TILES_Y};
 use glam::IVec3;
 
 fn f(x: f32) -> String {
@@ -19,7 +19,7 @@ fn f(x: f32) -> String {
 fn uniforms() -> String {
     let groups = TILES_X * TILES_Y / 4;
     COMMON_UNIFORMS
-        .replace("$CAPS", &MAX_CAPSULES.to_string())
+        .replace("$CAPS", &MAX_PRIMS.to_string())
         .replace("$TILES", &(crate::renderer::TILE_WORDS * groups).to_string())
         .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
         .replace("$GROUPS", &groups.to_string())
@@ -48,7 +48,8 @@ pub fn post() -> String {
 const COMMON_UNIFORMS: &str = r#"
 // One analytic primitive, intersected in closed form (not sphere-traced). The
 // fields mean different things per kind, read from `col.w`: 0 capsule, 1 flat
-// cylinder, 2 cuboid. (`array<Prim, $CAPS>` must match MAX_CAPSULES in renderer.rs.)
+// cylinder, 2 cuboid. (`array<Prim, $CAPS>` must match MAX_PRIMS in renderer.rs:
+// gameplay slots followed by the cosmetic blood slots.)
 struct Prim {
     a: vec4<f32>,           // capsule/cylinder: start.xyz + radius; cuboid: centre.xyz
     b: vec4<f32>,           // capsule/cylinder: end.xyz; cuboid: half extents. w = bound radius
@@ -66,6 +67,7 @@ struct U {
     flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
     counts: vec4<f32>,      // x: number of capsules in use, y: shadow casters (the first y)
+    fx: vec4<f32>,          // x: screen flash 0..1, y: world desaturation 0..1 (zw free)
     caps: array<Prim, $CAPS>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
     // which capsules can be seen in the tile. With up to $CAPS capsules each
@@ -412,6 +414,15 @@ fn toon(x: f32) -> f32 {
     return smoothstep(0.0, 0.04, x) * 0.55 + smoothstep(0.42, 0.46, x) * 0.45;
 }
 
+// The world is deliberately quieter than the actors. Most of the green is
+// pulled out of rock, grass, sky and the arena wall, so the weapon palette,
+// blood and health pips are the only strong colour on screen. Capsules are
+// drawn after this and are never muted.
+fn muted(c: vec3<f32>, amount: f32) -> vec3<f32> {
+    let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return mix(c, vec3<f32>(l), amount);
+}
+
 struct Out {
     @location(0) color: vec4<f32>,
     @location(1) gbuf: vec4<f32>,   // xyz: normal * 0.5 + 0.5, w: distance along the ray
@@ -571,6 +582,14 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         col = mix(srgb(vec3<f32>(0.20, 0.22, 0.32)), srgb(vec3<f32>(0.36, 0.38, 0.52)), clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
     }
 
+    // Grade after fog and the brush tint, so the distance haze is muted too.
+    // The sky keeps a little more colour: a grey sky reads as a bug.
+    if (kind == 1 || kind == 2) {
+        col = muted(col, u.fx.y);
+    } else if (kind == 0) {
+        col = muted(col, u.fx.y * 0.55);
+    }
+
     var out: Out;
     out.color = vec4<f32>(col, 1.0);
     // An inkless primitive writes a sentinel normal instead of a real one:
@@ -675,6 +694,21 @@ fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = frag.xy / u.size.zw;
     var col = textureSampleLevel(ink_tex, ink_smp, uv, 0.0).rgb;
 
+    // Impact flash: a white frame with a slight lens split. The two extra
+    // texture taps only run while a flash is alive (a blink), so the steady
+    // cost is one branch. The centre is hotter than the edges, which keeps the
+    // picture readable during the white-out instead of turning it into a slab.
+    let flash = clamp(u.fx.x, 0.0, 1.0);
+    if (flash > 0.002) {
+        let d = uv - vec2<f32>(0.5);
+        let ca = flash * 0.010;
+        let r = textureSampleLevel(ink_tex, ink_smp, uv + d * ca, 0.0).r;
+        let b = textureSampleLevel(ink_tex, ink_smp, uv - d * ca, 0.0).b;
+        col = vec3<f32>(r, col.g, b);
+        let core = 1.0 - 0.40 * smoothstep(0.0, 0.7, dot(d, d) * 2.0);
+        col = mix(col, vec3<f32>(1.0, 0.97, 0.90), flash * core * 0.60);
+    }
+
     // Paper grain and a soft vignette tie the frame together.
     col *= 1.0 + (hash21(frag.xy) - 0.5) * 0.035;
     let c = uv - 0.5;
@@ -691,7 +725,7 @@ fn fs_present(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renderer::{MAX_CAPSULES, TILES_X, TILES_Y, TILE_WORDS};
+    use crate::renderer::{MAX_PRIMS, TILES_X, TILES_Y, TILE_WORDS};
 
     // The WGSL has these numbers pasted in from the Rust side; a mismatch would
     // silently read the wrong tile or overrun the uniform. Test the resolved
@@ -700,7 +734,7 @@ mod tests {
     fn shader_constants_match_the_renderer() {
         let groups = TILES_X * TILES_Y / 4;
         let u = uniforms();
-        assert!(u.contains(&format!("array<Prim, {MAX_CAPSULES}>")));
+        assert!(u.contains(&format!("array<Prim, {MAX_PRIMS}>")));
         assert!(u.contains(&format!("array<vec4<u32>, {}>", TILE_WORDS * groups)));
         let m = march(glam::IVec3::splat(2));
         assert!(m.contains(&format!("vec2<f32>({TILES_X}.0, {TILES_Y}.0)")));
@@ -708,6 +742,6 @@ mod tests {
         assert!(m.contains(&format!("tile.y * {TILES_X}u")));
         assert!(m.contains(&format!("w < {}u", TILE_WORDS)));
         assert!(m.contains(&format!("w * {}u", groups)));
-        assert!(MAX_CAPSULES % 32 == 0, "every word must be full");
+        assert!(MAX_PRIMS % 32 == 0, "every word must be full");
     }
 }

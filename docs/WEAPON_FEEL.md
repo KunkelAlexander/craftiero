@@ -16,8 +16,9 @@ first and how to check each step.
 > implemented too: `Explosion` and `Hit` carry the weapon, and `viewer/src/feel.rs`
 > is the single signature table for fire colour, debris, shock rings, hit sparks,
 > camera shake, shove and lens punch. Phase 3 (victim reaction) is mostly in: hurt
-> flash, flinch, Liero blood with terrain stains, and a health-pip bar. Phases
-> 4-6 remain open.
+> flash, flinch, Liero blood with terrain stains, and a health-pip bar. Phase 4
+> (impact frame) is partly in: per-weapon camera punch and a screen flash with a
+> chromatic split. Hitstop and phases 5-6 remain open.
 
 ## 1. The claim
 
@@ -117,7 +118,7 @@ at 2 must stay quiet even when it is the newest thing in the game.
 | 2 | Railgun | the line through the room | the filament snaps into place with a rising whine | a white-blue line, a crack that arrives *after* the line, debris at the wall | an afterimage fading over 0.5 s, a ringing ear | **4** |
 | 3 | Bouncer | the billiard ball | none | ping on the first wall, pitch rising per bounce | each bounce leaves a short hot trail so you can read the chain | **3** |
 | 4 | Bomb | the trap you leave | a blink and a beep while it sits; the beep accelerates | a deep, dirty boom; more ground than fire | a crater that smokes and a low rumble that outlasts the flash | **4** |
-| 5 | Cluster | the mortar over the hill | the shell's fall whistle | seven separate pops in sequence, not one boom | seven small craters, seven small smoke columns | **4** |
+| 5 | Cluster | the mortar over the hill | its barrel is carried upward; the shell's fall whistle | seven separate pops in sequence, not one boom | seven small craters, seven small smoke columns | **4** |
 | 6 | Swarm | the pack | a rising whine as the six launch | six staggered impacts over ~0.5 s | the last missile still curling in when the first has landed | **3** |
 | 7 | Teleport | the swap | a hum that climbs | a snap, a violet ring, a hard cut in the world | the ringing ear; the swapped enemy visibly confused for a beat | **3** |
 | 8 | Nova | the cavern eraser | a 1.2 s charge: the view narrows, a ring of light gathers and spins | white-out, a fireball that fills the crater, the ground rolling | a 3 s smoke column and a crater rim glowing orange, cooling to black | **5** |
@@ -148,7 +149,12 @@ Three separate ideas, cheapest first:
   visibly *shove* the view.
 - **A white frame.** One frame (a few milliseconds at any refresh rate) of a
   bright full-screen tint on a heavy kill reads as a flashbulb and costs almost
-  nothing. Gate it to your own kills.
+  nothing. Gate it to your own kills. **Done:** `CameraFeel::burst` sets a 0..1
+  flash that decays in ~75 ms; `fs_present` turns it into a hot white frame with
+  a slight chromatic lens split. It is scaled per blast by the weapon's FOV
+  punch and distance (a Nova whites the frame out, a bomblet blinks), and a hit
+  on *you* or a kill of yours adds a short confirmation flash. Two extra texture
+  taps run only while the flash is alive.
 - **Hitstop.** 60-90 ms where the *view* stops while the sim keeps ticking. It
   is the strongest single trick in the book, and it is a multiplayer problem:
   through M4 (offline loopback) it is free; at M5 decide whether it is
@@ -169,11 +175,12 @@ The target is currently the least expressive thing on screen. Needs:
   sim stays authoritative and deterministic). **Done:** `Anim::hurt` drives a
   lean/roll/twist flinch for 0.4 s, strongest on the first frames.
 - **Blood** — Liero's lesson: the hit does not need a number if it paints the
-  room. **Done:** `Event::Hit` carries the push direction; `effects.rs::blood`
-  throws a deterministic spray of self-lit red droplets that follow the wound
-  (a third splash back towards the shooter), then raycasts a few stains onto the
-  rock below and the wall behind. Droplets live under a second, stains for 9 s.
-  It is pure cosmetic particles, no collision and no sim state.
+  room. **Done, and turned up:** `Event::Hit` carries the push direction;
+  `effects.rs::blood` throws roughly five times the old spray — about 80
+  self-lit droplets for a whip hit, with a handful of fat gobs — then raycasts
+  stains around the feet and three on the wall behind. Droplets live ~1 s,
+  stains 14 s. It is pure cosmetic particles, no collision and no sim state, and
+  it draws from its own 128-primitive pool (see the budget note below).
 - **Launch** — knockback already pushes. Make the *body* tumble: rotate the
   capsule chain along the velocity while airborne after a hit, and let the death
   throw the body 8-14 m/s instead of replacing it with a white ball.
@@ -247,17 +254,26 @@ Enforce the Loudness column. Concretely:
   top end or scale the *distribution*: blaster 0.01, rocket 0.06, nova 0.20.
 - Do not add the same smoke puff to every weapon. Silence and emptiness are part
   of the mix.
+- **Mute the world, not the actors.** The terrain, sky and arena wall are pulled
+  a third of the way to grey (`U.fx.y` in the march shader, `C` toggles it); the
+  capsules (worms, guns, blood, health pips) are not. One constant in `main.rs`
+  (`WORLD_GRADE`) sets the amount. This is the cheapest contrast win available:
+  it costs two arithmetic operations on environment pixels and makes every
+  coloured effect read from twice as far.
 
 ## 7. Constraints
 
 - **Determinism.** Nothing in `sim` may depend on the viewer, the clock, or
   audio. All of the above is triggered by existing events, so it stays a pure
   consumer. Hitstop and any time scaling are viewer-only.
-- **Capsule budget.** `MAX_CAPSULES` is 256 and the renderer keeps the head of
-  the list (worms, then the aim aid, then projectiles, then bursts, dust and
-  trails), so a busy fight trims the newest smoke first. Any new effect must fit
-  that budget, and a Nova's afterglow must not evict projectiles. Prefer fewer,
-  bigger, longer-lived primitives over many small ones.
+- **Capsule budgets.** Gameplay gets 256 slots (`MAX_CAPSULES`): worms, the aim
+  aid, projectiles, then bursts, dust and trails, so a busy fight trims the
+  newest smoke first. Blood gets its own 128 slots (`MAX_BLOOD_CAPSULES`) and is
+  packed after the gameplay pool; the renderer truncates each pool on its own,
+  so cosmetic spray can never evict a rocket and a crowded fight can never erase
+  a wound. The shader's total array is 384 primitives (12 tile-mask words), still
+  inside the 64 KB uniform limit. Within each pool, prefer fewer, bigger,
+  longer-lived primitives over many small ones.
 - **Frame cost.** The march pass is already ~16 ms on the target laptop. New
   effects must be cheap capsules and particles; no per-pixel work per explosion.
 - **No external assets.** Synthesised audio and procedural shapes only.
@@ -276,7 +292,7 @@ of this is reviewable headless except sound.
 | **1** | **Sound.** A tiny synth + mixer; events drive it. Three layers, pitch variance, distance filter. | Fire each weapon in turn with eyes closed: can you name it? |
 | **2** | **Weapon id on `Explosion`/`Hit`**, and a per-weapon effect table (colour, fireball, debris, ring, shake, kick). | `--fire 8` and `--fire 1` produce unmistakably different frames. |
 | **3** | **Victim reaction**: hurt flash, stagger, blood, death launch + reward burst. | `--hurt 34`: the body flashes, flinches and bleeds. |
-| **4** | **Impact frame**: punch table, FOV kick, white frame; hitstop offline only. | Rocket at your feet *feels* like a hit, not a nudge. |
+| **4** | **Impact frame**: punch table, FOV kick, white frame; hitstop offline only. | Rocket at your feet *feels* like a hit, not a nudge; `--flash 0.6` previews the white frame. |
 | **5** | **Afterglow**: longer smoke, cooling crater rim, settling dust. | A Nova crater is still readable 3 s later from the spawn camera. |
 | **6** | **Ritual + confirmation**: Nova spin-up, reload ceremony, weapon weight, hitmarker, damage numbers, name on swap. | Play one full fight and describe each kill afterwards. |
 
@@ -288,7 +304,9 @@ throws sparks), the smoke that stays after the flash, a shock ring on the heavy
 weapons, hit-spark colour, camera shake (a Nova is a 0.20 m shove), a
 directional shove and a distance-scaled lens punch. A Nova and a bomblet are now
 different pictures, and the audio uses the same weapon id instead of guessing
-from the blast radius.
+from the blast radius. Shock rings lie in the plane of the surface they hit, so
+an explosion on a wall paints the wall. The Cluster is carried with its barrel
+up and always launches on a lofted arc, even from a level crosshair.
 
 The Nova's wind-up (`WeaponDef::windup`): 1.2 s, committed on
 the press, cancelled by a weapon swap, drawn as a charge ring and a narrowing
@@ -308,6 +326,12 @@ wounded worm wears a five-pip health bar. The blood is purely cosmetic
 (`effects.rs`), deterministic, and sits in its own capsule budget so a messy
 fight trims stains before it trims rockets. `--hurt damage` takes a screenshot of
 all of it at once.
+
+The impact frame now has its white flash (phase 4, partly): explosions, damage
+to the player and player kills fire a short screen flash with a chromatic split.
+The world is also graded a third toward grey by default, so the weapons, blood
+and health pips are the only strong colour; `C` A/Bs it in game and `--no-grade`
+does the same for a screenshot.
 
 ## 9. Open questions for the owner
 

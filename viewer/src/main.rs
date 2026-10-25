@@ -57,7 +57,8 @@ Controls
                     left mouse carve, right mouse build, mouse wheel brush size
   F1 F2 F3          fixed render resolution 100% / 75% / 50%
   T                 automatic resolution (default): holds ~60 fps by scaling it
-  G shadows   H ambient occlusion   O ink outlines   V vsync   R reset the world
+  G shadows   H ambient occlusion   O ink outlines   C colour grade   V vsync
+  R reset the world
   M mute the sound (synthesised: every weapon has its own voice)";
 
 struct Config {
@@ -82,6 +83,12 @@ struct Config {
     /// `--hurt damage`: wound that worm before the shot, so the blood, the hurt
     /// flash and the health bar can be inspected without a second player.
     hurt: Option<f32>,
+    /// `--flash 0..1`: fill the screenshot with an impact flash, for looking at
+    /// the post effect without having to catch it in play.
+    flash: Option<f32>,
+    /// `--no-grade`: leave the environment colours alone (the interactive `C`
+    /// key toggles the same grade).
+    grade: bool,
     brush: bool,
     /// `--no-aim`: hide the weapon aim aid (arcs, blast rings, ricochet marks) in a screenshot.
     aim: bool,
@@ -104,6 +111,8 @@ fn parse_args() -> Config {
         fire: None,
         weapon: None,
         hurt: None,
+        flash: None,
+        grade: true,
         brush: true,
         aim: true,
         shadows: true,
@@ -143,6 +152,8 @@ fn parse_args() -> Config {
             }
             "--weapon" => c.weapon = Some(value("--weapon").parse().expect("--weapon weapon_id")),
             "--hurt" => c.hurt = Some(value("--hurt").parse().expect("--hurt damage")),
+            "--flash" => c.flash = Some(value("--flash").parse().expect("--flash 0..1")),
+            "--no-grade" => c.grade = false,
             "--no-brush" => c.brush = false,
             "--no-aim" => c.aim = false,
             "--no-shadows" => c.shadows = false,
@@ -156,6 +167,10 @@ fn parse_args() -> Config {
 
 /// The seed of the sim's random numbers (weapon spread, bomblets).
 const SEED: u32 = 1;
+
+/// How far the world is pulled towards grey by default. A third is enough to
+/// stop the grass competing with the weapons without making the map look dead.
+const WORLD_GRADE: f32 = 0.35;
 
 /// The weapon a number-row key picks: 1 to 9 are the first nine, then 0, `-`
 /// and `=`.
@@ -417,15 +432,19 @@ fn run_shot(cfg: &Config, path: &str) {
         }
     }
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
-    capsules.extend(effects.capsules());
+    capsules.extend(effects.core_capsules());
+    let blood = effects.blood_capsules();
     let params = FrameParams {
         camera: &cam,
         capsules: &capsules,
+        blood: &blood,
         brush: if cfg.brush { aim_point(&world.grid, &cam).map(|p| (p, 3.0)) } else { None },
         time: 0.0,
         shadows: cfg.shadows,
         ao: cfg.ao,
         outlines: cfg.outlines,
+        flash: cfg.flash.unwrap_or(0.0),
+        grade: if cfg.grade { WORLD_GRADE } else { 0.0 },
     };
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     renderer.render(&mut encoder, &target.view, &params);
@@ -527,7 +546,18 @@ fn run_bench(cfg: &Config) {
     println!("{:<14}{:<20}{:>9}{:>9}{:>9}{:>9}", "view", "variant", "total", "march", "post", "worst");
     for (name, cam) in &views {
         for (label, shadows, ao, outlines) in variants {
-            let params = FrameParams { camera: cam, capsules: &[], brush: None, time: 0.0, shadows, ao, outlines };
+            let params = FrameParams {
+                camera: cam,
+                capsules: &[],
+                blood: &[],
+                brush: None,
+                time: 0.0,
+                shadows,
+                ao,
+                outlines,
+                flash: 0.0,
+                grade: WORLD_GRADE,
+            };
             let t = time_frames(&gpu, &mut renderer, &target, &params, frames);
             println!("{name:<14}{label:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", t.total, t.march, t.post, t.worst);
         }
@@ -546,7 +576,18 @@ fn run_bench(cfg: &Config) {
     let positions: Vec<Vec3> = worms.iter().map(|w| w.pos).collect();
     let anims: Vec<worms::Anim> = worms.iter().map(|_| worms::Anim::default()).collect();
     let capsules = worms::capsules(&worms, &positions, &anims);
-    let with = FrameParams { camera: &views[0].1, capsules: &capsules, brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
+    let with = FrameParams {
+        camera: &views[0].1,
+        capsules: &capsules,
+        blood: &[],
+        brush: None,
+        time: 0.0,
+        shadows: true,
+        ao: true,
+        outlines: true,
+        flash: 0.0,
+        grade: WORLD_GRADE,
+    };
     let without = FrameParams { capsules: &[], ..with };
     // Alternate the two, best of five rounds each: a clock change on this GPU is
     // slow and large, and measured one after the other it would land on one variant.
@@ -563,7 +604,18 @@ fn run_bench(cfg: &Config) {
 
     // Edit cost: the CPU edit, the texture upload, and the frame after it.
     let cam = &views[0].1;
-    let params = FrameParams { camera: cam, capsules: &[], brush: None, time: 0.0, shadows: true, ao: true, outlines: true };
+    let params = FrameParams {
+        camera: cam,
+        capsules: &[],
+        blood: &[],
+        brush: None,
+        time: 0.0,
+        shadows: true,
+        ao: true,
+        outlines: true,
+        flash: 0.0,
+        grade: WORLD_GRADE,
+    };
     // A rocket's crater (r = 3 m) and a Nova's (r = 8 m). The Nova ones are 9 m
     // apart, so they overlap and the later ones are a little cheaper than the first.
     let n = 100;
@@ -616,6 +668,8 @@ struct Viewer {
     prev_pos: Vec<Vec3>,
     /// Per-worm animation clocks: gait phase, action age, blink and so on.
     anims: Vec<worms::Anim>,
+    /// Environment desaturation, 0..1 (`C` toggles it for an A/B).
+    grade: f32,
     seq: u32,
     /// Fireballs and beams, started by the sim's events.
     effects: Effects,
@@ -730,6 +784,7 @@ impl Viewer {
             effects: Effects::default(),
             audio,
             feel: CameraFeel::default(),
+            grade: WORLD_GRADE,
             step_dist: vec![0.0; worms],
             before: vec![(true, 0.0); worms],
             weapon: 0,
@@ -853,6 +908,7 @@ impl Viewer {
             KeyCode::KeyG => self.shadows = !self.shadows,
             KeyCode::KeyH => self.ao = !self.ao,
             KeyCode::KeyO => self.outlines = !self.outlines,
+            KeyCode::KeyC => self.grade = if self.grade > 0.0 { 0.0 } else { WORLD_GRADE },
             KeyCode::KeyM => {
                 let muted = self.audio.toggle_mute();
                 println!("sound {}", if muted { "muted" } else { "on" });
@@ -938,6 +994,9 @@ impl Viewer {
         // long stall cannot trigger a burst of ticks.) What is left in `acc` is
         // how far we are into the next tick; `frame` uses it to draw smoothly.
         self.acc += dt;
+        // Decay the screen flash here, not in `CameraFeel::update`: that one is
+        // skipped in fly mode, and a flash must never get stuck on screen.
+        self.feel.tick(dt);
         let mut input = self.worm_input();
         let t = Instant::now();
         let mut ticks = 0;
@@ -981,6 +1040,9 @@ impl Viewer {
                     // shoves the view, a bomblet does not.
                     self.feel.shake(look.shake * falloff * falloff);
                     self.feel.punch(look.fov * falloff);
+                    // The flash tracks the lens punch: a Nova whites the frame
+                    // out, a bomblet is only a blink.
+                    self.feel.burst((look.fov / 4.5 * 0.65 * falloff).clamp(0.0, 0.85));
                     self.feel.kick(
                         &self.camera,
                         Kick {
@@ -1020,14 +1082,26 @@ impl Viewer {
                     let hurt = if victim == 0 { 1.6 } else { 1.0 };
                     let look = feel::hit(weapon);
                     self.feel.shake(look.shake * hurt * (1.0 - away / 18.0).clamp(0.0, 1.0));
+                    // Taking a hit blinks the frame; hitting someone else does
+                    // not, or a blaster duel would strobe.
+                    if victim == 0 {
+                        self.feel.burst((0.12 + look.shake * 6.0).min(0.45));
+                    }
                 }
-                Event::Died { victim, pos, .. } => {
+                Event::Died { victim, killer, pos } => {
                     // A death is a fountain, not a puff: the body comes apart
                     // in front of the killer.
                     self.effects.blood(pos, Vec3::Y, 120.0, &self.world.grid);
                     let away = (pos - self.camera.pos).length();
                     let amount = if victim == 0 { 0.080 } else { 0.045 };
                     self.feel.shake(amount * (1.0 - away / 30.0).clamp(0.0, 1.0));
+                    // A kill is the one confirmation the player should feel:
+                    // a short white frame, not a full explosion white-out.
+                    if killer == 0 && victim != 0 {
+                        self.feel.burst(0.30);
+                    } else if victim == 0 {
+                        self.feel.burst(0.22);
+                    }
                 }
                 _ => {}
             }
@@ -1203,7 +1277,10 @@ impl Viewer {
             }
         }
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
-        capsules.extend(self.effects.capsules());
+        capsules.extend(self.effects.core_capsules());
+        // Cosmetic blood travels in its own pool, so it can never trim the
+        // worms, the aim aid or a rocket.
+        let blood = self.effects.blood_capsules();
         // Show where a dig would land (or, flying, where the brush would).
         let brush = if self.fly {
             aim_point(&self.world.grid, &self.camera).map(|p| (p, self.brush_radius))
@@ -1229,11 +1306,14 @@ impl Viewer {
         let params = FrameParams {
             camera: &render_camera,
             capsules: &capsules,
+            blood: &blood,
             brush,
             time: (now - self.started).as_secs_f32(),
             shadows: self.shadows,
             ao: self.ao,
             outlines: self.outlines,
+            flash: if self.fly { 0.0 } else { self.feel.flash() },
+            grade: self.grade,
         };
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.renderer.render(&mut encoder, &view, &params);

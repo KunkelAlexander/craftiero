@@ -59,20 +59,40 @@ impl Gpu {
 /// the textures and is updated by `Renderer::sync`.
 pub struct FrameParams<'a> {
     pub camera: &'a Camera,
-    /// Worms, guns, ropes and effects (at most `MAX_CAPSULES`, the rest are dropped).
+    /// Gameplay primitives: worms, guns, ropes, projectiles, aim aids and
+    /// non-blood effects. At most `MAX_CAPSULES`; the rest are dropped.
     pub capsules: &'a [DrawPrim],
+    /// Cosmetic blood droplets and stains, in their own `MAX_BLOOD_CAPSULES`
+    /// pool. They can never push a gameplay primitive out.
+    pub blood: &'a [DrawPrim],
     /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
     pub brush: Option<(Vec3, f32)>,
     pub time: f32,
     pub shadows: bool,
     pub ao: bool,
     pub outlines: bool,
+    /// Screen flash, 0..1. A blast or a hit fills a frame with hot white and
+    /// splits the lens for a blink.
+    pub flash: f32,
+    /// How far the environment is pulled towards grey, 0..1. Characters,
+    /// weapons and blood are not affected: they are the only colour left.
+    pub grade: f32,
 }
 
-/// How many primitives the shader's uniform block holds (`array<Prim, 256>`).
-/// Raised above 128 so four worms can each carry an oversized, multi-part weapon
-/// with room left over for projectiles and effects.
+/// Gameplay primitives: worms, guns, ropes, projectiles, aim aids and the
+/// non-blood effects. Four worms with oversized guns take a little over 200,
+/// so 256 leaves room for a busy fight.
 pub const MAX_CAPSULES: usize = 256;
+
+/// A separate pool for blood droplets and stains. Cosmetic, so it must never
+/// evict a worm or a rocket, and a crowded fight must never erase a wound.
+/// The two pools are packed back-to-back in the shader's uniform array; the
+/// renderer truncates each on its own.
+pub const MAX_BLOOD_CAPSULES: usize = 128;
+
+/// The total uniform array. MUST stay a multiple of 32 (one tile-mask word per
+/// 32 primitives) and inside the 64 KB uniform limit; 384 is 12 words.
+pub const MAX_PRIMS: usize = MAX_CAPSULES + MAX_BLOOD_CAPSULES;
 
 /// One primitive the raymarcher intersects in closed form (no sphere tracing),
 /// so each stays a handful of multiplications per pixel. Worms are mostly
@@ -207,17 +227,20 @@ struct Uniforms {
     flags: [f32; 4],
     size: [f32; 4],
     counts: [f32; 4], // x: number of primitives in use, y: shadow casters (the first y)
-    capsules: [GpuPrim; MAX_CAPSULES],
+    /// x: screen flash 0..1, y: environment desaturation 0..1. zw reserved.
+    fx: [f32; 4],
+    capsules: [GpuPrim; MAX_PRIMS],
     tiles: [[u32; 4]; TILE_WORDS * TILES_X * TILES_Y / 4],
 }
 
 /// The number of 4-tile groups in one word of the tile masks.
 const TILE_GROUPS: usize = TILES_X * TILES_Y / 4;
 
-/// How many 32-bit words a tile mask needs to cover every capsule bit. This is
-/// the one number that grows with `MAX_CAPSULES`: 64 capsules fit in two words,
-/// 128 in four. `tile_masks` packs that many blocks and the shader reads them.
-pub const TILE_WORDS: usize = MAX_CAPSULES / 32;
+/// How many 32-bit words a tile mask needs to cover every primitive bit. This
+/// is the one number that grows with `MAX_PRIMS`: 64 primitives fit in two
+/// words, 384 in twelve. `tile_masks` packs that many blocks and the shader
+/// reads them.
+pub const TILE_WORDS: usize = MAX_PRIMS / 32;
 
 /// For every screen tile, which capsules (bit i = capsule i) might be seen in it.
 /// Conservative: a tile may be marked without a capsule in it, never the reverse.
@@ -632,14 +655,18 @@ impl Renderer {
         let aspect = self.screen.0 as f32 / self.screen.1 as f32;
         let (brush_pos, brush_r) = f.brush.unwrap_or((Vec3::ZERO, 0.0));
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        // Shadow casters first: the shader's shadow loop runs over just those.
-        let ordered: Vec<&DrawPrim> = (f.capsules.iter().filter(|c| c.shadow()))
+        // Two independent pools. Gameplay keeps its shape; blood is appended
+        // after it and can only be truncated within its own 128 slots, so a
+        // worm, rocket or aim mark can never be evicted by a splash.
+        let core: Vec<&DrawPrim> = (f.capsules.iter().filter(|c| c.shadow()))
             .chain(f.capsules.iter().filter(|c| !c.shadow()))
             .take(MAX_CAPSULES)
             .collect();
-        let casters = ordered.iter().filter(|c| c.shadow()).count();
+        let casters = core.iter().filter(|c| c.shadow()).count();
+        let blood = &f.blood[..f.blood.len().min(MAX_BLOOD_CAPSULES)];
+        let ordered: Vec<&DrawPrim> = core.iter().copied().chain(blood.iter()).collect();
         let tiles = tile_masks(cam, aspect, &ordered);
-        let mut capsules = [GpuPrim::zeroed(); MAX_CAPSULES];
+        let mut capsules = [GpuPrim::zeroed(); MAX_PRIMS];
         let used = ordered.len();
         for (gpu, c) in capsules.iter_mut().zip(&ordered) {
             *gpu = pack(c);
@@ -654,6 +681,7 @@ impl Renderer {
             flags: [f.time, flag(f.shadows), flag(f.ao), flag(f.outlines)],
             size: [self.gbuf.0 as f32, self.gbuf.1 as f32, self.screen.0 as f32, self.screen.1 as f32],
             counts: [used as f32, casters as f32, 0.0, 0.0],
+            fx: [f.flash.clamp(0.0, 1.0), f.grade.clamp(0.0, 1.0), 0.0, 0.0],
             capsules,
             tiles,
         };
@@ -1136,6 +1164,15 @@ mod tests {
         assert_eq!(smoke.c[3], 2.0, "no outline");
     }
 
+    #[test]
+    fn the_uniform_block_fits_the_gpu_limit() {
+        // The pools are a fixed-size uniform array; doubling one without
+        // checking this would fail at pipeline creation, not at compile time.
+        let bytes = std::mem::size_of::<Uniforms>();
+        assert!(bytes <= 64 * 1024, "the uniform block is {bytes} bytes");
+        assert_eq!(MAX_PRIMS % 32, 0, "every tile word must be full");
+    }
+
     fn bit_set(masks: &[[u32; 4]], tx: usize, ty: usize, bit: usize) -> bool {
         let k = ty * TILES_X + tx;
         let groups = TILES_X * TILES_Y / 4;
@@ -1225,14 +1262,16 @@ mod tests {
 
     #[test]
     fn tile_masks_cover_capsules_in_every_word() {
-        // Bits 39 and 100 land in the second and fourth words: a capsule must
-        // still be visible there, or everything past word zero disappears.
+        // Bits 39, 100 and 300 land in different words (300 is in the blood
+        // pool): a primitive must still be visible there, or everything past
+        // word zero disappears.
         let capsule = caps(Vec3::new(0.0, 0.0, 10.0), Vec3::new(0.0, 1.0, 10.0), 0.5);
-        let refs: Vec<&DrawPrim> = (0..MAX_CAPSULES).map(|_| &capsule).collect();
+        let refs: Vec<&DrawPrim> = (0..MAX_PRIMS).map(|_| &capsule).collect();
         let cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 70f32.to_radians() };
         let masks = tile_masks(&cam, 16.0 / 9.0, &refs);
         assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 39));
         assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 100));
+        assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 300));
     }
 
     #[test]

@@ -116,6 +116,9 @@ pub struct CameraFeel {
     /// 0..1 of a weapon wind-up in progress. A full charge narrows the view a
     /// little, so the release has something to open from.
     charge: f32,
+    /// Screen flash left this frame, 0..1. Set by blasts and hits, decayed by
+    /// `tick`; the post pass turns it into a white frame and a lens split.
+    flash: f32,
     /// The first update snaps instead of easing from nowhere.
     started: bool,
 }
@@ -154,6 +157,9 @@ const CLIMB_MAX: f32 = 0.09;
 const FOV_TAU: f32 = 0.07;
 /// A full wind-up narrows the view by about 6 degrees.
 const CHARGE_SQUEEZE: f32 = 0.10;
+/// Screen flash: a short fuse, because a flash that lingers reads as fog. At
+/// 75 ms the frame is white for two or three frames at 60 Hz, then gone.
+const FLASH_TAU: f32 = 0.075;
 
 impl Default for CameraFeel {
     fn default() -> CameraFeel {
@@ -170,6 +176,7 @@ impl Default for CameraFeel {
             climb_vel: 0.0,
             fov_kick: 0.0,
             charge: 0.0,
+            flash: 0.0,
             started: false,
         }
     }
@@ -284,6 +291,26 @@ impl CameraFeel {
         self.shake = self.shake.max(metres.clamp(0.0, SHAKE_MAX));
     }
 
+    /// Fire the screen flash. The strongest recent event wins, so a Nova's
+    /// white-out is not cancelled by the blaster tick that lands next frame.
+    pub fn burst(&mut self, amount: f32) {
+        self.flash = self.flash.max(amount.clamp(0.0, 1.0));
+    }
+
+    /// The flash left this frame, 0..1.
+    pub fn flash(&self) -> f32 {
+        self.flash
+    }
+
+    /// Fade the flash. This is called once per frame even while flying, so a
+    /// flash left over from combat cannot stick to the screen.
+    pub fn tick(&mut self, dt: f32) {
+        self.flash *= (-dt.max(0.0) / FLASH_TAU).exp();
+        if self.flash < 1.0e-3 {
+            self.flash = 0.0;
+        }
+    }
+
     /// Add one shot's punch. `cam` is the clean camera, used only for its axes.
     /// This is applied only when drawing, so holding the trigger cannot walk
     /// the aim.
@@ -322,6 +349,7 @@ impl CameraFeel {
         self.climb = 0.0;
         self.climb_vel = 0.0;
         self.fov_kick = 0.0;
+        self.flash = 0.0;
         self.charge = 0.0;
     }
 }
@@ -512,6 +540,24 @@ mod tests {
         assert!((feel.shake - 0.20).abs() < 1.0e-6, "a Nova is felt: {}", feel.shake);
         feel.shake(1.0);
         assert!((feel.shake - SHAKE_MAX).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_blast_flashes_the_screen_then_gets_out_of_the_way() {
+        let mut feel = CameraFeel::default();
+        feel.burst(0.5);
+        assert!((feel.flash() - 0.5).abs() < 1.0e-6);
+        // The strongest recent event wins, so a following small hit cannot
+        // cancel the Nova's white-out.
+        feel.burst(0.1);
+        assert!((feel.flash() - 0.5).abs() < 1.0e-6);
+        // Three frames at 60 Hz: still bright. A fifth of a second later: gone.
+        for _ in 0..3 {
+            feel.tick(1.0 / 60.0);
+        }
+        assert!(feel.flash() > 0.25, "a flash lasts a blink: {}", feel.flash());
+        feel.tick(0.2);
+        assert!(feel.flash() < 0.02, "but not two: {}", feel.flash());
     }
 
     #[test]

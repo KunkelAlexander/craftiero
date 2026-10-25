@@ -307,6 +307,14 @@ impl World {
     fn shot_plan(&self, i: usize) -> (Vec3, Vec3) {
         let worm = &self.worms[i];
         let aim = worm.aim_dir();
+        let def = &WEAPONS[worm.weapons[worm.current].id as usize];
+        // A lobbed weapon is not aimed at the crosshair: it is aimed by the
+        // landing mark. Its barrel points along the lofted launch direction,
+        // and the convergence below would fight the arc, so skip it.
+        if def.loft > 0.0 {
+            let shot = def.launch_dir(aim);
+            return (worm.muzzle() + shot * MUZZLE, shot);
+        }
         let eye = worm.eye();
         // How far the eye ray reaches before it hits rock. With nothing in
         // reach, the crosshair is far enough away that the correction is nil.
@@ -990,7 +998,18 @@ impl World {
     /// so the rock that a blast destroys still shields you from that blast.
     fn explode(&mut self, pos: Vec3, weapon: u8, owner: usize) {
         let def = &WEAPONS[weapon as usize];
-        self.events.push(Event::Explosion { weapon, pos, radius: def.blast_radius });
+        // The gradient of the distance field is the surface normal. Only trust
+        // it close to rock: a shell that burst against a worm in open air is
+        // nowhere near a surface, and the ring should fall back to flat air.
+        let normal = {
+            let n = self.grid.gradient(pos);
+            if self.grid.sample(pos).abs() < 1.5 && n.length_squared() > 1.0e-6 {
+                n.normalize()
+            } else {
+                Vec3::Y
+            }
+        };
+        self.events.push(Event::Explosion { weapon, pos, normal, radius: def.blast_radius });
 
         for v in 0..self.worms.len() {
             if !self.worms[v].alive {
@@ -1166,9 +1185,11 @@ mod tests {
 
     #[test]
     fn a_cluster_shows_its_arc_and_where_it_will_land() {
-        let mut w = arena(flat, &[(16.0, 16.0)]);
-        // Aim slightly down, so the shell arcs into the ground in front of the
-        // worm rather than flying over the arena wall.
+        // A bigger arena than the others: the mortar's minimum arc now carries
+        // it farther than the 32 m test box, and the point is to land on ground.
+        let mut w = World::new(Grid::from_fn(IVec3::new(16, 4, 16), flat), &[(16.0, 16.0)], 1);
+        run(&mut w, 30);
+        // Aim slightly down: the launch loft turns that into a still-useful arc.
         w.worms[0].pitch = -0.18;
         w.worms[0].current = CLUSTER as usize;
         let path = w.aim_path(0).expect("a lobbed weapon has a path");
@@ -1274,6 +1295,25 @@ mod tests {
     }
 
     #[test]
+    fn the_cluster_is_a_mortar_that_launches_upward() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        w.worms[0].current = CLUSTER as usize;
+        // Even a level or downward crosshair must not fire a flat shell: the
+        // weapon's whole identity is the arc.
+        for pitch in [0.0, -0.5] {
+            w.worms[0].pitch = pitch;
+            let (_, shot) = w.shot_plan(0);
+            assert!(shot.y > 0.15, "a mortar arcs upward: {shot:?}");
+        }
+        // And the preview is the same arc the shell will fly.
+        w.worms[0].pitch = 0.0;
+        let path = w.aim_path(0).expect("a mortar shows its arc");
+        let peak = path.points.iter().map(|p| p.y).fold(0.0, f32::max);
+        let ground = w.worms[0].pos.y;
+        assert!(peak > ground + 3.0, "the arc climbs: peak {peak} from {ground}");
+    }
+
+    #[test]
     fn a_blast_and_a_hit_name_the_weapon_that_caused_them() {
         // The viewer, the audio and the camera each author their response per
         // weapon, so the event has to carry which one it was.
@@ -1281,6 +1321,11 @@ mod tests {
         let mut events = shoot(&mut w, ROCKET, -0.2);
         events.extend(run(&mut w, 60));
         assert!(events.iter().any(|e| matches!(e, Event::Explosion { weapon: ROCKET, .. })));
+        let ground = events
+            .iter()
+            .find_map(|e| if let Event::Explosion { normal, .. } = e { Some(*normal) } else { None })
+            .expect("the rocket exploded");
+        assert!(ground.y > 0.5, "the ring lies on the ground: {ground:?}");
 
         let mut w = arena(flat, &[(16.0, 16.0)]);
         let mut events = hold(&mut w, NOVA, -0.2, 90);

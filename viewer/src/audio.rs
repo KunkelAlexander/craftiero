@@ -941,13 +941,13 @@ mod tests {
     #[test]
     fn a_bigger_blast_lasts_longer() {
         let mut small = Sfx::new(48_000.0);
-        small.play(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, radius: 1.8 }, Vec3::ZERO, Vec3::X);
+        small.play(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, normal: Vec3::Y, radius: 1.8 }, Vec3::ZERO, Vec3::X);
         let s = render(&mut small, 0.4);
         assert!(peak(&s) > 0.01);
         assert!(peak(&render(&mut small, 1.2)) < 0.02, "a bomblet is over in about a second");
 
         let mut big = Sfx::new(48_000.0);
-        big.play(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
+        big.play(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, normal: Vec3::Y, radius: 8.0 }, Vec3::ZERO, Vec3::X);
         let b = render(&mut big, 0.4);
         assert!(rms(&b) > rms(&s) * 1.5);
         assert!(peak(&render(&mut big, 1.5)) > 0.01, "the Nova still rumbles a second later");
@@ -956,11 +956,11 @@ mod tests {
     #[test]
     fn a_bomb_and_a_rocket_have_different_voices() {
         let mut bomb = Sfx::new(48_000.0);
-        bomb.play(&Event::Explosion { weapon: BOMB, pos: Vec3::ZERO, radius: 4.0 }, Vec3::ZERO, Vec3::X);
+        bomb.play(&Event::Explosion { weapon: BOMB, pos: Vec3::ZERO, normal: Vec3::Y, radius: 4.0 }, Vec3::ZERO, Vec3::X);
         let b = render(&mut bomb, 1.0);
 
         let mut rocket = Sfx::new(48_000.0);
-        rocket.play(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, radius: 3.0 }, Vec3::ZERO, Vec3::X);
+        rocket.play(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, normal: Vec3::Y, radius: 3.0 }, Vec3::ZERO, Vec3::X);
         let r = render(&mut rocket, 1.0);
 
         // The bomb is the longer, heavier one; the rocket is over sooner.
@@ -1002,7 +1002,7 @@ mod tests {
         assert!(rms(&nova) > rms(&blaster) * 6.0, "and dwarf the Blaster: {} vs {}", rms(&nova), rms(&blaster));
 
         let mut boom = Sfx::new(48_000.0);
-        boom.play(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, radius: 8.0 }, Vec3::ZERO, Vec3::X);
+        boom.play(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, normal: Vec3::Y, radius: 8.0 }, Vec3::ZERO, Vec3::X);
         let one_second = render(&mut boom, 1.0);
         assert!(rms(&one_second) > 0.30, "a Nova is a wall of sound: {}", rms(&one_second));
         // Still rolling two and a half seconds after the flash.

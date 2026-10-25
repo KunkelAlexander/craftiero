@@ -23,9 +23,14 @@ also has its own synthesised voice: a dry blaster tick, a rocket thump, a
 railgun crack with a ringing tail, and a cavern-sized Nova. The same weapon id
 shapes the picture too: a rocket blooms orange, a bomb throws dirt under a long
 dark cloud, and a Nova is ice-white with a shockwave; hits spark in the weapon's
-colour and shake the camera by its weight. Hits are loud in the Liero sense:
+colour and shake the camera by its weight. The Cluster is a real mortar: its
+barrel points up and every shell leaves on a lofted arc, even aiming level.
+Hits are loud in the Liero sense:
 the victim flashes white and flinches, blood arcs out and stains the rock, and
-a wounded worm carries a five-pip health bar over its head. Sounds are panned
+a wounded worm carries a five-pip health bar over its head. Blasts and taking a
+hit flash the whole frame white for a blink, with a slight chromatic split. The
+world is graded a third towards grey by default, so the guns, blood and health
+pips are the only strong colour on screen (`C` A/Bs the grade). Sounds are panned
 and muffled by distance. The rules run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
@@ -83,6 +88,7 @@ cargo run -p viewer --release -- --shot out.png --worm 64,38,200 --cam 64,19.5,3
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 66.5,19.4,41,226,-11 --weapon 8
 cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 58,19,30,56,-10 --hurt 34
+cargo run -p viewer --release -- --shot out.png --worm 64,38,0 --cam 58,19,30,56,-10 --hurt 34 --flash 0.6
 cargo run -p viewer --release -- --bench --size 1920x1080
 cargo test -p sdf -p sim -p viewer
 ```
@@ -97,6 +103,8 @@ catches the blast, and `--fire 11,28` catches the whip at full crack.
 the character, and `--no-aim` hides the weapon aim aid: lobbed arcs, blast rings
 and ricochet marks. `--hurt damage` wounds the worm first, so one PNG shows the
 blood spray, the hurt flash and the health bar without needing a second player.
+`--flash 0..1` previews the post-process impact flash, and `--no-grade` turns off
+the world desaturation (the same A/B as the `C` key).
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.

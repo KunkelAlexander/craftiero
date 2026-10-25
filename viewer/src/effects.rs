@@ -16,19 +16,19 @@ use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM
 use sim::{whip_path, AimPath, Event, Projectile, Worm, DT, WHIP_POINTS};
 use std::f32::consts::TAU;
 
-/// The renderer holds `MAX_CAPSULES` (256) primitives in total, and worms,
-/// projectiles and the aim aid are drawn before effects. Keep the cosmetic
-/// lists small so a busy fight drops dust instead of rockets.
+/// Gameplay effects share the renderer's 256-slot core pool with the worms,
+/// projectiles and aim aid. Keep these lists small so a busy fight drops dust
+/// instead of rockets.
 const MAX_BURSTS: usize = 24;
 const MAX_DUST: usize = 20;
 /// Air traces. They are the first thing to drop when a fight is busy, because
 /// they are the least important: the shot itself still has to be drawn.
 const MAX_TRAILS: usize = 24;
-/// Droplets are short-lived, so a busy fight recycles them quickly. Splats are
-/// the marks they leave: a separate, small budget, because a blot on the rock
-/// should outlive the flash without ever evicting a rocket.
-const MAX_BLOOD: usize = 36;
-const MAX_SPLATS: usize = 14;
+/// Blood has its own 128-slot renderer pool, which gameplay cannot evict. These
+/// two lists feed it: stains are queued first, so a full pool loses droplets,
+/// never the marks on the floor.
+const MAX_BLOOD: usize = 128;
+const MAX_SPLATS: usize = 48;
 
 const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
 
@@ -40,13 +40,27 @@ const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
 /// droplets are self-lit so they stay legible in a dark crater; the splats are
 /// darker because a stain on rock should look like a stain, not a lamp.
 const BLOOD: Vec3 = Vec3::new(0.78, 0.035, 0.045);
-const BLOOD_DARK: Vec3 = Vec3::new(0.36, 0.012, 0.020);
+const BLOOD_DARK: Vec3 = Vec3::new(0.50, 0.018, 0.028);
 
 /// A deterministic 0..1 from a float. Blood spray must look violent, but the
 /// viewer has no RNG: the same hit in a replay must throw the same droplets.
 fn noise(seed: f32) -> f32 {
     let s = (seed * 12.9898).sin() * 43758.5453;
     s - s.floor()
+}
+
+/// Two unit vectors spanning the plane normal to `normal`: a shock ring lies in
+/// that plane, so an explosion on a wall paints the wall instead of cutting a
+/// flat circle through the rock. A degenerate normal falls back to the ground.
+fn plane_tangents(normal: Vec3) -> (Vec3, Vec3) {
+    let n = if normal.length_squared() > 1.0e-6 { normal.normalize() } else { Vec3::Y };
+    let mut side = n.cross(Vec3::Y);
+    if side.length_squared() < 1.0e-4 {
+        side = n.cross(Vec3::X);
+    }
+    let side = side.normalize_or_zero();
+    let up = side.cross(n).normalize_or_zero();
+    (side, up)
 }
 
 /// A frame along the direction of travel: forward, a perpendicular, and up.
@@ -300,8 +314,8 @@ enum Shape {
     Ball { at: Vec3, radius: f32 },
     /// A beam or a tracer: a thin line that thins out.
     Line { from: Vec3, to: Vec3 },
-    /// A shockwave ring, expanding along the ground plane from a blast.
-    Ring { at: Vec3, radius: f32 },
+    /// A shockwave ring, expanding in the plane of the surface it hit.
+    Ring { at: Vec3, normal: Vec3, radius: f32 },
     /// A blood splat lying on the rock: one flattened lozenge on `normal`.
     Splat { at: Vec3, normal: Vec3, radius: f32 },
 }
@@ -384,7 +398,9 @@ impl Effect {
             vel: Vec3::ZERO,
             gravity: 0.0,
             age: 0.0,
-            life: 9.0,
+            // Long enough that a fight leaves a readable floor, short enough
+            // that the pool recycles instead of becoming permanent.
+            life: 14.0,
             burst: false,
             width: 0.0,
             hot: false,
@@ -395,9 +411,9 @@ impl Effect {
 
     /// A shockwave ring: it grows out to `radius`, thins and fades. Self-lit and
     /// inkless, so it reads as a wave of air rather than a drawn circle.
-    fn ring(at: Vec3, radius: f32, colour: Vec3, life: f32) -> Effect {
+    fn ring(at: Vec3, normal: Vec3, radius: f32, colour: Vec3, life: f32) -> Effect {
         Effect {
-            shape: Shape::Ring { at, radius },
+            shape: Shape::Ring { at, normal, radius },
             colour,
             vel: Vec3::ZERO,
             gravity: 0.0,
@@ -415,6 +431,70 @@ impl Effect {
 fn styled(prim: DrawPrim, e: &Effect) -> DrawPrim {
     let prim = if e.hot { prim.glowing() } else { prim };
     if e.inkless { prim.inkless() } else { prim }
+}
+
+/// Turn a run of effects into primitives. Shared by the gameplay pool and the
+/// blood pool so the two cannot drift apart in how they draw.
+fn draw_effects<'a>(iter: impl Iterator<Item = &'a Effect>, out: &mut Vec<DrawPrim>) {
+    for e in iter {
+        let u = (e.age / e.life).clamp(0.0, 1.0);
+        match &e.shape {
+            Shape::Ball { at, radius } => {
+                // A burst grows in the first third, then shrinks; dust only
+                // shrinks, so it looks like it is settling.
+                let size = if e.burst {
+                    if u < 0.35 { u / 0.35 } else { 1.0 - (u - 0.35) / 0.65 }
+                } else {
+                    1.0 - u
+                };
+                // A capsule needs a direction: a stub makes a sphere.
+                let ball = DrawPrim::capsule(*at, *at + Vec3::Y * 0.01, *radius * size, e.colour, false);
+                out.push(styled(ball, e));
+            }
+            Shape::Line { from, to } => {
+                let line = DrawPrim::capsule(*from, *to, e.width * (1.0 - u), e.colour, false);
+                out.push(styled(line, e));
+            }
+            Shape::Ring { at, normal, radius } => {
+                // Expand from a tight knot to the blast radius, thinning as
+                // it goes, in the plane of the surface the blast hit. Eighteen
+                // segments keeps the circle smooth; the ring is one effect, so
+                // the budget stays predictable.
+                let r = *radius * (0.15 + 0.85 * u);
+                let width = (0.03 + radius * 0.015) * (1.0 - u).max(0.0);
+                let (side, up) = plane_tangents(*normal);
+                let n = 18;
+                for k in 0..n {
+                    let a0 = k as f32 * TAU / n as f32;
+                    let a1 = (k + 1) as f32 * TAU / n as f32;
+                    let p0 = *at + (side * a0.cos() + up * a0.sin()) * r;
+                    let p1 = *at + (side * a1.cos() + up * a1.sin()) * r;
+                    out.push(styled(DrawPrim::capsule(p0, p1, width, e.colour, false), e));
+                }
+            }
+            Shape::Splat { at, normal, radius } => {
+                // One flat lozenge lying on the surface. Varying its angle
+                // and length with a hash keeps a wall of splats from looking
+                // stamped; it dries (darkens and thins) over its long life.
+                let dry = if u < 0.70 { 1.0 } else { 1.0 - (u - 0.70) / 0.30 };
+                let base = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
+                let base = if base.length_squared() > 1.0e-4 { base.normalize() } else { Vec3::X };
+                let spin = noise(at.x * 2.3 + at.z * 1.7) * TAU;
+                let (s, c) = spin.sin_cos();
+                let dir = base * c + normal.cross(base) * s;
+                // Short and fat: a pool, not a dash. Long, thin splats read as
+                // debris shadows on the grass; a broad lozenge reads as blood.
+                let long = *radius * (0.30 + 0.25 * noise(at.z * 3.1 + at.x));
+                let a = *at - dir * long;
+                let b = *at + dir * long * 0.75;
+                let colour = e.colour * (0.45 + 0.55 * dry);
+                out.push(styled(
+                    DrawPrim::capsule(a, b, *radius * 0.80 * dry.max(0.35), colour, false),
+                    e,
+                ));
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -441,8 +521,8 @@ impl Effects {
     /// Start whatever effect `event` calls for (most events have none).
     pub fn add(&mut self, event: &Event) {
         match *event {
-            Event::Explosion { weapon, pos, radius } => {
-                self.blast(weapon, pos, radius);
+            Event::Explosion { weapon, pos, normal, radius } => {
+                self.blast(weapon, pos, normal, radius);
             }
             Event::Beam { from, to } => {
                 // A hot line, with a flash at each end: the muzzle it left and
@@ -515,7 +595,7 @@ impl Effects {
     /// One blast, authored by its weapon. The sim's `radius` is the *damage*
     /// reach, so every visible size is a fraction of it: the fireball stays
     /// proportional to what the weapon can hurt without hiding the fight.
-    fn blast(&mut self, weapon: u8, pos: Vec3, radius: f32) {
+    fn blast(&mut self, weapon: u8, pos: Vec3, normal: Vec3, radius: f32) {
         let look = feel::blast(weapon);
         // A white-hot core, then three fire layers thrown out from the centre.
         self.push_burst(
@@ -557,7 +637,9 @@ impl Effects {
             let scale = 1.0 - 0.18 * k as f32;
             let life = look.ring_life * (1.0 + 0.35 * k as f32);
             let colour = look.fire[0].lerp(Vec3::ONE, 0.35);
-            self.push_burst(Effect::ring(pos, radius * scale, colour, life));
+            // A few centimetres proud of the rock: the capsule has width, and a
+            // ring exactly on the surface would half-sink into it.
+            self.push_burst(Effect::ring(pos + normal * 0.05, normal, radius * scale, colour, life));
         }
     }
 
@@ -601,7 +683,10 @@ impl Effects {
         let chest = at + Vec3::Y * 0.95;
         let push = if dir.length_squared() > 1.0e-6 { dir.normalize() } else { Vec3::Y };
         let force = (damage / 28.0).clamp(0.35, 2.4);
-        let count = (6.0 + damage * 0.30).clamp(6.0, 30.0) as usize;
+        // Liero, not a nosebleed: roughly five times the old spray. The
+        // renderer's blood pool holds 128 primitives; the rest are dropped in
+        // its own pool, never from gameplay.
+        let count = (28.0 + damage * 1.40).clamp(28.0, 150.0) as usize;
 
         for i in 0..count {
             let seed = i as f32 * 1.7 + at.x * 3.1 + at.z * 1.3;
@@ -617,26 +702,27 @@ impl Effects {
                 Effect::puff(
                     chest + side * 0.10,
                     dir * speed,
-                    (0.045 + 0.025 * force) * (0.65 + 0.7 * noise(seed + 19.0)),
+                    (0.060 + 0.035 * force) * (0.65 + 0.7 * noise(seed + 19.0)),
                     BLOOD,
-                    0.45 + 0.55 * noise(seed + 23.0),
+                    0.55 + 0.65 * noise(seed + 23.0),
                     17.0,
                 )
                 .glow()
                 .inkless(),
             );
         }
-        // Two fat gobs, because Liero never believed in restraint.
-        for i in 0..2 {
+        // Fat gobs, because Liero never believed in restraint.
+        let gobs = (3.0 + damage / 25.0).clamp(3.0, 10.0) as usize;
+        for i in 0..gobs {
             let a = i as f32 * 2.399 + at.x;
             let side = Vec3::new(a.cos(), 0.0, a.sin());
             self.push_blood(
                 Effect::puff(
                     chest,
                     (push * 0.5 + Vec3::Y * 0.9 + side * 0.5).normalize_or_zero() * (4.5 + 2.5 * force),
-                    0.100 + 0.04 * force,
+                    0.115 + 0.045 * force,
                     BLOOD,
-                    0.55,
+                    0.60 + 0.10 * noise(a),
                     17.0,
                 )
                 .glow()
@@ -644,13 +730,14 @@ impl Effects {
             );
         }
 
-        // A stain under the body: a few points around the feet, each dropped
-        // onto the first surface below. Two to five, scaled by damage.
-        let n = (2.0 + damage * 0.035).clamp(2.0, 5.0) as usize;
+        // A stain under the body: eight to twenty-six points around the feet,
+        // each dropped onto the first surface below, and each bigger than the
+        // old marks. A full strike paints a rough ring around the worm.
+        let n = (8.0 + damage * 0.20).clamp(8.0, 26.0) as usize;
         for i in 0..n {
             let seed = i as f32 * 2.3 + at.x * 0.7 + at.z * 1.1;
             let a = seed * 2.399;
-            let off = Vec3::new(a.cos(), 0.0, a.sin()) * (0.55 + 0.85 * noise(seed + 5.0));
+            let off = Vec3::new(a.cos(), 0.0, a.sin()) * (0.60 + 1.0 * noise(seed + 5.0));
             let from = at + off + Vec3::Y * 1.4;
             if let Some(t) = grid.raycast(from, Vec3::NEG_Y, 6.0) {
                 let hit = from - Vec3::Y * t;
@@ -659,17 +746,28 @@ impl Effects {
                 self.push_splat(Effect::splat(
                     hit + normal * 0.015,
                     normal,
-                    0.12 + 0.08 * noise(seed + 13.0) + 0.03 * force,
+                    0.14 + 0.09 * noise(seed + 13.0) + 0.04 * force,
                 ));
             }
         }
-        // And one on the wall the spray is pointing at, so a hit in a corridor
-        // paints the corridor.
+        // And three on the wall the spray is pointing at, so a hit in a
+        // corridor paints the corridor instead of leaving one neat dot.
         if let Some(t) = grid.raycast(chest, push, 4.5) {
             let hit = chest + push * t;
             let normal = grid.gradient(hit);
             let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { -push };
-            self.push_splat(Effect::splat(hit + normal * 0.015, normal, 0.12 + 0.05 * force));
+            let side = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
+            let side = if side.length_squared() > 1.0e-4 { side.normalize() } else { Vec3::X };
+            let up = normal.cross(side).normalize_or_zero();
+            for k in 0..3 {
+                let a = k as f32 * 2.399 + at.x;
+                let off = side * (a.cos() * 0.34) + up * (a.sin() * 0.34);
+                self.push_splat(Effect::splat(
+                    hit + normal * 0.02 + off,
+                    normal,
+                    0.10 + 0.08 * noise(at.z + k as f32) + 0.02 * force,
+                ));
+            }
         }
     }
 
@@ -794,72 +892,28 @@ impl Effects {
         self.trails.retain(|e| e.age < e.life);
     }
 
+    /// The gameplay effects: blasts, beams, sparks, dust and trails. These
+    /// share the renderer's 256-slot core pool.
+    pub fn core_capsules(&self) -> Vec<DrawPrim> {
+        let mut out = Vec::with_capacity(self.list.len() + self.dust.len() + self.trails.len() + 16);
+        draw_effects(self.list.iter().chain(self.dust.iter()).chain(self.trails.iter()), &mut out);
+        out
+    }
+
+    /// The cosmetic pool: stains first (the evidence stays), then droplets.
+    /// The renderer keeps these separate from `core_capsules`, so blood can
+    /// never push a worm or a rocket out of the frame.
+    pub fn blood_capsules(&self) -> Vec<DrawPrim> {
+        let mut out = Vec::with_capacity(self.splats.len() + self.blood.len());
+        draw_effects(self.splats.iter().chain(self.blood.iter()), &mut out);
+        out
+    }
+
+    /// Everything, for tests that do not care about the pools.
+    #[cfg(test)]
     pub fn capsules(&self) -> Vec<DrawPrim> {
-        let mut out = Vec::with_capacity(
-            self.list.len() + self.blood.len() + self.splats.len() + self.dust.len() + self.trails.len() + 16,
-        );
-        for e in self
-            .list
-            .iter()
-            .chain(self.blood.iter())
-            .chain(self.splats.iter())
-            .chain(self.dust.iter())
-            .chain(self.trails.iter())
-        {
-            let u = (e.age / e.life).clamp(0.0, 1.0);
-            match &e.shape {
-                Shape::Ball { at, radius } => {
-                    // A burst grows in the first third, then shrinks; dust only
-                    // shrinks, so it looks like it is settling.
-                    let size = if e.burst {
-                        if u < 0.35 { u / 0.35 } else { 1.0 - (u - 0.35) / 0.65 }
-                    } else {
-                        1.0 - u
-                    };
-                    // A capsule needs a direction: a stub makes a sphere.
-                    let ball = DrawPrim::capsule(*at, *at + Vec3::Y * 0.01, *radius * size, e.colour, false);
-                    out.push(styled(ball, e));
-                }
-                Shape::Line { from, to } => {
-                    let line = DrawPrim::capsule(*from, *to, e.width * (1.0 - u), e.colour, false);
-                    out.push(styled(line, e));
-                }
-                Shape::Ring { at, radius } => {
-                    // Expand from a tight knot to the blast radius, thinning as
-                    // it goes. Eighteen segments keeps the circle smooth; the
-                    // ring is one effect, so the budget stays predictable.
-                    let r = *radius * (0.15 + 0.85 * u);
-                    let width = (0.03 + radius * 0.015) * (1.0 - u).max(0.0);
-                    let n = 18;
-                    for k in 0..n {
-                        let a0 = k as f32 * TAU / n as f32;
-                        let a1 = (k + 1) as f32 * TAU / n as f32;
-                        let p0 = *at + Vec3::new(a0.cos(), 0.0, a0.sin()) * r;
-                        let p1 = *at + Vec3::new(a1.cos(), 0.0, a1.sin()) * r;
-                        out.push(styled(DrawPrim::capsule(p0, p1, width, e.colour, false), e));
-                    }
-                }
-                Shape::Splat { at, normal, radius } => {
-                    // One flat lozenge lying on the surface. Varying its angle
-                    // and length with a hash keeps a wall of splats from looking
-                    // stamped; it dries (darkens and thins) over its long life.
-                    let dry = if u < 0.70 { 1.0 } else { 1.0 - (u - 0.70) / 0.30 };
-                    let base = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
-                    let base = if base.length_squared() > 1.0e-4 { base.normalize() } else { Vec3::X };
-                    let spin = noise(at.x * 2.3 + at.z * 1.7) * TAU;
-                    let (s, c) = spin.sin_cos();
-                    let dir = base * c + normal.cross(base) * s;
-                    let long = *radius * (0.75 + 0.35 * noise(at.z * 3.1 + at.x));
-                    let a = *at - dir * long;
-                    let b = *at + dir * long * 0.80;
-                    let colour = e.colour * (0.45 + 0.55 * dry);
-                    out.push(styled(
-                        DrawPrim::capsule(a, b, *radius * 0.52 * dry.max(0.35), colour, false),
-                        e,
-                    ));
-                }
-            }
-        }
+        let mut out = self.core_capsules();
+        out.extend(self.blood_capsules());
         out
     }
 
@@ -949,8 +1003,8 @@ mod tests {
         let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
         let mut e = Effects::default();
         e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::NEG_Z, 34.0, &grid);
-        assert!(e.blood.len() >= 8, "a spray, not a drop: {}", e.blood.len());
-        assert!(e.splats.len() >= 2, "blood marks the floor: {}", e.splats.len());
+        assert!(e.blood.len() >= 60, "a Liero spray, not a drop: {}", e.blood.len());
+        assert!(e.splats.len() >= 10, "blood marks the floor: {}", e.splats.len());
         for s in &e.splats {
             match &s.shape {
                 Shape::Splat { at, normal, radius } => {
@@ -966,6 +1020,19 @@ mod tests {
         assert!(e.blood.is_empty(), "the droplets have fallen");
         assert!(!e.splats.is_empty(), "the stains remain");
         assert_eq!(e.capsules().len(), e.splats.len(), "one cheap primitive per stain");
+    }
+
+    #[test]
+    fn blood_is_drawn_from_its_own_pool() {
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
+        let mut e = Effects::default();
+        // A gameplay effect to protect: a beam line.
+        e.add(&Event::Beam { from: Vec3::ZERO, to: Vec3::Z * 5.0 });
+        let core = e.core_capsules().len();
+        e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::Z, 70.0, &grid);
+        assert_eq!(e.core_capsules().len(), core, "blood never touches gameplay primitives");
+        assert!(!e.blood_capsules().is_empty());
+        assert_eq!(e.capsules().len(), core + e.blood_capsules().len(), "the test view sees both pools");
     }
 
     #[test]
@@ -1128,18 +1195,18 @@ mod tests {
     #[test]
     fn an_explosion_is_a_fireball_plus_dust() {
         let mut e = Effects::default();
-        e.add(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, radius: 3.0 });
+        e.add(&Event::Explosion { weapon: ROCKET, pos: Vec3::ZERO, normal: Vec3::Y, radius: 3.0 });
         assert!(count(&e) > 1, "the blast also kicks up dust: {}", count(&e));
     }
 
     #[test]
     fn a_nova_and_a_bomblet_are_different_pictures() {
         let mut nova = Effects::default();
-        nova.add(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, radius: 8.0 });
+        nova.add(&Event::Explosion { weapon: NOVA, pos: Vec3::ZERO, normal: Vec3::Y, radius: 8.0 });
         let mut pop = Effects::default();
-        pop.add(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, radius: 1.8 });
+        pop.add(&Event::Explosion { weapon: BOMBLET, pos: Vec3::ZERO, normal: Vec3::Y, radius: 1.8 });
 
-        // A Nova gets two shock rings, ten capsules each; a bomblet none.
+        // A Nova gets two shock rings, eighteen capsules each; a bomblet none.
         assert!(count(&nova) > count(&pop) * 3, "{} vs {}", count(&nova), count(&pop));
         // The rings expand: after a moment the widest primitive is far out.
         nova.update(0.2);
@@ -1153,5 +1220,22 @@ mod tests {
         nova.update(1.0);
         pop.update(1.0);
         assert!(count(&nova) > 0 && count(&pop) == 0, "the crater still smokes: {} {}", count(&nova), count(&pop));
+    }
+
+    #[test]
+    fn a_shock_ring_lies_on_the_surface_it_hit() {
+        // An explosion on a wall must paint the wall, not cut a flat ground
+        // ring through the rock. A ring with normal +X stays in the YZ plane.
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        let mut e = Effects::default();
+        e.push_burst(Effect::ring(at, Vec3::X, 5.0, Vec3::ONE, 0.5));
+        e.update(0.25);
+        let prims = e.capsules();
+        assert_eq!(prims.len(), 18, "one capsule per segment");
+        for p in &prims {
+            let a = a_of(p);
+            assert!((a.x - at.x).abs() < 1.0e-4, "the ring is in the wall plane: {a:?}");
+            assert!(a.distance(at) > 1.0, "and it has expanded: {a:?}");
+        }
     }
 }

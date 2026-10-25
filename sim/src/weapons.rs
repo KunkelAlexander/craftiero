@@ -13,6 +13,8 @@
 // the speeds were raised: the arena is 128 m wide, and a bolt that takes ten
 // seconds to cross it is no weapon.
 
+use glam::Vec3;
+
 /// The weapon id is its index in `WEAPONS`, and also its slot in a worm's
 /// inventory (every worm carries the whole arsenal), so `Input::weapon` is
 /// just an id.
@@ -87,6 +89,10 @@ pub struct WeaponDef {
     /// runs to completion: letting go does not cancel it, but switching weapons
     /// does. A heavy weapon's cost and its tell are the same number.
     pub windup: f32,
+    /// Extra elevation added to the shot, in radians: a mortar's arc. Zero for
+    /// a gun that fires straight down the reticle. The launch direction is
+    /// clamped so a lobbed weapon always arcs upward, even aiming down.
+    pub loft: f32,
     /// Rounds per magazine, and seconds to reload once it is empty.
     pub mag: u16,
     pub reload: f32,
@@ -132,6 +138,27 @@ impl WeaponState {
     }
 }
 
+impl WeaponDef {
+    /// The direction a shot really leaves the barrel: the aim raised by the
+    /// weapon's loft. A lobbed weapon keeps a minimum elevation, so a level or
+    /// downward crosshair still sends the shell up and over, and a maximum, so
+    /// aiming at the sky cannot turn the arc back through the worm.
+    pub fn launch_dir(&self, dir: Vec3) -> Vec3 {
+        if self.loft == 0.0 {
+            return dir;
+        }
+        let dir = if dir.length_squared() > 1.0e-8 { dir.normalize() } else { Vec3::Z };
+        // Keep the yaw the player aimed and bend the pitch. For a straight-up
+        // or straight-down aim the horizontal part has no direction; fall back
+        // to the +Z convention the rest of the aim code uses.
+        let flat = Vec3::new(dir.x, 0.0, dir.z);
+        let fwd = if flat.length_squared() > 1.0e-6 { flat.normalize() } else { Vec3::Z };
+        let pitch = (dir.y.clamp(-1.0, 1.0).asin() + self.loft).clamp(0.18, 1.30);
+        let (sp, cp) = pitch.sin_cos();
+        Vec3::new(fwd.x * cp, sp, fwd.z * cp)
+    }
+}
+
 pub static WEAPONS: [WeaponDef; 13] = [
     WeaponDef {
         name: "Neon Blaster",
@@ -154,6 +181,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Rocket",
@@ -175,6 +203,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Railgun",
@@ -199,6 +228,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Bouncer",
@@ -222,6 +252,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.9,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Bomb",
@@ -246,16 +277,18 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.3,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Cluster",
         kind: Kind::Projectile,
         damage: 0.0,
         // A mortar, not a throw: slow enough and heavy enough that the arc
-        // reads. At 45 degrees it peaks about 7 m up and lands about 27 m
-        // away; aiming higher trades range for a taller curve. The fuse
-        // outlasts a steep lob so the shell comes back down instead of
-        // bursting in the air halfway through its arc.
+        // reads, and it is *launched* with a built-in loft so even a level
+        // crosshair sends the shell up and over. At the default loft it peaks
+        // around 8 m and lands about 23 m away; aiming higher trades range for
+        // a taller curve. The fuse outlasts a steep lob so the shell comes back
+        // down instead of bursting in the air halfway through its arc.
         speed: 22.0,
         lifetime: 2.6,
         cooldown: 0.9,
@@ -272,6 +305,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::Cluster(7, BOMBLET),
         windup: 0.0,
+        loft: 0.55,
     },
     WeaponDef {
         name: "Swarm",
@@ -293,6 +327,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::Homing(3.0),
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Teleport",
@@ -314,6 +349,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::Teleport,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Nova",
@@ -337,6 +373,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         // The one weapon that does not fire on the click: a 1.2 s charge-up.
         // That is the difference between "a bigger rocket" and "a decision".
         windup: 1.2,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Block",
@@ -361,6 +398,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Tractor",
@@ -387,6 +425,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
     WeaponDef {
         name: "Plasma Whip",
@@ -417,6 +456,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         // Draw the lash back before it cracks. The commitment is the point:
         // step into range and accept that the swing is coming.
         windup: 0.30,
+        loft: 0.0,
     },
     // Not in anyone's arsenal: what the Cluster shell splits into.
     WeaponDef {
@@ -439,5 +479,6 @@ pub static WEAPONS: [WeaponDef; 13] = [
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,
+        loft: 0.0,
     },
 ];
