@@ -9,11 +9,11 @@
 
 use crate::feel;
 use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA, PLASMA_HOT, SMOKE, VIOLET};
-use crate::renderer::{DrawPrim, Light, Soot, Stain, Sprite};
+use crate::renderer::{DrawPrim, Light, Soot, Sprite};
 use glam::Vec3;
 use sdf::Grid;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
-use sim::{whip_path, AimPath, Event, Projectile, WhipPose, Worm, DT, WHIP_POINTS};
+use sim::{AimPath, Event, Projectile, Worm, DT};
 use std::f32::consts::TAU;
 
 /// Gameplay effects share the renderer's 256-slot core pool with the worms,
@@ -24,13 +24,15 @@ const MAX_DUST: usize = 96;
 /// Air traces. They are the first thing to drop when a fight is busy, because
 /// they are the least important: the shot itself still has to be drawn.
 const MAX_TRAILS: usize = 24;
-/// Blood droplets have their own 128-slot renderer pool, which gameplay cannot
-/// evict. The stains they leave are terrain paint and live in `splats`, so a
-/// full droplet pool loses spray, never the marks on the floor.
-const MAX_BLOOD: usize = 128;
-/// Surface marks. Blood is painted into the terrain's albedo (`Stain`), scorch
-/// is a decal sprite; both are cheap, so the floor can hold a lot of them.
-const MAX_SPLATS: usize = 192;
+/// Blood droplets are billboards now, not SDF capsules: one quad each, drawn
+/// with the terrain behind them. The pool is cosmetic and generous, so a messy
+/// hit never has to drop half its spray.
+const MAX_BLOOD: usize = 512;
+/// Surface marks. Blood is a painted decal (drawn from the G-buffer) and scorch
+/// is the same kind of mark; both are cheap. Blood lives for ten minutes, so
+/// the map keeps a fight's history until a busy match recycles the oldest. At
+/// most `MAX_SPLATS` are held, newest last; when full the oldest is overwritten.
+const MAX_SPLATS: usize = 8192;
 
 const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
 
@@ -389,8 +391,8 @@ struct Effect {
     /// Skip the ink outline (soft smoke, the aim aid). Without this a small
     /// primitive far away is all outline and reads as a dark pebble.
     inkless: bool,
-    /// Paint it into the terrain's albedo (`Stain`) instead of drawing a decal
-    /// sprite over the G-buffer. Blood uses this; a scorch still uses a decal.
+    /// Paint it as a stain on the G-buffer surface (a blood mark) instead of a
+    /// scorch decal. Blood uses this; a scorch still uses the older decal.
     paint: bool,
     /// Draw in front of the scene, with no depth fade. A muzzle flash sits
     /// inside the drawn barrel and an impact flash is half-buried in the rock;
@@ -464,16 +466,18 @@ impl Effect {
             vel: Vec3::ZERO,
             gravity: 0.0,
             age: 0.0,
-            // Long enough that a fight leaves a readable floor, short enough
-            // that the pool recycles instead of becoming permanent.
-            life: 14.0,
+            // Ten minutes: a match's blood stays on the map. The pool is the
+            // real limit (8k marks); a busy fight recycles the oldest instead
+            // of the whole floor going clean every fourteen seconds.
+            life: 600.0,
             burst: false,
             // Opacity: 1 for a fresh wound, lower for a faint burn.
             width: 1.0,
             hot: false,
             // A decal has no side; an ink rim would draw a 3D tube around it.
             inkless: true,
-            // Blood belongs to the rock, not to a screen-space sprite layer.
+            // A blood mark is painted onto the rock from the G-buffer; scorch
+            // uses the same shape but stays a plain decal.
             paint: true,
             front: false,
         }
@@ -654,39 +658,11 @@ impl Effects {
                 self.push_burst(Effect::burst(Shape::Ball { at: from, radius: 0.24 }, BEAM, 0.09).glow());
                 self.push_burst(Effect::burst(Shape::Ball { at: to, radius: 0.55 }, BEAM, 0.16).glow());
             }
-            Event::Whip { from, dir, side, phase, length, style, .. } => {
-                // The lash itself is carried by the worm (see `worms.rs`). The
-                // event only marks the crack: a hot tip, a light and a handful
-                // of sparks. The ghosts and the sweep live in the worm's own
-                // animation, so they stay in step with the drawn lash.
-                let pose = WhipPose {
-                    dir,
-                    side,
-                    phase,
-                    length,
-                    sweep: 0.0,
-                    curl: 0.0,
-                    arch: 0.0,
-                    lag: 0.0,
-                    style,
-                };
-                let points = whip_path(from, pose);
-                let tip = points[WHIP_POINTS - 1];
-                self.push_burst(Effect::puff(tip, Vec3::ZERO, 0.24, PLASMA_HOT, 0.15, 0.0).glow());
-                self.push_light(tip, PLASMA, 9.0, 5.0, 0.28);
-                for i in 0..7 {
-                    let a = i as f32 * 2.399 + phase;
-                    let spark = Vec3::new(a.cos(), 0.35 + 0.4 * (a * 1.7).sin().abs(), a.sin());
-                    self.push_burst(Effect::puff(
-                        tip,
-                        spark.normalize_or_zero() * (3.0 + i as f32 * 0.5),
-                        0.045,
-                        PLASMA_HOT,
-                        0.16,
-                        9.0,
-                    ).glow());
-                }
-            }
+            // The lash is the worm's own model and a swing is an animation
+            // (see `worms.rs`); the crack is made where the lash cuts rock, by
+            // the `Impact` events the cut sends. The start of a swing has
+            // nothing to flash.
+            Event::Whip { .. } => {}
             Event::Shot { weapon, pos, .. } => {
                 // A hot flash at the muzzle in the weapon's own colour (the
                 // tracer's direction is known to `main`), plus a wisp of smoke
@@ -1051,10 +1027,9 @@ impl Effects {
         let chest = at + Vec3::Y * 0.95;
         let push = if dir.length_squared() > 1.0e-6 { dir.normalize() } else { Vec3::Y };
         let force = (damage / 28.0).clamp(0.35, 2.4);
-        // Liero, not a nosebleed: roughly five times the old spray. The
-        // renderer's blood pool holds 128 primitives; the rest are dropped in
-        // its own pool, never from gameplay.
-        let count = (28.0 + damage * 1.40).clamp(28.0, 150.0) as usize;
+        // Liero, not a nosebleed: roughly twice the old spray. Droplets are
+        // billboards, so the pool can be large without touching the SDF budget.
+        let count = (48.0 + damage * 2.2).clamp(48.0, 260.0) as usize;
 
         for i in 0..count {
             let seed = i as f32 * 1.7 + at.x * 3.1 + at.z * 1.3;
@@ -1062,25 +1037,32 @@ impl Effects {
             let side = Vec3::new(a.cos(), 0.0, a.sin());
             // Splash-back on every third drop, the rest out of the exit wound.
             let along = if i % 3 == 0 { -push } else { push };
-            let up = 0.35 + 0.85 * noise(seed + 7.0);
-            let speed = (4.0 + 4.5 * force) * (0.55 + 0.75 * noise(seed + 3.0));
-            let dir =
-                (along * (0.55 + 0.45 * noise(seed + 11.0)) + Vec3::Y * up + side * 0.90).normalize_or_zero();
+            // Every sixth drop is arterial: a thin jet on a flat, fast arc that
+            // can cross the arena. Gore needs a few streaks that leave the body
+            // far behind, not just a cloud hugging the wound. The low gravity
+            // and long life keep them in the air past the fight.
+            let arterial = i % 6 == 0;
+            let (dir, speed, radius, life, gravity) = if arterial {
+                let up = 0.20 + 0.35 * noise(seed + 7.0);
+                let dir = (push * 1.15 + Vec3::Y * up + side * 0.30).normalize_or_zero();
+                let speed = 55.0 + 55.0 * noise(seed + 31.0);
+                let radius = 0.055 + 0.035 * noise(seed + 19.0);
+                (dir, speed, radius, 1.10 + 0.60 * noise(seed + 23.0), 6.0 + 5.0 * noise(seed + 41.0))
+            } else {
+                let up = 0.35 + 0.85 * noise(seed + 7.0);
+                let dir = (along * (0.55 + 0.45 * noise(seed + 11.0)) + Vec3::Y * up + side * 0.90)
+                    .normalize_or_zero();
+                let speed = (4.0 + 4.5 * force) * (0.55 + 0.75 * noise(seed + 3.0));
+                let radius = (0.075 + 0.040 * force) * (0.65 + 0.7 * noise(seed + 19.0));
+                (dir, speed, radius, 0.60 + 0.70 * noise(seed + 23.0), 17.0)
+            };
             self.push_blood(
-                Effect::puff(
-                    chest + side * 0.10,
-                    dir * speed,
-                    (0.060 + 0.035 * force) * (0.65 + 0.7 * noise(seed + 19.0)),
-                    BLOOD,
-                    0.55 + 0.65 * noise(seed + 23.0),
-                    17.0,
-                )
-                .glow()
-                .inkless(),
+                Effect::puff(chest + side * 0.10, dir * speed, radius, BLOOD, life, gravity).glow().inkless(),
             );
         }
-        // Fat gobs, because Liero never believed in restraint.
-        let gobs = (3.0 + damage / 25.0).clamp(3.0, 10.0) as usize;
+        // Fat gobs, because Liero never believed in restraint. Now that a
+        // droplet is one quad, the spray can afford them.
+        let gobs = (4.0 + damage / 20.0).clamp(4.0, 14.0) as usize;
         for i in 0..gobs {
             let a = i as f32 * 2.399 + at.x;
             let side = Vec3::new(a.cos(), 0.0, a.sin());
@@ -1088,7 +1070,7 @@ impl Effects {
                 Effect::puff(
                     chest,
                     (push * 0.5 + Vec3::Y * 0.9 + side * 0.5).normalize_or_zero() * (4.5 + 2.5 * force),
-                    0.115 + 0.045 * force,
+                    0.130 + 0.050 * force,
                     BLOOD,
                     0.60 + 0.10 * noise(a),
                     17.0,
@@ -1098,43 +1080,96 @@ impl Effects {
             );
         }
 
-        // A stain under the body: eight to twenty-six points around the feet,
-        // each dropped onto the first surface below, and each bigger than the
-        // old marks. A full strike paints a rough ring around the worm.
-        let n = (14.0 + damage * 0.35).clamp(14.0, 48.0) as usize;
+        // A stain under the body: a rough ring around the worm, each point
+        // dropped onto the first surface below. More and bigger marks than the
+        // old paint pool could hold, because the map no longer throws them away.
+        // The ring reaches further than the old puddle: blood thrown out of the
+        // body should be on the floor around it, not only under its feet.
+        let n = (24.0 + damage * 0.55).clamp(24.0, 90.0) as usize;
         for i in 0..n {
             let seed = i as f32 * 2.3 + at.x * 0.7 + at.z * 1.1;
             let a = seed * 2.399;
-            let off = Vec3::new(a.cos(), 0.0, a.sin()) * (0.60 + 1.0 * noise(seed + 5.0));
-            let from = at + off + Vec3::Y * 1.4;
-            if let Some(t) = grid.raycast(from, Vec3::NEG_Y, 6.0) {
+            let off = Vec3::new(a.cos(), 0.0, a.sin()) * (0.80 + 3.6 * noise(seed + 5.0));
+            let from = at + off + Vec3::Y * 2.5;
+            if let Some(t) = grid.raycast(from, Vec3::NEG_Y, 12.0) {
+                if t <= 0.10 { continue; } // start outside the field: not a surface below
                 let hit = from - Vec3::Y * t;
                 let normal = grid.gradient(hit);
                 let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { Vec3::Y };
                 self.push_splat(Effect::splat(
                     hit + normal * 0.015,
                     normal,
-                    0.30 + 0.18 * noise(seed + 13.0) + 0.10 * force,
+                    0.34 + 0.20 * noise(seed + 13.0) + 0.12 * force,
+                ));
+            }
+        }
+        // The spray lands further out too: a fan of marks 2-22 m away in the
+        // direction the blood was thrown. This is what stops the floor from
+        // reading as one neat puddle around the victim.
+        let spray = (10.0 + damage * 0.25).clamp(10.0, 32.0) as usize;
+        let flat = Vec3::new(push.x, 0.0, push.z).normalize_or_zero();
+        let flat = if flat.length_squared() > 0.5 { flat } else { Vec3::X };
+        for i in 0..spray {
+            let seed = i as f32 * 3.1 + at.z * 0.9 + at.x * 0.4;
+            let a = seed * 2.399;
+            let side = Vec3::new(a.cos(), 0.0, a.sin());
+            let dir = (flat * (0.65 + 0.50 * noise(seed + 3.0)) + side * (0.25 + 0.55 * noise(seed + 9.0)))
+                .normalize_or_zero();
+            let reach = 2.0 + 20.0 * (i as f32 / spray as f32) * (0.55 + 0.45 * noise(seed + 17.0));
+            let from = at + dir * reach + Vec3::Y * 3.0;
+            if let Some(t) = grid.raycast(from, Vec3::NEG_Y, 20.0) {
+                if t <= 0.10 { continue; } // start outside the field: not a surface below
+                let hit = from - Vec3::Y * t;
+                let normal = grid.gradient(hit);
+                let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { Vec3::Y };
+                self.push_splat(Effect::splat(
+                    hit + normal * 0.015,
+                    normal,
+                    0.20 + 0.22 * noise(seed + 21.0),
                 ));
             }
         }
         // And three on the wall the spray is pointing at, so a hit in a
         // corridor paints the corridor instead of leaving one neat dot.
         if let Some(t) = grid.raycast(chest, push, 4.5) {
+            if t > 0.10 {
+                let hit = chest + push * t;
+                let normal = grid.gradient(hit);
+                let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { -push };
+                let side = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
+                let side = if side.length_squared() > 1.0e-4 { side.normalize() } else { Vec3::X };
+                let up = normal.cross(side).normalize_or_zero();
+                for k in 0..5 {
+                    let a = k as f32 * 2.399 + at.x;
+                    let off = side * (a.cos() * 0.40) + up * (a.sin() * 0.40);
+                    self.push_splat(Effect::splat(
+                        hit + normal * 0.02 + off,
+                        normal,
+                        0.30 + 0.20 * noise(at.z + k as f32) + 0.08 * force,
+                    ));
+                }
+            }
+        }
+        // The arterial jets can reach the far side of the room. If there is a
+        // surface out there, leave a distant splatter too, so the spray reads
+        // across the arena instead of the blood stopping at the body.
+        if let Some(t) = grid.raycast(chest, push, 45.0) {
             let hit = chest + push * t;
-            let normal = grid.gradient(hit);
-            let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { -push };
-            let side = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
-            let side = if side.length_squared() > 1.0e-4 { side.normalize() } else { Vec3::X };
-            let up = normal.cross(side).normalize_or_zero();
-            for k in 0..3 {
-                let a = k as f32 * 2.399 + at.x;
-                let off = side * (a.cos() * 0.34) + up * (a.sin() * 0.34);
-                self.push_splat(Effect::splat(
-                    hit + normal * 0.02 + off,
-                    normal,
-                    0.24 + 0.16 * noise(at.z + k as f32) + 0.05 * force,
-                ));
+            if t > 6.0 {
+                let normal = grid.gradient(hit);
+                let normal = if normal.length_squared() > 1.0e-4 { normal.normalize() } else { -push };
+                let side = if normal.y.abs() > 0.90 { Vec3::X } else { normal.cross(Vec3::Y) };
+                let side = if side.length_squared() > 1.0e-4 { side.normalize() } else { Vec3::X };
+                let up = normal.cross(side).normalize_or_zero();
+                for k in 0..4 {
+                    let a = k as f32 * 2.399 + at.x;
+                    let off = side * (a.cos() * (0.30 + 0.25 * k as f32)) + up * (a.sin() * 0.30);
+                    self.push_splat(Effect::splat(
+                        hit + normal * 0.02 + off,
+                        normal,
+                        0.30 + 0.18 * noise(at.x + k as f32),
+                    ));
+                }
             }
         }
     }
@@ -1313,16 +1348,9 @@ impl Effects {
         out
     }
 
-    /// The cosmetic pool: the in-flight blood droplets (solid red beads). The
-    /// stains that land are terrain paint (`Stain`), not capsules or sprites.
-    pub fn blood_capsules(&self) -> Vec<DrawPrim> {
-        let mut out = Vec::with_capacity(self.blood.len());
-        draw_effects(self.blood.iter(), &mut out);
-        out
-    }
-
     /// The soft billboards and decals this frame, split by blend mode. `main`
-    /// sorts `smoke` back-to-front once the camera is known.
+    /// sorts `smoke` back-to-front once the camera is known. The blood list is
+    /// stains (read the G-buffer for their surface) followed by flying beads.
     pub fn sprites(&self) -> Sprites {
         let mut glow = Vec::new();
         let mut smoke = Vec::new();
@@ -1356,20 +1384,31 @@ impl Effects {
             }
         }
         let mut decals = Vec::new();
-        let mut stains = Vec::new();
+        // The blood list is the biggest allocation of the frame: reserve for
+        // the marks and the spray up front instead of growing it piecemeal.
+        let mut blood = Vec::with_capacity(
+            (self.splats.len() + self.blood.len()).min(crate::renderer::MAX_BLOOD_SPRITES),
+        );
         for e in &self.splats {
             if e.paint {
                 if let Some(s) = stain(e) {
-                    stains.push(s);
+                    blood.push(s);
                 }
             } else if let Some(d) = decal_sprite(e) {
                 decals.push(d);
             }
         }
-        // Newest wins when the paint pool is full: a hit's fresh wound matters
-        // more than the oldest mark on the floor.
-        if stains.len() > crate::renderer::MAX_STAINS {
-            stains.drain(..stains.len() - crate::renderer::MAX_STAINS);
+        // The droplets are billboards too, added after the marks so a bead in
+        // flight always composites over paint on the ground it flew past.
+        for e in &self.blood {
+            if let Some(s) = bead_sprite(e) {
+                blood.push(s);
+            }
+        }
+        // A safety net: the effect pools are bounded, but the renderer's buffer
+        // is the hard limit. Newest wins (the fresh wound, not the oldest mark).
+        if blood.len() > crate::renderer::MAX_BLOOD_SPRITES {
+            blood.drain(..blood.len() - crate::renderer::MAX_BLOOD_SPRITES);
         }
         // The eight strongest lights. A busy fight can have more events than
         // the shader has slots; the biggest blasts win, which is what the eye
@@ -1389,15 +1428,13 @@ impl Effects {
             .filter(|s| s.now() > 0.01)
             .map(|s| Soot::new(s.at, s.radius, s.now()))
             .collect();
-        Sprites { glow, smoke, decals, stains, lights, soot }
+        Sprites { glow, smoke, decals, blood, lights, soot }
     }
 
-    /// Everything, for tests that do not care about the pools.
+    /// The solid effects, for tests that do not care about the sprite pools.
     #[cfg(test)]
     pub fn capsules(&self) -> Vec<DrawPrim> {
-        let mut out = self.core_capsules();
-        out.extend(self.blood_capsules());
-        out
+        self.core_capsules()
     }
 
     fn push_burst(&mut self, e: Effect) {
@@ -1423,14 +1460,17 @@ impl Effects {
 
     fn push_blood(&mut self, e: Effect) {
         if self.blood.len() >= MAX_BLOOD {
-            self.blood.remove(0);
+            self.blood.swap_remove(0);
         }
         self.blood.push(e);
     }
 
     fn push_splat(&mut self, e: Effect) {
+        // `swap_remove` is O(1): marks do not need to stay in order, and the
+        // pool is now thousands of entries. `remove(0)` would memmove the whole
+        // floor every time a busy fight added a stain.
         if self.splats.len() >= MAX_SPLATS {
-            self.splats.remove(0);
+            self.splats.swap_remove(0);
         }
         self.splats.push(e);
     }
@@ -1452,7 +1492,9 @@ pub struct Sprites {
     pub glow: Vec<Sprite>,
     pub smoke: Vec<Sprite>,
     pub decals: Vec<Sprite>,
-    pub stains: Vec<Stain>,
+    /// Blood on the ground and in flight. Both are painted billboards: a stain
+    /// reads the G-buffer's surface point, a droplet is a round bead.
+    pub blood: Vec<Sprite>,
     pub lights: Vec<Light>,
     pub soot: Vec<Soot>,
 }
@@ -1553,9 +1595,9 @@ fn ring_sprite(e: &Effect) -> Option<Sprite> {
 }
 
 
-/// A blood stain as paint for the terrain's albedo. It holds full strength for
-/// most of its life, then dries out (fades) at the end, like the old decal.
-fn stain(e: &Effect) -> Option<Stain> {
+/// A blood stain as a painted decal. It holds full strength for most of its
+/// life, then dries out (fades) at the end.
+fn stain(e: &Effect) -> Option<Sprite> {
     let Shape::Splat { at, normal, radius } = &e.shape else { return None };
     let u = (e.age / e.life).clamp(0.0, 1.0);
     let strength = (1.0 - ((u - 0.7) / 0.3).clamp(0.0, 1.0)).clamp(0.0, 1.0) * 0.95 * e.width.clamp(0.0, 1.0);
@@ -1565,7 +1607,21 @@ fn stain(e: &Effect) -> Option<Stain> {
     let seed = at.x * 2.3 + at.z * 1.7 + normal.y * 3.1;
     // Fresh blood is bright red; it dries to a darker maroon as it ages.
     let colour = e.colour.lerp(BLOOD_DARK, u * 0.65);
-    Some(Stain::new(*at, *normal, *radius, colour, strength, seed))
+    Some(Sprite::decal(*at, *normal, *radius, colour, strength, seed))
+}
+
+/// A droplet in flight: a round bead, not a ray-marched capsule. It shrinks as
+/// it falls and fades in the last fifth of its life, so a spray thins out
+/// instead of vanishing in one frame.
+fn bead_sprite(e: &Effect) -> Option<Sprite> {
+    let Shape::Ball { at, radius } = &e.shape else { return None };
+    let u = (e.age / e.life).clamp(0.0, 1.0);
+    let alpha = ((1.0 - u) / 0.20).clamp(0.0, 1.0);
+    if alpha <= 0.01 {
+        return None;
+    }
+    let seed = at.x * 1.7 + at.z * 1.3 + at.y * 0.9;
+    Some(Sprite::blood_drop(*at, *radius * (1.0 - 0.45 * u), e.colour, alpha, seed))
 }
 
 /// A scorch mark lying on a surface. It holds full strength for most of its
@@ -1603,8 +1659,14 @@ mod tests {
         e.sprites().decals.len()
     }
 
+    /// Blood sprites that lie on a surface (they carry a unit normal). Droplets
+    /// carry none, so the two can be counted apart.
     fn stain_count(e: &Effects) -> usize {
-        e.sprites().stains.len()
+        e.sprites().blood.iter().filter(|s| s.c[0] * s.c[0] + s.c[1] * s.c[1] + s.c[2] * s.c[2] > 0.5).count()
+    }
+
+    fn drop_count(e: &Effects) -> usize {
+        e.sprites().blood.len() - stain_count(e)
     }
 
     #[test]
@@ -1659,50 +1721,85 @@ mod tests {
         // Flat rock at y = 2, so the stains have somewhere real to land.
         let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
         let mut e = Effects::default();
-        e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::NEG_Z, 34.0, &grid);
-        assert!(e.blood.len() >= 60, "a Liero spray, not a drop: {}", e.blood.len());
-        assert!(e.splats.len() >= 10, "blood marks the floor: {}", e.splats.len());
+        e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::Z, 34.0, &grid);
+        assert!(e.blood.len() >= 100, "a Liero spray, not a drop: {}", e.blood.len());
+        assert!(e.splats.len() >= 30, "blood marks the floor: {}", e.splats.len());
         for s in &e.splats {
             match &s.shape {
                 Shape::Splat { at, normal, radius } => {
-                    assert!((at.y - 2.0).abs() < 0.2, "the stain is on the rock: {at:?}");
                     assert!(normal.is_normalized());
                     assert!(*radius > 0.0);
+                    // Ground marks sit on the flat floor; the far wall splatter
+                    // is intentionally vertical.
+                    if normal.y > 0.9 {
+                        assert!((at.y - 2.0).abs() < 0.2, "the stain is on the rock: {at:?}");
+                    }
                 }
                 _ => panic!("a splat should be a splat"),
             }
         }
-        // Droplets are ballistic and short-lived; stains are the receipt.
-        e.update(1.2);
+        assert!(drop_count(&e) >= 100, "the spray is drawn as beads: {}", drop_count(&e));
+        // Marks are not only a puddle at the feet: some land metres away.
+        let far = e
+            .splats
+            .iter()
+            .filter_map(|s| match &s.shape {
+                Shape::Splat { at, .. } => Some(at.distance(Vec3::new(4.0, 2.0, 4.0))),
+                _ => None,
+            })
+            .fold(0.0f32, f32::max);
+        assert!(far > 5.0, "the spray stains the ground away from the body: {far} m");
+        // Droplets are ballistic and short-lived; stains are the receipt. The
+        // arterial jets are the longest-lived, so wait them out too.
+        e.update(2.0);
         assert!(e.blood.is_empty(), "the droplets have fallen");
         assert!(!e.splats.is_empty(), "the stains remain");
-        assert!(stain_count(&e) >= 10, "the stains paint the rock: {}", stain_count(&e));
-        assert_eq!(decal_count(&e), 0, "blood is terrain paint, not a decal sprite");
+        assert!(stain_count(&e) >= 30, "the stains paint the rock: {}", stain_count(&e));
+        assert_eq!(decal_count(&e), 0, "blood is a blood mark, not a scorch decal");
     }
 
     #[test]
-    fn blood_is_drawn_from_its_own_pool() {
+    fn blood_is_fx_and_never_touches_the_scene_primitives() {
         let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
         let mut e = Effects::default();
         // A gameplay effect to protect: a beam line.
         e.add(&Event::Beam { from: Vec3::ZERO, to: Vec3::Z * 5.0 });
         let core = e.core_capsules().len();
         e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::Z, 70.0, &grid);
-        assert_eq!(e.core_capsules().len(), core, "blood never touches gameplay primitives");
-        assert!(!e.blood_capsules().is_empty());
-        assert_eq!(e.capsules().len(), core + e.blood_capsules().len(), "the test view sees both pools");
+        assert_eq!(e.core_capsules().len(), core, "blood is not a scene primitive");
+        assert!(drop_count(&e) > 0, "the spray is billboards");
+        assert!(stain_count(&e) > 0, "the marks are painted decals");
     }
 
     #[test]
-    fn a_long_fight_cannot_flood_the_blood_budget() {
+    fn some_blood_droplets_shoot_really_far() {
+        // Gore needs arterial streaks, not only a cloud at the wound. With the
+        // viewer's light drag, a 55 m/s drop covers roughly 28 m in the first
+        // second; the fastest should clear the whole fight.
         let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
         let mut e = Effects::default();
-        for i in 0..40 {
-            e.blood(Vec3::new(4.0 + i as f32 * 0.1, 2.0, 4.0), Vec3::Z, 70.0, &grid);
+        e.blood(Vec3::new(4.0, 2.0, 4.0), Vec3::NEG_Z, 70.0, &grid);
+        let fast = e.blood.iter().filter(|d| d.vel.length() > 50.0).count();
+        let fastest = e.blood.iter().map(|d| d.vel.length()).fold(0.0, f32::max);
+        assert!(fast >= 5, "a few jets leave the body behind: {fast}");
+        assert!(fastest > 85.0, "the fastest drop can cross the arena: {fastest}");
+    }
+
+    #[test]
+    fn a_long_fight_keeps_thousands_of_marks_and_recycles_the_oldest() {
+        let grid = Grid::from_fn(glam::IVec3::new(8, 4, 8), |p| p.y - 2.0);
+        let mut e = Effects::default();
+        for i in 0..200 {
+            e.blood(Vec3::new(4.0 + (i % 8) as f32 * 0.1, 2.0, 4.0), Vec3::Z, 70.0, &grid);
         }
         assert!(e.blood.len() <= MAX_BLOOD, "droplets are capped: {}", e.blood.len());
-        assert!(e.splats.len() <= MAX_SPLATS, "stains are capped: {}", e.splats.len());
-        assert!(stain_count(&e) <= crate::renderer::MAX_STAINS, "paint is capped: {}", stain_count(&e));
+        assert_eq!(e.splats.len(), MAX_SPLATS, "the mark pool fills, then recycles: {}", e.splats.len());
+        assert!(stain_count(&e) <= crate::renderer::MAX_BLOOD_SPRITES, "paint fits the buffer");
+        // Two minutes on: the droplets are long gone; the map still carries
+        // thousands of marks, where the old 14-second pool kept 48.
+        e.update(120.0);
+        assert!(e.blood.is_empty(), "droplets are brief");
+        assert!(stain_count(&e) > 1000, "the floor remembers the fight: {}", stain_count(&e));
     }
 
     #[test]
@@ -1845,23 +1942,19 @@ mod tests {
     }
 
     #[test]
-    fn a_whip_crack_flashes_at_the_tip_and_fades_fast() {
+    fn starting_a_whip_swing_spawns_no_effect_of_its_own() {
         let mut e = Effects::default();
         e.add(&Event::Whip {
             worm: 0,
             from: Vec3::ZERO,
-            dir: Vec3::Z,
+            fwd: Vec3::Z,
             side: Vec3::NEG_X,
-            phase: 0.0,
-            length: 9.5,
+            lean: 0.0,
             style: sim::WhipStyle::Sweep,
             flip: false,
         });
-        // The lash itself is part of the worm (see `worms::lash`); the event
-        // only adds the crack at the far end and the sparks it throws.
-        assert!(glow_count(&e) >= 5, "a flash and sparks: {}", glow_count(&e));
-        e.update(0.5);
-        assert_eq!(glow_count(&e), 0, "the sparks and the arc are gone");
+        // The lash is part of the worm; the crack comes from the cut's `Impact`.
+        assert_eq!(glow_count(&e), 0);
     }
 
     #[test]

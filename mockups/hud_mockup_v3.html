@@ -1,0 +1,298 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; width: 1280px; height: 720px; overflow: hidden; background: #000; }
+  svg { display: block; }
+  text { font-family: "Bahnschrift", "Segoe UI", sans-serif; }
+  .num { font-size: 30px; font-weight: 700; letter-spacing: 0.5px; }
+  .ammo { font-size: 22px; font-weight: 700; letter-spacing: .5px; }
+  .tiny { font-size: 8.5px; letter-spacing: .8px; font-weight: 600; }
+</style>
+</head>
+<body>
+<svg width="1280" height="720" viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="blur3" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="3"/></filter>
+    <filter id="blur6" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="6"/></filter>
+    <filter id="blur9" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="9"/></filter>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="1.3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <linearGradient id="panelFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2d2d1c" stop-opacity=".95"/>
+      <stop offset=".45" stop-color="#1a1b10" stop-opacity=".94"/>
+      <stop offset="1" stop-color="#0c0d08" stop-opacity=".97"/>
+    </linearGradient>
+    <linearGradient id="panelTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f3d99c" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#f3d99c" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="healthGrad" x1="76" y1="0" x2="188" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8dd75"/>
+      <stop offset=".38" stop-color="#e7aa3e"/>
+      <stop offset="1" stop-color="#c76a2a"/>
+    </linearGradient>
+    <linearGradient id="chargeGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#aac4e4"/>
+      <stop offset="1" stop-color="#53749f"/>
+    </linearGradient>
+    <linearGradient id="ammoGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f7de8f"/>
+      <stop offset="1" stop-color="#c17e32"/>
+    </linearGradient>
+    <radialGradient id="badgeGrad" cx=".36" cy=".30" r=".86">
+      <stop offset="0" stop-color="#3b3c27"/>
+      <stop offset=".62" stop-color="#1b1c12"/>
+      <stop offset="1" stop-color="#0a0b06"/>
+    </radialGradient>
+    <radialGradient id="novaGrad" cx=".5" cy=".45" r=".58">
+      <stop offset="0" stop-color="#fffaf0"/>
+      <stop offset=".42" stop-color="#ffe8b6"/>
+      <stop offset=".75" stop-color="#e8b45a"/>
+      <stop offset="1" stop-color="#b7762d" stop-opacity=".12"/>
+    </radialGradient>
+    <pattern id="aged" width="7" height="7" patternUnits="userSpaceOnUse">
+      <path d="M0 6.5 H7" stroke="#f6dca2" stroke-opacity=".035"/>
+      <circle cx="2" cy="2" r=".55" fill="#f6dca2" opacity=".055"/>
+      <circle cx="5.5" cy="4.5" r=".45" fill="#000" opacity=".10"/>
+    </pattern>
+
+    <linearGradient id="topShade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#090a05" stop-opacity=".48"/>
+      <stop offset=".22" stop-color="#090a05" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="vignette" cx=".5" cy=".5" r=".72">
+      <stop offset=".52" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#050503" stop-opacity=".56"/>
+    </radialGradient>
+    <linearGradient id="oliveWash" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#768145" stop-opacity=".17"/>
+      <stop offset=".55" stop-color="#768145" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="warmWash" x1="1" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff9b3d" stop-opacity=".10"/>
+      <stop offset=".55" stop-color="#ff9b3d" stop-opacity="0"/>
+    </linearGradient>
+
+    <clipPath id="healthClip">
+      <path d="M22 2 H238 L258 22 V52 L238 72 H22 L2 52 V22 Z"/>
+    </clipPath>
+    <clipPath id="weaponClip">
+      <path d="M26 2 H84 L108 26 V134 L84 158 H26 L2 134 V26 Z"/>
+    </clipPath>
+    <clipPath id="hpFill3"><rect x="76" y="27" width="87.36" height="18"/></clipPath>
+    <clipPath id="hpTrail3"><rect x="76" y="27" width="96.32" height="18"/></clipPath>
+    <clipPath id="chargeFill3"><rect x="59" y="102" width="10" height="31.5"/></clipPath>
+  </defs>
+
+  <!-- Background: the actual game frame, graded warmer and earthier. -->
+  <image href="../screenshots/worm_in_game.png" x="0" y="0" width="1280" height="720"
+         preserveAspectRatio="xMidYMid slice" style="filter:saturate(1.08) contrast(1.04) brightness(.95)"/>
+  <rect x="0" y="0" width="1280" height="720" fill="url(#oliveWash)"/>
+  <rect x="0" y="0" width="1280" height="720" fill="url(#warmWash)"/>
+  <rect x="0" y="0" width="1280" height="720" fill="url(#topShade)"/>
+  <rect x="0" y="0" width="1280" height="720" fill="url(#vignette)"/>
+
+  <!-- ======================= TOP LEFT: COMPACT VITALS ======================= -->
+  <g transform="translate(24 22)">
+    <path d="M22 2 H238 L258 22 V52 L238 72 H22 L2 52 V22 Z" fill="#000" opacity=".62" filter="url(#blur6)" transform="translate(0 4)"/>
+    <path d="M22 2 H238 L258 22 V52 L238 72 H22 L2 52 V22 Z" fill="none" stroke="#d7a85b" stroke-width="4" opacity=".20" filter="url(#blur3)"/>
+    <path d="M22 2 H238 L258 22 V52 L238 72 H22 L2 52 V22 Z" fill="url(#panelFill)" stroke="#c99a55" stroke-opacity=".92" stroke-width="1.5"/>
+    <g clip-path="url(#healthClip)">
+      <rect x="0" y="0" width="260" height="72" fill="url(#panelTop)"/>
+      <rect x="0" y="0" width="260" height="72" fill="url(#aged)"/>
+      <path d="M22 72 H84 L78 64 H22 Z" fill="#c98d3c" opacity=".20"/>
+      <path d="M25 5 H235" stroke="#ffe9b7" stroke-opacity=".28" stroke-width="1"/>
+    </g>
+    <g>
+      <circle cx="20" cy="12" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+      <circle cx="240" cy="12" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+      <circle cx="20" cy="60" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+      <circle cx="240" cy="60" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+    </g>
+
+    <!-- badge, scaled into the smaller plate -->
+    <g transform="translate(36 36) scale(.82) translate(-56 -50)">
+      <circle cx="56" cy="50" r="35" fill="#000" opacity=".45" filter="url(#blur3)"/>
+      <circle cx="56" cy="50" r="36" fill="none" stroke="#d7a55a" stroke-width="3" opacity=".32" filter="url(#blur3)"/>
+      <circle cx="56" cy="50" r="33" fill="url(#badgeGrad)" stroke="#d9b06e" stroke-width="1.8"/>
+      <circle cx="56" cy="50" r="27" fill="none" stroke="#5c4728" stroke-width="1"/>
+      <g stroke="#e5c487" stroke-width="1.4" opacity=".72">
+        <line x1="56" y1="14" x2="56" y2="18"/><line x1="56" y1="82" x2="56" y2="86"/>
+        <line x1="20" y1="50" x2="24" y2="50"/><line x1="88" y1="50" x2="92" y2="50"/>
+        <line x1="30.5" y1="24.5" x2="33.5" y2="27.5"/><line x1="78.5" y1="72.5" x2="81.5" y2="75.5"/>
+        <line x1="81.5" y1="24.5" x2="78.5" y2="27.5"/><line x1="33.5" y1="72.5" x2="30.5" y2="75.5"/>
+      </g>
+      <path d="M47 74 C37 69 38 55 49 53 C57 51 61 57 58 63 C56 68 49 68 48 63"
+            fill="none" stroke="#2b120c" stroke-width="9" stroke-linecap="round"/>
+      <path d="M47 74 C37 69 38 55 49 53 C57 51 61 57 58 63 C56 68 49 68 48 63"
+            fill="none" stroke="#ff8a3c" stroke-width="5.6" stroke-linecap="round"/>
+      <circle cx="59" cy="42" r="11" fill="#ff8a3c" stroke="#2b120c" stroke-width="2"/>
+      <path d="M52 36 L57 38 M66 36 L61 38" stroke="#2b120c" stroke-width="1.3" stroke-linecap="round"/>
+      <circle cx="55.5" cy="41" r="2" fill="#1b0d09"/><circle cx="62.5" cy="41" r="2" fill="#1b0d09"/>
+      <circle cx="56.1" cy="40.3" r=".65" fill="#fff6e2"/><circle cx="63.1" cy="40.3" r=".65" fill="#fff6e2"/>
+      <path d="M54 46 Q59 50 64 46" fill="none" stroke="#2b120c" stroke-width="1.8" stroke-linecap="round"/>
+      <path d="M57 48.6 L58 46.8 M61 48.6 L60 46.8" stroke="#ffe8cf" stroke-width="1.1" stroke-linecap="round"/>
+    </g>
+
+    <!-- health bar -->
+    <rect x="76" y="27" width="112" height="18" rx="3" fill="#080905" stroke="#7b582b" stroke-opacity=".95"/>
+    <rect x="78" y="29" width="108" height="14" rx="2" fill="#020302" opacity=".9"/>
+    <g clip-path="url(#hpTrail3)">
+      <g fill="#fff0cf" opacity=".22">
+        <rect x="76" y="29" width="12.25" height="14"/><rect x="90.25" y="29" width="12.25" height="14"/>
+        <rect x="104.5" y="29" width="12.25" height="14"/><rect x="118.75" y="29" width="12.25" height="14"/>
+        <rect x="133" y="29" width="12.25" height="14"/><rect x="147.25" y="29" width="12.25" height="14"/>
+        <rect x="161.5" y="29" width="12.25" height="14"/><rect x="175.75" y="29" width="12.25" height="14"/>
+      </g>
+    </g>
+    <g clip-path="url(#hpFill3)">
+      <g fill="url(#healthGrad)">
+        <rect x="76" y="29" width="12.25" height="14"/><rect x="90.25" y="29" width="12.25" height="14"/>
+        <rect x="104.5" y="29" width="12.25" height="14"/><rect x="118.75" y="29" width="12.25" height="14"/>
+        <rect x="133" y="29" width="12.25" height="14"/><rect x="147.25" y="29" width="12.25" height="14"/>
+        <rect x="161.5" y="29" width="12.25" height="14"/><rect x="175.75" y="29" width="12.25" height="14"/>
+      </g>
+      <g fill="#fff8e6" opacity=".30">
+        <rect x="76" y="29" width="12.25" height="3.5"/><rect x="90.25" y="29" width="12.25" height="3.5"/>
+        <rect x="104.5" y="29" width="12.25" height="3.5"/><rect x="118.75" y="29" width="12.25" height="3.5"/>
+        <rect x="133" y="29" width="12.25" height="3.5"/><rect x="147.25" y="29" width="12.25" height="3.5"/>
+      </g>
+    </g>
+    <g fill="#0b0c07">
+      <rect x="88.25" y="27" width="2" height="18"/><rect x="102.5" y="27" width="2" height="18"/>
+      <rect x="116.75" y="27" width="2" height="18"/><rect x="131" y="27" width="2" height="18"/>
+      <rect x="145.25" y="27" width="2" height="18"/><rect x="159.5" y="27" width="2" height="18"/>
+      <rect x="173.75" y="27" width="2" height="18"/>
+    </g>
+    <rect x="76" y="27" width="112" height="18" rx="3" fill="none" stroke="#e6c07e" stroke-opacity=".32"/>
+
+    <line x1="199" y1="20" x2="199" y2="54" stroke="#7b582b" stroke-opacity=".8"/>
+    <text x="246" y="48" text-anchor="end" class="num" fill="#f8ecd0" filter="url(#softGlow)">78</text>
+
+    <!-- kills / deaths, icon-only -->
+    <g transform="translate(78 60)" opacity=".9">
+      <circle r="3.6" fill="none" stroke="#d9b06e" stroke-width=".9"/>
+      <path d="M-5.5 0 H-3 M2.5 0 H5.5 M0 -5.5 V-3 M0 2.5 V5.5" stroke="#d9b06e" stroke-width=".9" stroke-linecap="round"/>
+      <circle r=".9" fill="#d9b06e"/>
+    </g>
+    <text x="87" y="63" class="tiny" fill="#d9b06e">04</text>
+    <g transform="translate(112 60) scale(.62)" opacity=".9">
+      <path d="M0 -5 C3.4 -5 5.6 -2.7 5.6 .2 C5.6 2.2 4.6 3.4 3.4 4.1 L3.4 5.6 L1.9 5.6 L1.9 4.6 L0.8 4.6 L0.8 5.6 L-0.8 5.6 L-0.8 4.6 L-1.9 4.6 L-1.9 5.6 L-3.4 5.6 L-3.4 4.1 C-4.6 3.4 -5.6 2.2 -5.6 .2 C-5.6 -2.7 -3.4 -5 0 -5 Z"
+            fill="none" stroke="#c98d6a" stroke-width="1.1"/>
+      <circle cx="-2" cy="0" r="1.1" fill="#c98d6a"/><circle cx="2" cy="0" r="1.1" fill="#c98d6a"/>
+      <path d="M-1 2.6 H1" stroke="#c98d6a" stroke-width=".9"/>
+    </g>
+    <text x="120" y="63" class="tiny" fill="#c98d6a">02</text>
+  </g>
+
+  <!-- ======================= TOP RIGHT: COMPACT WEAPON ======================= -->
+  <g transform="translate(1146 22)">
+    <path d="M26 2 H84 L108 26 V134 L84 158 H26 L2 134 V26 Z" fill="#000" opacity=".62" filter="url(#blur6)" transform="translate(0 5)"/>
+    <path d="M26 2 H84 L108 26 V134 L84 158 H26 L2 134 V26 Z" fill="none" stroke="#d7a85b" stroke-width="4" opacity=".20" filter="url(#blur3)"/>
+    <path d="M26 2 H84 L108 26 V134 L84 158 H26 L2 134 V26 Z" fill="url(#panelFill)" stroke="#c99a55" stroke-opacity=".92" stroke-width="1.5"/>
+    <g clip-path="url(#weaponClip)">
+      <rect x="0" y="0" width="110" height="160" fill="url(#panelTop)"/>
+      <rect x="0" y="0" width="110" height="160" fill="url(#aged)"/>
+      <path d="M2 38 Q22 20 48 38 Q22 56 2 38 Z" fill="#76906a" opacity=".07"/>
+      <path d="M27 5 H83" stroke="#ffe9b7" stroke-opacity=".28" stroke-width="1"/>
+    </g>
+    <g>
+      <circle cx="18" cy="12" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+      <circle cx="92" cy="12" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+      <circle cx="18" cy="148" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+      <circle cx="92" cy="148" r="1.8" fill="#4c3418" stroke="#d9ae66" stroke-width=".7"/>
+    </g>
+
+    <!-- current weapon emblem + charge arc -->
+    <circle cx="55" cy="40" r="31" fill="#000" opacity=".45" filter="url(#blur3)"/>
+    <circle cx="55" cy="40" r="31.5" fill="none" stroke="#d7a55a" stroke-width="2.5" opacity=".32" filter="url(#blur3)"/>
+    <circle cx="55" cy="40" r="29" fill="url(#badgeGrad)" stroke="#d9b06e" stroke-width="1.6"/>
+    <circle cx="55" cy="40" r="23.5" fill="none" stroke="#5c4728" stroke-width="1"/>
+    <circle cx="55" cy="40" r="33" fill="none" stroke="#332815" stroke-width="3.2"/>
+    <circle cx="55" cy="40" r="33" fill="none" stroke="#9ab5d6" stroke-width="3.2"
+            stroke-linecap="round" stroke-dasharray="149.3 207.3" transform="rotate(-90 55 40)"
+            filter="url(#glow)"/>
+    <g stroke="#e5c487" stroke-width="1.2" opacity=".72">
+      <line x1="55" y1="8" x2="55" y2="12"/><line x1="55" y1="68" x2="55" y2="72"/>
+      <line x1="23" y1="40" x2="27" y2="40"/><line x1="83" y1="40" x2="87" y2="40"/>
+    </g>
+    <!-- nova mark -->
+    <circle cx="55" cy="40" r="15" fill="url(#novaGrad)" opacity=".85" filter="url(#blur3)"/>
+    <path d="M55 24 L59 36 L71 40 L59 44 L55 56 L51 44 L39 40 L51 36 Z" fill="#fff7e4" filter="url(#glow)"/>
+    <path d="M55 31 L58 37 L64 40 L58 43 L55 49 L52 43 L46 40 L52 37 Z"
+          fill="#ffe0a3" opacity=".55" transform="rotate(45 55 40)"/>
+    <circle cx="55" cy="40" r="2.8" fill="#ffffff"/>
+
+    <!-- ammo + two vertical bars, R&C-style -->
+    <text x="55" y="93" text-anchor="middle" class="ammo" fill="#f7de8f" filter="url(#softGlow)">1 <tspan fill="#b8a47c" font-size="14">/ 1</tspan></text>
+    <g>
+      <rect x="30" y="100" width="12" height="48" fill="#080905" stroke="#7b582b" stroke-opacity=".95"/>
+      <rect x="59" y="100" width="12" height="48" fill="#080905" stroke="#7b582b" stroke-opacity=".95"/>
+      <rect x="29" y="98" width="14" height="2" fill="#d9ae66" opacity=".8"/>
+      <rect x="58" y="98" width="14" height="2" fill="#9ab5d6" opacity=".8"/>
+      <!-- full magazine -->
+      <g fill="url(#ammoGrad)">
+        <rect x="32" y="102" width="8" height="3.5"/><rect x="32" y="106.5" width="8" height="3.5"/>
+        <rect x="32" y="111" width="8" height="3.5"/><rect x="32" y="115.5" width="8" height="3.5"/>
+        <rect x="32" y="120" width="8" height="3.5"/><rect x="32" y="124.5" width="8" height="3.5"/>
+        <rect x="32" y="129" width="8" height="3.5"/><rect x="32" y="133.5" width="8" height="3.5"/>
+        <rect x="32" y="138" width="8" height="3.5"/><rect x="32" y="142.5" width="8" height="3.5"/>
+      </g>
+      <g fill="#fff8e6" opacity=".22">
+        <rect x="32" y="102" width="8" height="1"/><rect x="32" y="106.5" width="8" height="1"/>
+        <rect x="32" y="111" width="8" height="1"/><rect x="32" y="115.5" width="8" height="1"/>
+        <rect x="32" y="120" width="8" height="1"/><rect x="32" y="124.5" width="8" height="1"/>
+        <rect x="32" y="129" width="8" height="1"/><rect x="32" y="133.5" width="8" height="1"/>
+        <rect x="32" y="138" width="8" height="1"/><rect x="32" y="142.5" width="8" height="1"/>
+      </g>
+      <!-- charge, 72% -->
+      <g clip-path="url(#chargeFill3)">
+        <g fill="url(#chargeGrad)">
+          <rect x="61" y="102" width="8" height="3.5"/><rect x="61" y="106.5" width="8" height="3.5"/>
+          <rect x="61" y="111" width="8" height="3.5"/><rect x="61" y="115.5" width="8" height="3.5"/>
+          <rect x="61" y="120" width="8" height="3.5"/><rect x="61" y="124.5" width="8" height="3.5"/>
+          <rect x="61" y="129" width="8" height="3.5"/><rect x="61" y="133.5" width="8" height="3.5"/>
+        </g>
+        <g fill="#eef6ff" opacity=".25">
+          <rect x="61" y="102" width="8" height="1"/><rect x="61" y="106.5" width="8" height="1"/>
+          <rect x="61" y="111" width="8" height="1"/><rect x="61" y="115.5" width="8" height="1"/>
+          <rect x="61" y="120" width="8" height="1"/><rect x="61" y="124.5" width="8" height="1"/>
+          <rect x="61" y="129" width="8" height="1"/><rect x="61" y="133.5" width="8" height="1"/>
+        </g>
+      </g>
+      <rect x="60" y="133.5" width="10" height="1.2" fill="#dcefff" opacity=".9" filter="url(#softGlow)"/>
+    </g>
+    <path d="M42 151 H68" stroke="#7b582b" stroke-width="1"/>
+    <path d="M55 148.5 L58 151 L55 153.5 L52 151 Z" fill="#d9ae66" opacity=".85"/>
+  </g>
+
+  <!-- ============================== RETICLE ============================== -->
+  <g transform="translate(640 360)">
+    <g stroke="#0b0905" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity=".7">
+      <path d="M-5 -22 L0 -17 L5 -22" fill="none"/>
+      <path d="M-5 22 L0 17 L5 22" fill="none"/>
+      <path d="M-22 -5 L-17 0 L-22 5" fill="none"/>
+      <path d="M22 -5 L17 0 L22 5" fill="none"/>
+    </g>
+    <g stroke="#f4dfad" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" filter="url(#softGlow)">
+      <path d="M-5 -22 L0 -17 L5 -22" fill="none"/>
+      <path d="M-5 22 L0 17 L5 22" fill="none"/>
+      <path d="M-22 -5 L-17 0 L-22 5" fill="none"/>
+      <path d="M22 -5 L17 0 L22 5" fill="none"/>
+    </g>
+    <circle r="13" fill="none" stroke="#fff6df" stroke-opacity=".28" stroke-width="1"/>
+    <circle r="4.2" fill="none" stroke="#e7b45a" stroke-opacity=".9" stroke-width="1.2"/>
+    <circle r="1.7" fill="#e7b45a" filter="url(#softGlow)"/>
+  </g>
+</svg>
+</body>
+</html>

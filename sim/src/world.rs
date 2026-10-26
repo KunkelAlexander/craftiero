@@ -11,7 +11,7 @@
 // host runs the sim and clients draw its snapshots. If a client ever predicts
 // its own worm, swap `sin_cos` for a table or an approximation written here.
 
-use crate::combat::{Projectile, WhipStyle, MAX_HP};
+use crate::combat::{Projectile, Swing, WhipStyle, MAX_HP};
 use crate::input::Input;
 use crate::rng::Rng;
 use crate::weapons::{WeaponState, ARSENAL, WEAPONS};
@@ -208,6 +208,8 @@ pub struct Worm {
     pub weapons: Vec<WeaponState>,
     /// Index into `weapons`.
     pub current: usize,
+    /// The plasma-whip swing in progress, if any (see `combat::Swing`).
+    pub swing: Option<Swing>,
     pub kills: i32,
     pub deaths: i32,
 }
@@ -243,6 +245,7 @@ impl Worm {
             invuln: 0.0,
             weapons: ARSENAL.iter().map(|&id| WeaponState::full(id)).collect(),
             current: 0,
+            swing: None,
             kills: 0,
             deaths: 0,
         }
@@ -360,23 +363,14 @@ pub enum Event {
     Shot { worm: u8, weapon: u8, pos: Vec3 },
     /// A beam weapon's line, for drawing.
     Beam { from: Vec3, to: Vec3 },
-    /// `worm`'s plasma whip has cracked. `dir`, `side`, `phase`, `style` and
-    /// `flip` are what the viewer needs to rebuild the same curve the sim digs
-    /// (and, for a smash, hits) the world along (see `whip_path`); `length` is
-    /// the reach. The worm itself carries the lash every frame, so this event is
-    /// what starts the swing animation, not what makes the weapon appear.
-    /// `flip` reverses the swing, so a held trigger alternates right-to-left and
-    /// left-to-right instead of repeating one canned arc.
-    Whip {
-        worm: u8,
-        from: Vec3,
-        dir: Vec3,
-        side: Vec3,
-        phase: f32,
-        length: f32,
-        style: WhipStyle,
-        flip: bool,
-    },
+    /// `worm` has started a plasma-whip swing. `fwd`, `side`, `lean`, `style`
+    /// and `flip` are the swing's fixed frame: with them the viewer rebuilds
+    /// the same lash direction the sim hits and cuts along (see `whip_dir`),
+    /// then plays it for `WHIP_SWING_TIME` seconds. The worm itself carries the
+    /// lash every frame, so this event starts the swing animation, not the
+    /// weapon. `flip` reverses the arc, so a held trigger alternates
+    /// right-to-left and left-to-right instead of repeating one canned arc.
+    Whip { worm: u8, from: Vec3, fwd: Vec3, side: Vec3, lean: f32, style: WhipStyle, flip: bool },
     /// `weapon` made the blast: the viewer, the audio and the camera each have
     /// their own signature for it (see `docs/WEAPON_FEEL.md`). `radius` is the
     /// damage reach, not the size of the fireball. `normal` is the surface the
@@ -450,6 +444,7 @@ impl World {
             if self.worms[i].alive {
                 step_worm(&mut self.grid, &mut self.worms[i], &input, &mut self.events);
                 self.step_weapons(i, &input);
+                self.step_swing(i);
             } else {
                 self.step_dead(i);
             }
@@ -913,6 +908,25 @@ mod tests {
         // It does creep up a little: it is stepping up the lip of the hole it
         // just carved. A real climb is metres; this is a knee.
         assert!(w.worms[0].pos.y < 6.0, "tunnelled instead of climbing: y = {}", w.worms[0].pos.y);
+    }
+
+    #[test]
+    fn digging_stops_at_solid_rock() {
+        // The same wall, but the rock beyond it is the arena's solid frame.
+        fn solid(p: Vec3) -> sdf::Material {
+            if p.x > 17.0 { sdf::Material::Solid } else { sdf::Material::Rock }
+        }
+        let grid = Grid::from_fn_material(SIZE, walled, solid);
+        let mut w = World::new(grid, &[(17.0, 16.0)], 1);
+        w.worms[0].pos.y = 4.05;
+        run(&mut w, 30, Input::default());
+        let probe = Vec3::new(20.5, 5.5, 16.0);
+        let before = w.grid.sample(probe);
+        assert!(before < 0.0);
+        let dig_in = Input { yaw: FRAC_PI_2, dig: true, ..Input::default() };
+        run(&mut w, 120, dig_in);
+        assert_eq!(w.grid.sample(probe), before, "the solid wall is untouched");
+        assert_eq!(w.grid.material(probe), sdf::Material::Solid);
     }
 
     /// Highest the worm gets above `ground` in `ticks` ticks of `input`.

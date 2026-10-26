@@ -13,6 +13,25 @@ pub enum Shape {
     /// Block weapon uses this to throw up a rectangular wall; a box keeps the
     /// faces flat instead of looking like a row of lumps.
     Box { centre: Vec3, half: Vec3, yaw: f32 },
+    /// A thin slab: the cut of a whip. It spans the segment `a..b` along one
+    /// axis and reaches `depth` metres into the rock along `dir` (the part of
+    /// `dir` along `a..b` is dropped, so the faces stay flat), and is
+    /// `2 * half_thickness` thick across the sheet. Where a capsule leaves a
+    /// round tunnel, this leaves a flat-walled slit, like a wire through cheese.
+    Blade { a: Vec3, b: Vec3, dir: Vec3, depth: f32, half_thickness: f32 },
+}
+
+/// The blade's own frame: its centre, its three unit axes (along the cut,
+/// into the rock, across the sheet) and its half extents in those axes.
+fn blade_frame(a: Vec3, b: Vec3, dir: Vec3, depth: f32, half_thickness: f32) -> (Vec3, [Vec3; 3], Vec3) {
+    let ab = b - a;
+    let len = ab.length();
+    let u = if len > 1e-4 { ab / len } else { dir.any_orthonormal_vector() };
+    // Into the rock, made perpendicular to the cut so the slab is a true box.
+    let v = (dir - u * dir.dot(u)).try_normalize().unwrap_or_else(|| u.any_orthonormal_vector());
+    let w = u.cross(v);
+    let centre = (a + b) * 0.5 + v * (depth * 0.5);
+    (centre, [u, v, w], Vec3::new(len * 0.5, depth * 0.5, half_thickness))
 }
 
 impl Shape {
@@ -34,6 +53,13 @@ impl Shape {
                 let q = local.abs() - half;
                 q.max(Vec3::ZERO).length() + q.x.max(q.y).max(q.z).min(0.0)
             }
+            Shape::Blade { a, b, dir, depth, half_thickness } => {
+                let (centre, axes, half) = blade_frame(a, b, dir, depth, half_thickness);
+                let d = p - centre;
+                let local = Vec3::new(d.dot(axes[0]), d.dot(axes[1]), d.dot(axes[2]));
+                let q = local.abs() - half;
+                q.max(Vec3::ZERO).length() + q.x.max(q.y).max(q.z).min(0.0)
+            }
         }
     }
 
@@ -48,6 +74,13 @@ impl Shape {
                 let ex = half.x * c.abs() + half.z * s.abs();
                 let ez = half.x * s.abs() + half.z * c.abs();
                 (centre - Vec3::new(ex, half.y, ez), centre + Vec3::new(ex, half.y, ez))
+            }
+            Shape::Blade { a, b, dir, depth, half_thickness } => {
+                // The AABB of an oriented box: each world axis gets the sum of
+                // the half extents projected onto it.
+                let (centre, axes, half) = blade_frame(a, b, dir, depth, half_thickness);
+                let e = axes[0].abs() * half.x + axes[1].abs() * half.y + axes[2].abs() * half.z;
+                (centre - e, centre + e)
             }
         }
     }

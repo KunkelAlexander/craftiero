@@ -25,7 +25,6 @@ fn uniforms() -> String {
     COMMON_UNIFORMS
         .replace("$WORMS", &crate::renderer::MAX_WORMS.to_string())
         .replace("$CAPS", &MAX_PRIMS.to_string())
-        .replace("$STAINS", &crate::renderer::MAX_STAINS.to_string())
         .replace("$TILES", &(crate::renderer::TILE_WORDS * groups).to_string())
         .replace("$WORDS", &crate::renderer::TILE_WORDS.to_string())
         .replace("$GROUPS", &groups.to_string())
@@ -59,8 +58,12 @@ pub fn post() -> String {
     format!("{}{POST}", uniforms())
 }
 
-pub fn sprites() -> String {
+pub fn sprites(world_chunks: IVec3) -> String {
+    let dims = (world_chunks * sdf::CHUNK).as_vec3();
     format!("{}{SPRITES}", uniforms())
+        .replace("$VOX", &f(sdf::VOX))
+        .replace("$BAND", &f(sdf::BAND))
+        .replace("$DIMS", &format!("{}, {}, {}", f(dims.x), f(dims.y), f(dims.z)))
 }
 
 // One uniform block shared by both passes. Everything is vec4 so the Rust side
@@ -90,13 +93,7 @@ struct Soot {
     b: vec4<f32>,           // x: strength 0..1
 }
 
-// A blood stain painted into the terrain's albedo. Must match `Stain` in
-// renderer.rs.
-struct Stain {
-    a: vec4<f32>,           // xyz: centre on the surface, w: radius
-    b: vec4<f32>,           // rgb: colour (sRGB), w: strength 0..1
-    c: vec4<f32>,           // xyz: surface normal, w: noise seed
-}
+
 
 // One worm body, evaluated as a signed distance field. Must match `GpuWorm`
 // in renderer.rs. The sculpt is duplicated from `worm_preview.rs`, where the
@@ -121,11 +118,10 @@ struct U {
     brush: vec4<f32>,       // xyz: centre, w: radius (0 = no brush)
     flags: vec4<f32>,       // x: time, y: shadows, z: ao, w: outlines
     size: vec4<f32>,        // xy: G-buffer size, zw: screen size
-    counts: vec4<f32>,      // x: capsules in use, y: shadow casters (the first y), z: stains
+    counts: vec4<f32>,      // x: capsules, y: shadow casters, z: soot, w: lights
     fx: vec4<f32>,          // x: screen flash 0..1, y: world desaturation 0..1 (zw free)
     lights: array<Light, 8>,
     soot: array<Soot, 8>,
-    stains: array<Stain, $STAINS>,
     worms: array<Worm, $WORMS>,
     caps: array<Prim, $CAPS>,
     // 32 x 18 screen tiles (see TILES_X in renderer.rs), one bit per capsule:
@@ -166,6 +162,53 @@ fn vnoise3(p: vec3<f32>) -> f32 {
     let b = mix(mix(hash31(i + vec3<f32>(0.0, 0.0, 1.0)), hash31(i + vec3<f32>(1.0, 0.0, 1.0)), w.x),
                 mix(hash31(i + vec3<f32>(0.0, 1.0, 1.0)), hash31(i + vec3<f32>(1.0, 1.0, 1.0)), w.x), w.y);
     return mix(a, b, w.z);
+}
+
+// Shared shading helpers. The march pass and the sprite passes must agree on
+// these, or blood painted over the rock would have a different light on it than
+// the rock itself.
+// The palette is written the way you would pick colours in a paint program
+// (sRGB). Shading happens in linear light, so convert on the way in: without
+// this everything looks washed out.
+fn srgb(c: vec3<f32>) -> vec3<f32> {
+    return pow(c, vec3<f32>(2.2));
+}
+
+// Three flat bands with a hair of smoothing so the edges do not alias.
+fn toon(x: f32) -> f32 {
+    return smoothstep(0.0, 0.04, x) * 0.55 + smoothstep(0.42, 0.46, x) * 0.45;
+}
+
+// Add the eight dynamic lights to a shaded surface. The falloff is squared and
+// then banded with `toon`, so a fireball paints hard-edged pools of light on the
+// rock in the same visual language as the sun instead of a smooth CG gradient.
+fn lit_by_points(p: vec3<f32>, n: vec3<f32>, base: vec3<f32>, col: vec3<f32>) -> vec3<f32> {
+    var out = col;
+    for (var i = 0; i < i32(u.counts.w); i++) {
+        let L = u.lights[i];
+        if (L.b.w <= 0.001 || L.a.w <= 0.0) { continue; }
+        let d = L.a.xyz - p;
+        let dist2 = dot(d, d);
+        let reach2 = L.a.w * L.a.w;
+        if (dist2 > reach2) { continue; }
+        let dist = sqrt(dist2);
+        let near = max(1.0 - dist / L.a.w, 0.0);
+        let fall = near * near;
+        let ndl = max(dot(n, d / max(dist, 0.001)), 0.0);
+        let band = 0.30 + 0.70 * toon(ndl);
+        out += base * L.b.rgb * L.b.w * fall * band;
+    }
+    return out;
+}
+
+// The world is deliberately quieter than the actors. Most of the green is
+// pulled out of rock, grass, sky and the arena wall, so the weapon palette,
+// blood and health pips are the only strong colour on screen. Capsules are
+// drawn after this and are never muted. Stains are blood, so they are muted
+// with the ground they lie on.
+fn muted(c: vec3<f32>, amount: f32) -> vec3<f32> {
+    let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return mix(c, vec3<f32>(l), amount);
 }
 "#;
 
@@ -734,10 +777,6 @@ fn caps_block(ro: vec3<f32>, rd: vec3<f32>) -> bool {
 // The palette below is written the way you would pick colours in a paint
 // program (sRGB). Shading happens in linear light, so convert on the way in:
 // without this everything looks washed out.
-fn srgb(c: vec3<f32>) -> vec3<f32> {
-    return pow(c, vec3<f32>(2.2));
-}
-
 fn sky(rd: vec3<f32>) -> vec3<f32> {
     let h = clamp(rd.y, 0.0, 1.0);
     var c = mix(srgb(vec3<f32>(0.95, 0.88, 0.74)), srgb(vec3<f32>(0.40, 0.60, 0.88)), pow(h, 0.45));
@@ -762,7 +801,7 @@ fn albedo(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // overlapping craters are darker than one.
 fn soot_at(p: vec3<f32>) -> f32 {
     var s = 0.0;
-    for (var i = 0; i < 8; i++) {
+    for (var i = 0; i < i32(u.counts.z); i++) {
         let S = u.soot[i];
         if (S.b.x <= 0.001) { continue; }
         let f = 1.0 - smoothstep(S.a.w * 0.55, S.a.w, length(p - S.a.xyz));
@@ -771,71 +810,10 @@ fn soot_at(p: vec3<f32>) -> f32 {
     return min(s, 1.0);
 }
 
-// Blood painted into the rock. A stain is a disc lying on the surface, not a
-// ball in space: only terrain within a few centimetres of its plane is
-// coloured, so a stain behind a bump cannot paint the bump red.
-// Returns premultiplied linear colour in rgb and coverage in a; overlapping
-// stains composite front-to-back as paint would.
-fn stain_at(p: vec3<f32>) -> vec4<f32> {
-    var rgb = vec3<f32>(0.0);
-    var clear = 1.0;
-    for (var i = 0; i < i32(u.counts.z); i++) {
-        let S = u.stains[i];
-        if (S.b.w <= 0.002) { continue; }
-        let d = p - S.a.xyz;
-        // Cheap sphere reject before the surface-distance maths. A ground
-        // pixel is usually far from most stains, so this skips nearly all of
-        // the per-stain work for free.
-        if (dot(d, d) > S.a.w * S.a.w) { continue; }
-        let along = dot(d, S.c.xyz);
-        if (abs(along) > 0.20) { continue; }
-        let rr = length(d - S.c.xyz * along) / S.a.w;
-        if (rr >= 1.0) { continue; }
-        // The same ragged edge as the old decal, so a stain reads as a splat
-        // and not a perfect circle stamped on the floor.
-        let wob = vnoise3(d * 3.0 + vec3<f32>(S.c.w));
-        let a = smoothstep(1.0, 0.22, rr + (wob - 0.5) * 0.55) * S.b.w;
-        rgb += srgb(S.b.rgb) * a * clear;
-        clear *= 1.0 - a;
-    }
-    return vec4<f32>(rgb, 1.0 - clear);
-}
-
-// Three flat bands with a hair of smoothing so the edges do not alias.
-fn toon(x: f32) -> f32 {
-    return smoothstep(0.0, 0.04, x) * 0.55 + smoothstep(0.42, 0.46, x) * 0.45;
-}
-
-// Add the eight dynamic lights to a shaded surface. The falloff is squared and
-// then banded with `toon`, so a fireball paints hard-edged pools of light on the
-// rock in the same visual language as the sun instead of a smooth CG gradient.
-fn lit_by_points(p: vec3<f32>, n: vec3<f32>, base: vec3<f32>, col: vec3<f32>) -> vec3<f32> {
-    var out = col;
-    for (var i = 0; i < 8; i++) {
-        let L = u.lights[i];
-        if (L.b.w <= 0.001 || L.a.w <= 0.0) { continue; }
-        let d = L.a.xyz - p;
-        let dist2 = dot(d, d);
-        let reach2 = L.a.w * L.a.w;
-        if (dist2 > reach2) { continue; }
-        let dist = sqrt(dist2);
-        let near = max(1.0 - dist / L.a.w, 0.0);
-        let fall = near * near;
-        let ndl = max(dot(n, d / max(dist, 0.001)), 0.0);
-        let band = 0.30 + 0.70 * toon(ndl);
-        out += base * L.b.rgb * L.b.w * fall * band;
-    }
-    return out;
-}
-
 // The world is deliberately quieter than the actors. Most of the green is
 // pulled out of rock, grass, sky and the arena wall, so the weapon palette,
 // blood and health pips are the only strong colour on screen. Capsules are
 // drawn after this and are never muted.
-fn muted(c: vec3<f32>, amount: f32) -> vec3<f32> {
-    let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-    return mix(c, vec3<f32>(l), amount);
-}
 
 struct Out {
     @location(0) color: vec4<f32>,
@@ -958,13 +936,6 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
             base = srgb(w_colour(pl, nl, wp));
             base = mix(base, srgb(vec3<f32>(1.0, 0.90, 0.90)), wp.skin.w);
         }
-        // Blood is part of the rock: paint the terrain's own albedo at the
-        // surface point, so the stain follows every bump and can never be
-        // hidden by the ground it lies on.
-        if (kind == 1) {
-            let stain = stain_at(p);
-            base = base * (1.0 - stain.a) + stain.rgb;
-        }
         // Fresh craters are burnt: darken the albedo wherever a recent blast
         // left soot. This follows the bowl's walls for free, which decals on a
         // plane cannot.
@@ -1071,8 +1042,9 @@ const SPRITES: &str = r#"
 // picture. They are raster, not ray-marched, so a fireball is a soft sprite
 // instead of an opaque ball, and a scorch is painted onto the rock instead of
 // floating above it. The G-buffer supplies depth (occlusion) and, for decals,
-// the exact surface point and normal. Blood is not here: it is mixed into the
-// terrain's albedo in the march shader (see `stain_at`), so the ground owns it.
+// the exact surface point and normal. Blood is a decal too: the stain reads the
+// G-buffer and shades itself like the rock it lies on, and a droplet is a
+// small round bead. Both cost one quad, so the map can keep thousands of marks.
 struct Sprite {
     a: vec4<f32>, // xyz centre, w radius (metres)
     b: vec4<f32>, // rgb colour (sRGB), w opacity 0..1
@@ -1081,6 +1053,19 @@ struct Sprite {
 struct Sprites { data: array<Sprite> }
 @group(0) @binding(1) var<storage, read> sprites: Sprites;
 @group(0) @binding(2) var gbuf_tex: texture_2d<f32>;
+// The terrain distance field. Blood only paints terrain, so a stain can ask
+// "is this point on the rock?" instead of colouring a worm that stands in the
+// puddle. Same encoding as `map` in the march shader.
+@group(0) @binding(3) var sdf_tex: texture_3d<f32>;
+@group(0) @binding(4) var sdf_smp: sampler;
+const SDF_VOX: f32 = $VOX;
+const SDF_BAND: f32 = $BAND;
+const SDF_DIMS: vec3<f32> = vec3<f32>($DIMS);
+
+fn terrain_distance(p: vec3<f32>) -> f32 {
+    let uvw = (p / SDF_VOX + 0.5) / SDF_DIMS;
+    return textureSampleLevel(sdf_tex, sdf_smp, uvw, 0.0).r * SDF_BAND;
+}
 
 struct VSOut {
     @builtin(position) pos: vec4<f32>,
@@ -1230,6 +1215,69 @@ fn fs_decal(vin: VSOut) -> @location(0) vec4<f32> {
     let alpha = s.b.w * mask;
     if (alpha <= 0.004) { discard; }
     return vec4<f32>(lin(s.b.rgb), alpha);
+}
+
+// Shade a blood mark with the same sun ramp, camera lamp, point lights, fog and
+// world grade as the terrain. A stain is drawn over the inked picture, not into
+// its albedo, so without this it would read as a bright sticker in a dark cave.
+fn shade_blood(p: vec3<f32>, n: vec3<f32>, base: vec3<f32>) -> vec3<f32> {
+    let lit = max(dot(n, u.sun.xyz), 0.0);
+    let tint = mix(vec3<f32>(0.42, 0.45, 0.70), vec3<f32>(1.10, 1.0, 0.86), toon(lit));
+    var col = base * tint;
+    let to_cam = u.cam_pos.xyz - p;
+    let d = length(to_cam);
+    let lamp = max(dot(n, to_cam / max(d, 0.001)), 0.0) * (1.0 - smoothstep(3.0, 26.0, d));
+    col += base * vec3<f32>(1.0, 0.78, 0.5) * toon(lamp) * 0.5 * (1.0 - toon(lit));
+    col = lit_by_points(p, n, base, col);
+    col = mix(col, srgb(vec3<f32>(0.93, 0.86, 0.72)), 1.0 - exp(-d * 0.002));
+    return muted(col, u.fx.y);
+}
+
+@fragment
+fn fs_blood(vin: VSOut) -> @location(0) vec4<f32> {
+    let s = sprites.data[vin.i];
+    // A stain carries a unit surface normal; a droplet has none. That one test
+    // picks the mode without another buffer or pipeline.
+    if (dot(s.c.xyz, s.c.xyz) < 0.5) {
+        // A bead in flight: a round quad with a fake sphere normal, so it
+        // catches the sun instead of reading as a flat red disc.
+        let r = length(vin.local);
+        if (r > 1.0) { discard; }
+        var alpha = s.b.w * smoothstep(1.0, 0.72, r);
+        alpha *= occlude(vin.ndc, s.a.xyz, s.a.w, 0.08);
+        if (alpha <= 0.004) { discard; }
+        let right = normalize(u.cam_right.xyz);
+        let up = normalize(u.cam_up.xyz);
+        let fwd = normalize(u.cam_fwd.xyz);
+        let n = normalize(right * vin.local.x + up * vin.local.y - fwd * sqrt(max(1.0 - r * r, 0.0)));
+        let lit = max(dot(n, u.sun.xyz), 0.0);
+        // Self-lit enough to read in a dark crater, shaded enough to be a bead.
+        return vec4<f32>(lin(s.b.rgb) * (0.65 + 0.85 * toon(lit)), alpha);
+    }
+    // A mark on the rock: find the visible surface under this pixel and paint
+    // only the disc lying in that surface's plane. The plane test keeps a mark
+    // on one side of a thin wall from bleeding through to the other side.
+    let ndc = vin.ndc;
+    let px = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * u.size.xy;
+    let g = textureLoad(gbuf_tex, vec2<i32>(floor(px)), 0);
+    if (g.w > 300.0 || g.x < 0.0) { discard; }
+    let p = u.cam_pos.xyz + sprite_rd(ndc) * g.w;
+    let n = normalize(g.xyz * 2.0 - 1.0);
+    // Blood belongs to the rock. A worm, gun or rope standing in the puddle
+    // is its own surface, more than a voxel away from the terrain field; leave
+    // it clean. (The feet may still catch a little where they touch the ground,
+    // which is what standing in blood should look like.)
+    if (abs(terrain_distance(p)) > 0.22) { discard; }
+    let d = p - s.a.xyz;
+    let along = dot(d, n);
+    if (abs(along) > 0.20) { discard; }
+    let rr = length(d - n * along) / s.a.w;
+    if (rr > 1.0) { discard; }
+    let wob = vnoise2(vec2<f32>(d.x * 3.0 + d.z * 1.7, d.y * 3.0 + d.z * 0.9) + vec2<f32>(s.c.w));
+    let mask = smoothstep(1.0, 0.22, rr + (wob - 0.5) * 0.55);
+    let alpha = s.b.w * mask;
+    if (alpha <= 0.004) { discard; }
+    return vec4<f32>(shade_blood(p, n, lin(s.b.rgb)), alpha);
 }
 "#;
 
@@ -1431,7 +1479,7 @@ mod tests {
         let groups = TILES_X * TILES_Y / 4;
         let u = uniforms();
         assert!(u.contains(&format!("array<Prim, {MAX_PRIMS}>")));
-        assert!(u.contains(&format!("array<Stain, {}>", crate::renderer::MAX_STAINS)));
+        assert!(!u.contains("struct Stain"), "stains are decals now, not a march uniform");
         assert!(u.contains(&format!("array<vec4<u32>, {}>", TILE_WORDS * groups)));
         assert!(!u.contains('$'), "every uniform placeholder is filled in");
         let m = march(glam::IVec3::splat(2));
@@ -1441,6 +1489,9 @@ mod tests {
         assert!(m.contains(&format!("w < {}u", TILE_WORDS)));
         assert!(m.contains(&format!("w * {}u", groups)));
         assert!(MAX_PRIMS % 32 == 0, "every word must be full");
+        let s = sprites(glam::IVec3::splat(2));
+        assert!(!s.contains('$'), "every sprite placeholder is filled in");
+        assert!(s.contains("texture_3d<f32>"), "blood can sample the terrain");
     }
 
     // The whole point of the shared chunk: the studio sheet and the game compile

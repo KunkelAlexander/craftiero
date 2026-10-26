@@ -172,7 +172,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         speed: 85.0,
         lifetime: 1.2,
         cooldown: 0.085,
-        mag: 24,
+        mag: 72,
         reload: 1.1,
         spread: 0.02,
         range: 0.0,
@@ -246,7 +246,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         speed: 45.0,
         lifetime: 3.0,
         cooldown: 0.35,
-        mag: 8,
+        mag: 16,
         reload: 1.6,
         spread: 0.015,
         range: 0.0,
@@ -439,35 +439,33 @@ pub static WEAPONS: [WeaponDef; 13] = [
     WeaponDef {
         name: "Plasma Whip",
         kind: Kind::Whip,
-        // A long reach and a slow cadence, but a hard hit: this is the
-        // close-quarters answer to a rocket in the face.
-        damage: 44.0,
+        // The R&C crowd-clearer: a light hit, but the swings chain, they pass
+        // through every worm on the arc, and the whole thing is melee. About
+        // five hits to kill, so the rocket stays the lethal tool.
+        damage: 22.0,
         speed: 0.0,
         lifetime: 0.0,
-        // A lash is a whole-body swing, not a flick of the wrist. The lash is
-        // always carried, so the wind-up only coils it: a short tell, then the
-        // crack, then a beat before the next swing. Holding the trigger keeps
-        // the whip swinging; it is melee, not a magazine.
-        cooldown: 0.55,
+        // One swing takes `WHIP_SWING_TIME` (0.30 s); the cooldown is a hair
+        // shorter so a held trigger starts the next swing on the very tick the
+        // last one ends, with no pause in the chain. Melee, not a magazine.
+        cooldown: 0.29,
         mag: 0,
         reload: 0.0,
         spread: 0.0,
-        // The carried lash is about six metres; a strike extends it to
-        // fourteen. `terrain` is the radius of the groove it digs across
-        // whatever rock the sweep crosses. Deep enough to see after the strike,
-        // now that there is no glowing scar to mark it.
-        range: 14.0,
+        // The carried lash is `WHIP_REST` (5 m); a swing extends it to this.
+        range: 9.5,
         blast_radius: 0.0,
         blast_damage: 0.0,
-        knockback: 18.0,
-        terrain: 0.35,
+        knockback: 10.0,
+        // The whip cuts with its own `Blade` shape (see `combat.rs`), not a
+        // round hole, so there is no radius here.
+        terrain: 0.0,
         pellets: 1,
         gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
-        // A short coil, not the old raised-over-the-shoulder draw. The lash is
-        // never put away, so the tell has to live in its shape, not in hiding it.
-        windup: 0.14,
+        // No separate charge: the draw-back is the first fifth of the swing.
+        windup: 0.0,
         loft: 0.0,
     },
     // Not in anyone's arsenal: what the Cluster shell splits into.
@@ -485,7 +483,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         blast_radius: 2.8,
         blast_damage: 42.0,
         knockback: 20.0,
-        terrain: 2.4,
+        terrain: 4.0,
         pellets: 1,
         gravity: 10.0,
         bounce: 0.0,

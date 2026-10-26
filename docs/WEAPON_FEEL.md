@@ -175,11 +175,18 @@ The target is currently the least expressive thing on screen. Needs:
   lean/roll/twist flinch for 0.4 s, strongest on the first frames.
 - **Blood** — Liero's lesson: the hit does not need a number if it paints the
   room. **Done, and turned up:** `Event::Hit` carries the push direction;
-  `effects.rs::blood` throws roughly five times the old spray — about 80
-  self-lit droplets for a whip hit, with a handful of fat gobs — then raycasts
-  stains around the feet and three on the wall behind. Droplets live ~1 s,
-  stains 14 s. It is pure cosmetic particles, no collision and no sim state, and
-  it draws from its own 128-primitive pool (see the budget note below).
+  `effects.rs::blood` throws roughly twice the old spray — about 120 droplets
+  for a mid-strength hit, with a handful of fat gobs — then raycasts stains
+  around the feet, five on the wall behind, and a distant splatter if the
+  arterial jets reach a far surface. Every sixth droplet is a fast, flat jet
+  that can cross the arena, so the spray reads as gore and not only as a cloud.
+  Both droplets and stains are
+  billboards: a droplet is one bead quad, a stain is a decal that reads the
+  G-buffer surface and shades itself like the rock. Droplets live ~1 s (the
+  arterial jets ~1.5 s); marks
+  live ten minutes up to an 8k pool, so the map keeps a fight's history. Blood
+  is pure cosmetic particles, no collision and no sim state, and it never takes
+  a capsule slot from a worm or a rocket (see the budget note below).
 - **Launch** — knockback already pushes. Make the *body* tumble: rotate the
   capsule chain along the velocity while airborne after a hit, and let the death
   throw the body 8-14 m/s instead of replacing it with a white ball.
@@ -268,16 +275,17 @@ Enforce the Loudness column. Concretely:
   consumer. Hitstop and any time scaling are viewer-only.
 - **Capsule budgets.** Gameplay gets 256 slots (`MAX_CAPSULES`): worms, the aim
   aid, projectiles, then bursts, dust and trails, so a busy fight trims the
-  newest smoke first. The blood droplets get their own 128 slots
-  (`MAX_BLOOD_CAPSULES`) and are packed after the gameplay pool; the renderer
-  truncates each pool on its own, so cosmetic spray can never evict a rocket.
-  The stains they leave are a separate 48-slot paint pool in the march shader
-  (`MAX_STAINS`), so a crowded fight cannot erase a wound either. The shader's
-  total capsule array is 384 primitives (12 tile-mask words), still inside the
-  64 KB uniform limit. Within each pool, prefer fewer, bigger,
-  longer-lived primitives over many small ones.
+  newest smoke first. Blood is not in that array at all: droplets and marks are
+  billboards in a storage buffer (`MAX_BLOOD_SPRITES`), one quad each, so
+  cosmetic spray can never evict a rocket. The effects pools hold up to 512
+  droplets and 8192 marks. The shader's capsule array is 256 primitives (8
+  tile-mask words), well inside the 64 KB uniform limit. Within each pool,
+  prefer fewer, bigger, longer-lived primitives over many small ones.
 - **Frame cost.** The march pass is already ~16 ms on the target laptop. New
   effects must be cheap capsules and particles; no per-pixel work per explosion.
+  Blood taught this the hard way: a 48-stain loop in the march shader cost
+  ~20 ms here, while the same marks as decal quads cost ~1 ms even at 8k (see
+  `docs/PERFORMANCE.md` section 11).
 - **No external assets.** Synthesised audio and procedural shapes only.
 - **Web later.** The mixer must not assume a native device; keep the synth
   behind a small trait so a WebAudio backend can be added at M6.

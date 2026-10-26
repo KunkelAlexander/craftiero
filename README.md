@@ -32,8 +32,9 @@ a wounded worm carries a five-pip health bar over its head. Blasts and taking a
 hit flash the whole frame white for a blink, with a slight chromatic split. The
 world is graded a third towards grey by default, so the guns, blood droplets and
 health pips are the only strong colour on screen (`C` A/Bs the grade). Blood that
-lands is mixed into the terrain's own albedo, so the rock carries the stain
-instead of a sprite floating over it. Sounds are panned
+lands is a painted decal: it reads the G-buffer surface, so it follows the rock
+instead of floating over it, and the map keeps thousands of marks for minutes.
+Sounds are panned
 and muffled by distance. The rules run in a pure `sim` crate, with headless tests.
 There is no multiplayer yet (M4-M6, see [PLAN.md](PLAN.md)). The second worm is
 an idle dummy to practise on. The M1 fly camera and brush are still there (press F).
@@ -136,6 +137,22 @@ hunting for one in play.
 
 On Windows the viewer uses DX12 because Vulkan crashed on the Intel driver it was
 developed on. Set `WGPU_BACKEND=vulkan` (or `metal`, `gl`) to override.
+
+### Build a standalone copy to send to someone
+
+The viewer needs no asset files: shaders, sound and the world are in code, so a
+build is one exe. Link the C runtime statically, or the exe also needs the VC++
+runtime (`VCRUNTIME140.dll`), which a clean Windows may not have:
+
+```
+$env:RUSTFLAGS='-C target-feature=+crt-static'
+cargo build -p viewer --release --target-dir target\standalone
+```
+
+Send `target\standalone\release\viewer.exe`. It is a 64-bit Windows build and
+needs a DX12 driver, like the normal build. The separate target directory keeps
+it apart from `target\release`, so `cargo run` is unaffected. Because the exe is
+unsigned, Windows SmartScreen will ask before running it.
 
 ## How it works
 

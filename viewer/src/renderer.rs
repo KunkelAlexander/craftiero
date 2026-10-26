@@ -69,9 +69,10 @@ pub struct FrameParams<'a> {
     /// The worm bodies, one SDF each (up to `MAX_WORMS`). Their shadow proxies
     /// live in `capsules`; the bodies themselves are traced in the shader.
     pub worms: &'a [WormSdf],
-    /// Cosmetic blood droplets, in their own `MAX_BLOOD_CAPSULES` pool. They
-    /// can never push a gameplay primitive out.
-    pub blood: &'a [DrawPrim],
+    /// Blood, both landed and in flight, drawn as painted billboards. A stain
+    /// reads the G-buffer's surface and normal; a droplet is a round bead. They
+    /// are raster quads, so a spray never costs a ray test or a capsule slot.
+    pub blood: &'a [Sprite],
     /// Soft billboards drawn with additive blending: muzzle flash, fire, sparks,
     /// embers, hot cores. Layered over the inked picture, not ray-marched.
     pub glow: &'a [Sprite],
@@ -88,10 +89,6 @@ pub struct FrameParams<'a> {
     /// Spheres of soot left by blasts. The shader darkens the rock inside them,
     /// which is the only way a scorch can follow a curved crater wall.
     pub soot: &'a [Soot],
-    /// Blood marks painted into the terrain's own albedo. Unlike a decal they
-    /// are part of the ground: the march shader colours the rock itself, so no
-    /// depth test and no bump can hide them.
-    pub stains: &'a [Stain],
     /// Brush centre and radius, drawn as a tint plus a rim on the terrain.
     pub brush: Option<(Vec3, f32)>,
     pub time: f32,
@@ -109,18 +106,19 @@ pub struct FrameParams<'a> {
 
 /// Gameplay primitives: worms, guns, ropes, projectiles, aim aids and the
 /// non-blood effects. Four worms with oversized guns take a little over 200,
-/// so 256 leaves room for a busy fight.
+/// so 256 leaves room for a busy fight. Blood is not in this pool: it is drawn
+/// as billboards (see `MAX_BLOOD_SPRITES`), so spray can never evict a rocket.
 pub const MAX_CAPSULES: usize = 256;
 
-/// A separate pool for blood droplets. Cosmetic, so it must never evict a worm
-/// or a rocket, and a crowded fight must never erase a wound. The two pools are
-/// packed back-to-back in the shader's uniform array; the renderer truncates
-/// each on its own. The stains the droplets leave are terrain paint, not here.
-pub const MAX_BLOOD_CAPSULES: usize = 128;
-
 /// The total uniform array. MUST stay a multiple of 32 (one tile-mask word per
-/// 32 primitives) and inside the 64 KB uniform limit; 384 is 12 words.
-pub const MAX_PRIMS: usize = MAX_CAPSULES + MAX_BLOOD_CAPSULES;
+/// 32 primitives) and inside the 64 KB uniform limit; 256 is 8 words.
+pub const MAX_PRIMS: usize = MAX_CAPSULES;
+
+/// Blood sprites: every blood mark on the map, plus the droplets still in the
+/// air. They live in a storage buffer, one quad each, so the cap is about how
+/// much overdraw the frame can paint. The effects pool holds 8k marks and 512
+/// droplets; this is that sum with room to spare.
+pub const MAX_BLOOD_SPRITES: usize = 9216;
 
 /// The soft billboards and decals. These live in storage buffers, not the
 /// raymarcher's uniform array, so a busy fight can throw a thousand sparks
@@ -164,6 +162,16 @@ impl Sprite {
             a: [at.x, at.y, at.z, radius],
             b: [colour.x, colour.y, colour.z, opacity],
             c: [normal.x, normal.y, normal.z, seed],
+        }
+    }
+
+    /// A droplet in flight: a round bead with no surface normal. The blood
+    /// shader picks the bead mode when `c.xyz` is zero.
+    pub fn blood_drop(at: Vec3, radius: f32, colour: Vec3, opacity: f32, seed: f32) -> Sprite {
+        Sprite {
+            a: [at.x, at.y, at.z, radius.max(0.01)],
+            b: [colour.x, colour.y, colour.z, opacity],
+            c: [0.0, 0.0, 0.0, seed],
         }
     }
 
@@ -233,38 +241,6 @@ pub struct Soot {
 impl Soot {
     pub fn new(at: Vec3, radius: f32, strength: f32) -> Soot {
         Soot { a: [at.x, at.y, at.z, radius.max(0.05)], b: [strength.clamp(0.0, 1.0), 0.0, 0.0, 0.0] }
-    }
-}
-
-/// A splat of blood painted into the terrain's albedo. `a.w` is the radius on
-/// the surface, `b.rgb` the colour (sRGB), `b.w` the strength (0..1) and
-/// `c.xyz` the surface normal. Must match `Stain` in shaders.rs.
-///
-/// Why not a decal sprite? A decal is drawn from the G-buffer: a nearer bump
-/// hides the patch, and a stain whose centre sank a few centimetres into the
-/// rock only showed the sliver that poked out. Painting the terrain itself
-/// makes the mark follow the ground exactly, at every angle.
-pub const MAX_STAINS: usize = 48;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Stain {
-    /// xyz: centre on the surface, w: radius in metres.
-    pub a: [f32; 4],
-    /// rgb: colour (sRGB), w: strength 0..1.
-    pub b: [f32; 4],
-    /// xyz: unit surface normal, w: noise seed.
-    pub c: [f32; 4],
-}
-
-impl Stain {
-    pub fn new(at: Vec3, normal: Vec3, radius: f32, colour: Vec3, strength: f32, seed: f32) -> Stain {
-        let n = normal.normalize_or_zero();
-        Stain {
-            a: [at.x, at.y, at.z, radius.max(0.05)],
-            b: [colour.x, colour.y, colour.z, strength.clamp(0.0, 1.0)],
-            c: [n.x, n.y, n.z, seed],
-        }
     }
 }
 
@@ -483,12 +459,11 @@ struct Uniforms {
     brush: [f32; 4],
     flags: [f32; 4],
     size: [f32; 4],
-    counts: [f32; 4], // x: primitives in use, y: shadow casters (the first y), z: stains
+    counts: [f32; 4], // x: primitives in use, y: shadow casters, z: soot, w: lights
     /// x: screen flash 0..1, y: environment desaturation 0..1. zw reserved.
     fx: [f32; 4],
     lights: [Light; MAX_LIGHTS],
     soot: [Soot; MAX_SOOT],
-    stains: [Stain; MAX_STAINS],
     worms: [GpuWorm; MAX_WORMS],
     capsules: [GpuPrim; MAX_PRIMS],
     tiles: [[u32; 4]; TILE_WORDS * TILES_X * TILES_Y / 4],
@@ -598,6 +573,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     world_chunks: IVec3,
     sdf_tex: wgpu::Texture,
+    sdf_view: wgpu::TextureView,
+    terrain_sampler: wgpu::Sampler,
     coarse_tex: wgpu::Texture,
     uniforms: wgpu::Buffer,
     march_pipeline: wgpu::RenderPipeline,
@@ -622,13 +599,16 @@ pub struct Renderer {
     glow_buf: wgpu::Buffer,
     smoke_buf: wgpu::Buffer,
     decal_buf: wgpu::Buffer,
+    blood_buf: wgpu::Buffer,
     glow_pipeline: wgpu::RenderPipeline,
     smoke_pipeline: wgpu::RenderPipeline,
     decal_pipeline: wgpu::RenderPipeline,
+    blood_pipeline: wgpu::RenderPipeline,
     sprite_layout: wgpu::BindGroupLayout,
     glow_bind: wgpu::BindGroup,
     smoke_bind: wgpu::BindGroup,
     decal_bind: wgpu::BindGroup,
+    blood_bind: wgpu::BindGroup,
     scratch: Box<[i8; CHUNK_VOL]>,
     /// Staging area for batched uploads, reused so edits allocate nothing.
     region: Vec<i8>,
@@ -711,8 +691,7 @@ impl Renderer {
             ],
         });
         let sdf_view = sdf_tex.create_view(&Default::default());
-        let coarse_view = coarse_tex.create_view(&Default::default());
-        let march_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let coarse_view = coarse_tex.create_view(&Default::default());        let march_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march bind group"),
             layout: &march_layout,
             entries: &[
@@ -798,6 +777,7 @@ impl Renderer {
         let glow_buf = sprite_buf("glow sprites", MAX_GLOW);
         let smoke_buf = sprite_buf("smoke sprites", MAX_SMOKE);
         let decal_buf = sprite_buf("decal sprites", MAX_DECALS);
+        let blood_buf = sprite_buf("blood sprites", MAX_BLOOD_SPRITES);
         let sprite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sprite layout"),
             entries: &[
@@ -818,12 +798,15 @@ impl Renderer {
                     count: None,
                 },
                 entry(2, tex2d(false)),
+                entry(3, tex3d(wgpu::TextureSampleType::Float { filterable: true })),
+                entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
             ],
         });
-        let sprite_wgsl = shaders::sprites();
+        let sprite_wgsl = shaders::sprites(world_chunks);
         let glow_pipeline = sprite_pipeline(&device, "glow sprites", &sprite_wgsl, "fs_glow", &sprite_layout, true);
         let smoke_pipeline = sprite_pipeline(&device, "smoke sprites", &sprite_wgsl, "fs_smoke", &sprite_layout, false);
         let decal_pipeline = sprite_pipeline(&device, "decals", &sprite_wgsl, "fs_decal", &sprite_layout, false);
+        let blood_pipeline = sprite_pipeline(&device, "blood", &sprite_wgsl, "fs_blood", &sprite_layout, false);
 
         let gbuf = scaled(screen, scale);
         let targets = make_targets(
@@ -846,18 +829,23 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&targets.gbuf) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&sdf_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sampler) },
                 ],
             })
         };
         let glow_bind = sprite_bind(&glow_buf);
         let smoke_bind = sprite_bind(&smoke_buf);
         let decal_bind = sprite_bind(&decal_buf);
+        let blood_bind = sprite_bind(&blood_buf);
 
         let mut r = Renderer {
             device,
             queue,
             world_chunks,
             sdf_tex,
+            sdf_view,
+            terrain_sampler: sampler,
             coarse_tex,
             uniforms,
             march_pipeline,
@@ -878,13 +866,16 @@ impl Renderer {
             glow_buf,
             smoke_buf,
             decal_buf,
+            blood_buf,
             glow_pipeline,
             smoke_pipeline,
             decal_pipeline,
+            blood_pipeline,
             sprite_layout,
             glow_bind,
             smoke_bind,
             decal_bind,
+            blood_bind,
             scratch: Box::new([0; CHUNK_VOL]),
             region: Vec::new(),
             surface_cache: Vec::new(),
@@ -925,10 +916,12 @@ impl Renderer {
         self.glow_bind = self.sprite_bind(&self.glow_buf);
         self.smoke_bind = self.sprite_bind(&self.smoke_buf);
         self.decal_bind = self.sprite_bind(&self.decal_buf);
+        self.blood_bind = self.sprite_bind(&self.blood_buf);
     }
 
     /// A bind group for one sprite pass: the shared uniforms, the storage
-    /// buffer for this pass, and the G-buffer (for depth and the surface normal).
+    /// buffer for this pass, the G-buffer (depth and surface normal) and the
+    /// terrain field (blood uses it to stay off worms and guns).
     fn sprite_bind(&self, buf: &wgpu::Buffer) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sprite bind group"),
@@ -937,6 +930,8 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 0, resource: self.uniforms.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.targets.gbuf) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.sdf_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.terrain_sampler) },
             ],
         })
     }
@@ -1059,15 +1054,14 @@ impl Renderer {
         let aspect = self.screen.0 as f32 / self.screen.1 as f32;
         let (brush_pos, brush_r) = f.brush.unwrap_or((Vec3::ZERO, 0.0));
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        // Two independent pools. Gameplay keeps its shape; blood is appended
-        // after it and can only be truncated within its own 128 slots, so a
-        // worm, rocket or aim mark can never be evicted by a splash.
+        // Gameplay keeps its shape; blood is drawn as billboards and never
+        // takes a capsule slot, so a splash cannot evict a worm, rocket or aim
+        // mark.
         let core: Vec<&DrawPrim> = (f.capsules.iter().filter(|c| c.shadow()))
             .chain(f.capsules.iter().filter(|c| !c.shadow()))
             .take(MAX_CAPSULES)
             .collect();
         let casters = core.iter().filter(|c| c.shadow()).count();
-        let blood = &f.blood[..f.blood.len().min(MAX_BLOOD_CAPSULES)];
         // `counts.y` means "the first y primitives cast shadows", so the casters
         // have to be a prefix. Put them first; the draw pass takes the nearest
         // hit, so its order does not matter.
@@ -1076,7 +1070,6 @@ impl Renderer {
             .copied()
             .filter(|c| c.shadow())
             .chain(core.iter().copied().filter(|c| !c.shadow()))
-            .chain(blood.iter())
             .collect();
         let tiles = tile_masks(cam, aspect, &ordered);
         let mut capsules = [GpuPrim::zeroed(); MAX_PRIMS];
@@ -1093,7 +1086,12 @@ impl Renderer {
             brush: brush_pos.extend(brush_r).to_array(),
             flags: [f.time, flag(f.shadows), flag(f.ao), flag(f.outlines)],
             size: [self.gbuf.0 as f32, self.gbuf.1 as f32, self.screen.0 as f32, self.screen.1 as f32],
-            counts: [used as f32, casters as f32, f.stains.len().min(MAX_STAINS) as f32, 0.0],
+            counts: [
+                used as f32,
+                casters as f32,
+                f.soot.len().min(MAX_SOOT) as f32,
+                f.lights.len().min(MAX_LIGHTS) as f32,
+            ],
             fx: [f.flash.clamp(0.0, 1.0), f.grade.clamp(0.0, 1.0), 0.0, 0.0],
             lights: {
                 let mut l = [Light::zeroed(); MAX_LIGHTS];
@@ -1105,13 +1103,6 @@ impl Renderer {
             soot: {
                 let mut s = [Soot::zeroed(); MAX_SOOT];
                 for (slot, src) in s.iter_mut().zip(f.soot.iter().take(MAX_SOOT)) {
-                    *slot = *src;
-                }
-                s
-            },
-            stains: {
-                let mut s = [Stain::zeroed(); MAX_STAINS];
-                for (slot, src) in s.iter_mut().zip(f.stains.iter().take(MAX_STAINS)) {
                     *slot = *src;
                 }
                 s
@@ -1137,6 +1128,7 @@ impl Renderer {
         upload(&self.glow_buf, f.glow, MAX_GLOW);
         upload(&self.smoke_buf, f.smoke, MAX_SMOKE);
         upload(&self.decal_buf, f.decals, MAX_DECALS);
+        upload(&self.blood_buf, f.blood, MAX_BLOOD_SPRITES);
 
         let slot = self.timer.as_mut().and_then(|t| t.begin(&self.device));
         let timer = self.timer.as_ref();
@@ -1214,6 +1206,9 @@ impl Renderer {
             pass.draw(0..4, 0..count);
         };
         sprite_pass("decals", &self.decal_pipeline, &self.decal_bind, f.decals.len().min(MAX_DECALS) as u32, encoder);
+        // Blood over the scorch: a fresh wound should not be dirtied by the
+        // burn under it. Both are painted from the same G-buffer surface.
+        sprite_pass("blood", &self.blood_pipeline, &self.blood_bind, f.blood.len().min(MAX_BLOOD_SPRITES) as u32, encoder);
         sprite_pass("smoke", &self.smoke_pipeline, &self.smoke_bind, f.smoke.len().min(MAX_SMOKE) as u32, encoder);
         sprite_pass("glow", &self.glow_pipeline, &self.glow_bind, f.glow.len().min(MAX_GLOW) as u32, encoder);
         // Bloom: half-res downsample of the emissive picture, then two separable
@@ -1877,16 +1872,15 @@ mod tests {
 
     #[test]
     fn tile_masks_cover_capsules_in_every_word() {
-        // Bits 39, 100 and 300 land in different words (300 is in the blood
-        // pool): a primitive must still be visible there, or everything past
-        // word zero disappears.
+        // Bits 39, 100 and 255 land in different words: a primitive must still
+        // be visible there, or everything past word zero disappears.
         let capsule = caps(Vec3::new(0.0, 0.0, 10.0), Vec3::new(0.0, 1.0, 10.0), 0.5);
         let refs: Vec<&DrawPrim> = (0..MAX_PRIMS).map(|_| &capsule).collect();
         let cam = Camera { pos: Vec3::ZERO, yaw: 0.0, pitch: 0.0, fov_y: 70f32.to_radians() };
         let masks = tile_masks(&cam, 16.0 / 9.0, &refs);
         assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 39));
         assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 100));
-        assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 300));
+        assert!(bit_set(&masks, TILES_X / 2, TILES_Y / 2, 255));
     }
 
     #[test]

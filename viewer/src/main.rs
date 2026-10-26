@@ -26,7 +26,7 @@ use camera::{Camera, CameraFeel, Kick, FOLLOW_DIST};
 use effects::Effects;
 use feel::shot_kick;
 use glam::{Vec2, Vec3};
-use renderer::{FrameParams, Gpu, Offscreen, Renderer};
+use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
 use sim::weapons::WHIP;
 use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
@@ -467,7 +467,6 @@ fn run_shot(cfg: &Config, path: &str) {
     }
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
     capsules.extend(effects.core_capsules());
-    let blood = effects.blood_capsules();
     let mut sprites = effects.sprites();
     sprites.glow.extend(whip_glow);
     sprites.sort_smoke(cam.pos);
@@ -475,13 +474,12 @@ fn run_shot(cfg: &Config, path: &str) {
         camera: &cam,
         capsules: &capsules,
         worms: &worm_sdfs,
-        blood: &blood,
+        blood: &sprites.blood,
         glow: &sprites.glow,
         smoke: &sprites.smoke,
         decals: &sprites.decals,
         lights: &sprites.lights,
         soot: &sprites.soot,
-        stains: &sprites.stains,
         brush: if cfg.brush { aim_point(&world.grid, &cam).map(|p| (p, 3.0)) } else { None },
         time: 0.0,
         shadows: cfg.shadows,
@@ -600,7 +598,6 @@ fn run_bench(cfg: &Config) {
                 decals: &[],
                 lights: &[],
                 soot: &[],
-                stains: &[],
                 brush: None,
                 time: 0.0,
                 shadows,
@@ -637,7 +634,6 @@ fn run_bench(cfg: &Config) {
         decals: &[],
         lights: &[],
         soot: &[],
-        stains: &[],
         brush: None,
         time: 0.0,
         shadows: true,
@@ -660,6 +656,87 @@ fn run_bench(cfg: &Config) {
         println!("{:<14}{:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", "open hills", label, t.total, t.march, t.post, t.worst);
     }
 
+    // Blood is drawn entirely as billboards now. These rows say what a screen
+    // full of marks and spray costs; the old per-pixel stain loop and the SDF
+    // droplet rows were removed with the implementations they measured.
+    let cam = &views[0].1;
+    let fwd = cam.forward();
+    let flat = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
+    let side = Vec3::Y.cross(flat).normalize_or_zero();
+    let blood_col = Vec3::new(0.78, 0.035, 0.045);
+    let mut marks = Vec::with_capacity(renderer::MAX_BLOOD_SPRITES);
+    for i in 0..renderer::MAX_BLOOD_SPRITES - 512 {
+        let (ix, iz) = ((i % 96) as f32 - 47.5, (i / 96) as f32 - 47.5);
+        let at = cam.pos + flat * (30.0 + iz * 0.7) + side * (ix * 0.7);
+        // Start the ray inside the world: the spawn camera is 56 m up, so
+        // `at + 20` would be above the ceiling and hit nothing.
+        let from = Vec3::new(at.x, 60.0, at.z);
+        if let Some(t) = grid.raycast(from, -Vec3::Y, 80.0) {
+            let hit = from - Vec3::Y * t;
+            let n = grid.gradient(hit).normalize_or_zero();
+            let n = if n.length_squared() > 1.0e-4 { n } else { Vec3::Y };
+            marks.push(Sprite::decal(hit + n * 0.02, n, 0.55, blood_col, 0.95, i as f32));
+        }
+    }
+    let old_cap = marks.len().min(48);
+    let mut drops = Vec::with_capacity(512);
+    for i in 0..512 {
+        let a = i as f32 * 2.399;
+        let at = cam.pos + flat * (5.0 + (i % 7) as f32 * 0.5) + side * (a.cos() * 2.0) + Vec3::Y * (a.sin() * 1.5);
+        drops.push(Sprite::blood_drop(at, 0.09, blood_col, 1.0, i as f32));
+    }
+    let mut both = marks.clone();
+    both.extend_from_slice(&drops);
+    let blood_rows: [(&str, &[Sprite]); 6] = [
+        ("no blood", &[]),
+        ("48 stains (old)", &marks[..old_cap]),
+        ("1024 stains", &marks[..marks.len().min(1024)]),
+        ("all stains", &marks[..]),
+        ("512 drops", &drops[..]),
+        ("marks + drops", &both[..]),
+    ];
+    for (label, blood) in blood_rows {
+        let params = FrameParams {
+            camera: cam,
+            capsules: &[],
+            worms: &[],
+            blood,
+            glow: &[],
+            smoke: &[],
+            decals: &[],
+            lights: &[],
+            soot: &[],
+            brush: None,
+            time: 0.0,
+            shadows: true,
+            ao: true,
+            outlines: true,
+            flash: 0.0,
+            grade: WORLD_GRADE,
+        };
+        let t = time_frames(&gpu, &mut renderer, &target, &params, frames);
+        println!("{:<14}{:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", "open hills", label, t.total, t.march, t.post, t.worst);
+    }
+
+    // The GPU rows above do not include the CPU side of a busy blood pool:
+    // turning 8k marks into sprites and uploading them. Time the build here.
+    let mut fx = Effects::default();
+    for i in 0..200 {
+        let a = i as f32 * 0.7;
+        let at = cam.pos + flat * (6.0 + (i % 12) as f32) + side * (a.cos() * 4.0);
+        // A real hit happens at the worm's feet, not at camera height. Drop
+        // the sample onto the ground so the stain raycasts find it.
+        let from = Vec3::new(at.x, 60.0, at.z);
+        let Some(t) = grid.raycast(from, -Vec3::Y, 80.0) else { continue };
+        fx.blood(from - Vec3::Y * t, Vec3::Z, 70.0, &grid);
+    }
+    let marks = fx.sprites().blood.len();
+    let t = Instant::now();
+    for _ in 0..50 {
+        std::hint::black_box(fx.sprites());
+    }
+    println!("blood sprite build: {:.3} ms for {marks} marks", t.elapsed().as_secs_f64() * 1000.0 / 50.0);
+
     // Edit cost: the CPU edit, the texture upload, and the frame after it.
     let cam = &views[0].1;
     let params = FrameParams {
@@ -672,7 +749,6 @@ fn run_bench(cfg: &Config) {
         decals: &[],
         lights: &[],
         soot: &[],
-        stains: &[],
         brush: None,
         time: 0.0,
         shadows: true,
@@ -1351,11 +1427,9 @@ impl Viewer {
         }
         capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
         capsules.extend(self.effects.core_capsules());
-        // Cosmetic blood travels in its own pool, so it can never trim the
-        // worms, the aim aid or a rocket.
-        let blood = self.effects.blood_capsules();
-        // Soft effects and surface marks: billboards and decals, sorted so alpha
-        // smoke draws back-to-front.
+        // Soft effects, surface marks and blood: billboards and decals, sorted
+        // so alpha smoke draws back-to-front. Blood never touches the capsule
+        // pool, so spray cannot trim a worm, the aim aid or a rocket.
         let mut sprites = self.effects.sprites();
         sprites.glow.extend(whip_glow);
         sprites.sort_smoke(render_camera.pos);
@@ -1385,13 +1459,12 @@ impl Viewer {
             camera: &render_camera,
             capsules: &capsules,
             worms: &worm_sdfs,
-            blood: &blood,
+            blood: &sprites.blood,
             glow: &sprites.glow,
             smoke: &sprites.smoke,
             decals: &sprites.decals,
             lights: &sprites.lights,
             soot: &sprites.soot,
-            stains: &sprites.stains,
             brush,
             time: (now - self.started).as_secs_f32(),
             shadows: self.shadows,

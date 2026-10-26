@@ -908,10 +908,9 @@ mod tests {
             WHIP => Event::Whip {
                 worm: 0,
                 from: Vec3::ZERO,
-                dir: Vec3::Z,
+                fwd: Vec3::Z,
                 side: Vec3::NEG_X,
-                phase: 0.0,
-                length: 9.5,
+                lean: 0.0,
                 style: sim::WhipStyle::Sweep,
                 flip: false,
             },

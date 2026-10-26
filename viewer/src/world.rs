@@ -8,17 +8,37 @@
 // field uses a slope-corrected estimate and the shapes are lower bounds.
 
 use glam::{IVec3, Vec3};
-use sdf::Grid;
+use sdf::{Grid, Material};
 
 /// 128 x 64 x 128 m: 32 x 16 x 32 chunks of 16 voxels of 0.25 m.
 pub const WORLD_CHUNKS: IVec3 = IVec3::new(32, 16, 32);
+/// The same size in metres.
+pub const WORLD_METRES: Vec3 = Vec3::new(
+    WORLD_CHUNKS.x as f32 * sdf::CHUNK as f32 * sdf::VOX,
+    WORLD_CHUNKS.y as f32 * sdf::CHUNK as f32 * sdf::VOX,
+    WORLD_CHUNKS.z as f32 * sdf::CHUNK as f32 * sdf::VOX,
+);
 
 /// Where worms start, as (x, z) columns: they drop from the sky onto the hills
 /// in view of the spawn camera. The second one is a target dummy for now.
 pub const SPAWNS: [(f32, f32); 2] = [(64.0, 38.0), (69.0, 41.0)];
 
+/// Thickness of the indestructible rock around the arena: the four walls and
+/// the floor. Players can throw anything at it; it does not move.
+const SOLID_THICKNESS: f32 = 3.0;
+
+/// Air between the tallest terrain and the world's top face. A surface that
+/// reached the boundary would be clipped there ("an open SDF"), so nothing is
+/// built above this line.
+const SKY_MARGIN: f32 = 8.0;
+const SKY_CEILING: f32 = WORLD_METRES.y - SKY_MARGIN;
+
+/// The rim peaks stay below the solid wall, so a worm cannot climb a mountain
+/// and jump over the arena's frame.
+const RIM_CEILING: f32 = SKY_CEILING - 8.0;
+
 pub fn build() -> Grid {
-    Grid::from_fn(WORLD_CHUNKS, terrain)
+    Grid::from_fn_material(WORLD_CHUNKS, terrain, material)
 }
 
 fn hash2(x: i32, z: i32) -> f32 {
@@ -69,7 +89,8 @@ fn height(x: f32, z: f32) -> f32 {
 }
 
 /// Rolling hills, with mountains rising around the edge so the arena reads as
-/// a valley and the box walls are never seen as flat slabs.
+/// a valley. The mountains stop below the solid frame, which stands above them
+/// at the very edge of the world.
 fn height_raw(x: f32, z: f32) -> f32 {
     let hills = noise2(x * 0.02, z * 0.02) * 16.0 + noise2(x * 0.045, z * 0.045) * 8.0 + noise2(x * 0.1, z * 0.1) * 2.5;
     // Distance to the arena edge. A max-norm would be exact but has creases
@@ -78,7 +99,10 @@ fn height_raw(x: f32, z: f32) -> f32 {
     let r = ((x - 64.0).abs().powi(8) + (z - 64.0).abs().powi(8)).powf(0.125);
     let t = (1.0 - (64.0 - r) / 30.0).clamp(0.0, 1.0);
     let rim = t * t * (3.0 - 2.0 * t) * 56.0;
-    10.0 + hills + rim
+    // The peaks stop well below the grid's top face. A soft min rounds the
+    // plateau over, and every surface (mountain, wall, floating rock) closes
+    // inside the world instead of being cut open by the boundary.
+    smin(10.0 + hills + rim, RIM_CEILING, 6.0)
 }
 
 /// A lower bound of the distance to the height field (`Grid::from_fn` needs
@@ -127,6 +151,30 @@ fn capsule(p: Vec3, a: Vec3, b: Vec3, r: f32) -> f32 {
     (p - (a + ab * t)).length() - r
 }
 
+/// Signed distance to the indestructible frame: four walls and the floor,
+/// stopped `SKY_MARGIN` below the world's top face so the frame's own top face
+/// closes inside the grid. Negative inside the solid rock. The pieces are half-spaces, so
+/// `min` for their union and `max` for the intersection stay exact distances.
+fn frame(p: Vec3) -> f32 {
+    let wall = (p.x - SOLID_THICKNESS)
+        .min(WORLD_METRES.x - SOLID_THICKNESS - p.x)
+        .min(p.z - SOLID_THICKNESS)
+        .min(WORLD_METRES.z - SOLID_THICKNESS - p.z);
+    let floor = p.y - SOLID_THICKNESS;
+    wall.min(floor).max(p.y - SKY_CEILING)
+}
+
+/// The material of the rock at `p`: the frame is `Solid` and everything else is
+/// ordinary, destructible `Rock`. Air gets whatever falls out of this; the
+/// grid only stores it where there is rock.
+fn material(p: Vec3) -> Material {
+    if frame(p) < 0.0 {
+        Material::Solid
+    } else {
+        Material::Rock
+    }
+}
+
 pub fn terrain(p: Vec3) -> f32 {
     // Rock below the height field.
     let mut d = ground(p);
@@ -150,11 +198,15 @@ pub fn terrain(p: Vec3) -> f32 {
         d = smin(d, capsule(p, Vec3::new(x, 0.0, z), Vec3::new(x, 18.0, z), 2.2), 1.5);
     }
 
-    // Floating rocks above the hills.
+    // Floating rocks above the hills. The second one used to poke through the
+    // sky ceiling; it is lower now so its whole surface closes inside the grid.
     d = d.min(sphere(p, Vec3::new(30.0, 48.0, 80.0), 6.0) * 0.8);
-    d = d.min(ellipsoid(p, Vec3::new(98.0, 52.0, 34.0), Vec3::new(9.0, 4.0, 7.0)) * 0.8);
+    d = d.min(ellipsoid(p, Vec3::new(98.0, 50.0, 34.0), Vec3::new(9.0, 3.5, 7.0)) * 0.8);
     d = d.min(sphere(p, Vec3::new(64.0, 44.0, 18.0), 4.0) * 0.8);
-    d
+
+    // The frame goes last: no cavern or tunnel carves it, and it reaches the
+    // world edge so a worm can never leave the arena.
+    d.min(frame(p))
 }
 
 #[cfg(test)]
@@ -169,7 +221,28 @@ mod tests {
         assert!(terrain(Vec3::new(64.0, 2.0, 30.0)) < 0.0, "deep ground is rock");
         assert!(terrain(Vec3::new(64.0, 9.0, 64.0)) > 0.0, "cavern centre is air");
         assert!(terrain(Vec3::new(52.0, 9.0, 52.0)) < 0.0, "pillar is rock");
-        assert!(terrain(Vec3::new(2.0, 60.0, 2.0)) < 0.0, "the rim mountains reach the top at the edge");
+        assert!(terrain(Vec3::new(2.0, 30.0, 2.0)) < 0.0, "the solid frame closes the edge");
+        assert_eq!(material(Vec3::new(2.0, 30.0, 2.0)), Material::Solid);
+        assert!(terrain(Vec3::new(2.0, 60.0, 2.0)) > 0.0, "and stops below the sky ceiling");
+    }
+
+    #[test]
+    fn nothing_reaches_the_sky_ceiling() {
+        // Every column is air at the world's top face: no surface can be cut
+        // open by the boundary.
+        for x in [1.0, 32.0, 64.0, 96.0, 126.0] {
+            for z in [1.0, 32.0, 64.0, 96.0, 126.0] {
+                assert!(terrain(Vec3::new(x, 60.0, z)) > 0.0, "({x}, 60, {z}) is air");
+                assert!(terrain(Vec3::new(x, SKY_CEILING + 0.5, z)) > 0.0, "({x}, top, {z}) is air");
+            }
+        }
+    }
+
+    #[test]
+    fn the_frame_is_solid_and_the_rock_inside_is_not() {
+        assert_eq!(material(Vec3::new(1.5, 20.0, 64.0)), Material::Solid, "wall");
+        assert_eq!(material(Vec3::new(64.0, 1.5, 64.0)), Material::Solid, "floor");
+        assert_eq!(material(Vec3::new(64.0, 20.0, 64.0)), Material::Rock, "the arena rock");
     }
 
     #[test]

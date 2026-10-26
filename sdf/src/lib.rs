@@ -44,19 +44,55 @@ fn dequantize(v: i8) -> f32 {
     v as f32 / SCALE * VOX
 }
 
+/// What a voxel of rock is made of. Air has no material of its own: an edit
+/// that turns air into rock always makes `Rock`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Material {
+    /// Ordinary terrain. Digging, explosions and the brush change it.
+    #[default]
+    Rock,
+    /// The arena's frame. `Grid::apply` refuses to change it, so the world
+    /// always keeps a closed border.
+    Solid,
+}
+
+impl Material {
+    fn is_solid(self) -> bool {
+        matches!(self, Material::Solid)
+    }
+}
+
+/// The per-voxel data of a chunk that is neither all air nor one uniform kind
+/// of rock. Distances and materials are separate arrays: the material is only
+/// read when the distance says "rock", and keeping it out of `i8` leaves the
+/// distance encoding alone.
+struct ChunkData {
+    dist: Box<[i8; CHUNK_VOL]>,
+    /// `None` means every voxel here is ordinary `Rock`. Only chunks that hold
+    /// a solid voxel pay the second array, and most of the world never does.
+    material: Option<Box<[Material; CHUNK_VOL]>>,
+}
+
 /// Pattern: Flyweight. A chunk that is all air or all rock stores nothing, and
 /// all of them share the one meaning. Most of a cave map is exactly that, and
 /// they cost no memory and no meshing time.
 enum Chunk {
     Air,
     Rock,
-    Data(Box<[i8; CHUNK_VOL]>),
+    Solid,
+    Data(Box<ChunkData>),
 }
 
 pub struct Grid {
     /// World size in chunks.
     size: IVec3,
     chunks: Vec<Chunk>,
+    /// Chunks that contain at least one solid voxel. Solid never changes, so
+    /// this is filled once when the map is generated; `apply` uses it to skip
+    /// the distance-to-solid work for edits far from the arena's frame.
+    solid: Vec<bool>,
+
     /// Pattern: Dirty Flag. Chunks whose samples changed since the renderer
     /// last asked. The flag array stops a chunk being queued twice.
     dirty: Vec<bool>,
@@ -70,6 +106,7 @@ impl Grid {
         Grid {
             size: size_chunks,
             chunks: (0..n).map(|_| Chunk::Rock).collect(),
+            solid: vec![false; n],
             dirty: vec![false; n],
             dirty_list: Vec::new(),
         }
@@ -80,6 +117,18 @@ impl Grid {
     /// uniform. That shortcut is only valid if `f` never over-estimates the
     /// distance, so write `f` conservatively.
     pub fn from_fn(size_chunks: IVec3, f: fn(Vec3) -> f32) -> Grid {
+        Self::from_fn_material(size_chunks, f, |_| Material::Rock)
+    }
+
+    /// `from_fn`, plus a material for the rock at each point. `material` is
+    /// only asked about voxels that end up inside rock; an all-rock chunk that
+    /// is entirely `Solid` collapses to `Chunk::Solid` just like an all-`Rock`
+    /// one collapses to `Chunk::Rock`.
+    pub fn from_fn_material(
+        size_chunks: IVec3,
+        f: fn(Vec3) -> f32,
+        material: fn(Vec3) -> Material,
+    ) -> Grid {
         let mut g = Grid::new(size_chunks);
         let half_diagonal = CHUNK as f32 * 0.5 * 3f32.sqrt() * VOX;
         // Cheap serial pass: one evaluation per chunk settles the easy ones.
@@ -94,7 +143,19 @@ impl Grid {
                         let idx = g.chunk_index(c);
                         g.chunks[idx] = Chunk::Air;
                     } else if d >= -(half_diagonal + BAND) {
-                        undecided.push(c); // (the rest stay Rock)
+                        undecided.push(c);
+                    } else {
+                        // Deep inside rock: the distance is uniform, but the
+                        // material is not necessarily. A chunk that straddles a
+                        // material boundary has to be evaluated voxel by voxel.
+                        match uniform_material(c * CHUNK, CHUNK, material) {
+                            Some(Material::Solid) => {
+                                let idx = g.chunk_index(c);
+                                g.chunks[idx] = Chunk::Solid;
+                            }
+                            Some(Material::Rock) => {} // stays Rock
+                            None => undecided.push(c),
+                        }
                     }
                 }
             }
@@ -107,7 +168,7 @@ impl Grid {
         let results: Vec<(IVec3, Chunk)> = std::thread::scope(|scope| {
             let workers: Vec<_> = undecided
                 .chunks(per_thread)
-                .map(|part| scope.spawn(move || part.iter().map(|&c| (c, eval_chunk(c, f))).collect::<Vec<_>>()))
+                .map(|part| scope.spawn(move || part.iter().map(|&c| (c, eval_chunk(c, f, material))).collect::<Vec<_>>()))
                 .collect();
             // Joined in order, so the result does not depend on thread timing.
             workers.into_iter().flat_map(|w| w.join().expect("map worker panicked")).collect()
@@ -119,6 +180,7 @@ impl Grid {
             }
             g.chunks[idx] = chunk;
         }
+        g.solid = g.chunks.iter().map(contains_solid).collect();
         g
     }
 
@@ -152,9 +214,32 @@ impl Grid {
         let c = IVec3::new(v.x >> SHIFT, v.y >> SHIFT, v.z >> SHIFT);
         match &self.chunks[self.chunk_index(c)] {
             Chunk::Air => 127,
-            Chunk::Rock => -127,
-            Chunk::Data(data) => data[local_index(v & MASK)],
+            Chunk::Rock | Chunk::Solid => -127,
+            Chunk::Data(data) => data.dist[local_index(v & MASK)],
         }
+    }
+
+    /// Material of the voxel at integer voxel coordinates `v`. Outside the
+    /// grid counts as solid, matching `voxel`'s "outside is rock".
+    fn material_voxel(&self, v: IVec3) -> Material {
+        let d = self.voxel_dims();
+        if v.x as u32 >= d.x as u32 || v.y as u32 >= d.y as u32 || v.z as u32 >= d.z as u32 {
+            return Material::Solid;
+        }
+        let c = IVec3::new(v.x >> SHIFT, v.y >> SHIFT, v.z >> SHIFT);
+        match &self.chunks[self.chunk_index(c)] {
+            Chunk::Air | Chunk::Rock => Material::Rock,
+            Chunk::Solid => Material::Solid,
+            Chunk::Data(data) => data
+                .material
+                .as_ref()
+                .map_or(Material::Rock, |m| m[local_index(v & MASK)]),
+        }
+    }
+
+    /// Material of the voxel containing `p`.
+    pub fn material(&self, p: Vec3) -> Material {
+        self.material_voxel((p / VOX).floor().as_ivec3())
     }
 
     fn set_voxel(&mut self, v: IVec3, value: i8) {
@@ -162,13 +247,18 @@ impl Grid {
         let idx = self.chunk_index(c);
         // A uniform chunk becomes real data the first time something is cut
         // into it. (Chunks never turn back into uniform: a cheap omission that
-        // costs memory only, never correctness.)
+        // costs memory only, never correctness.) Solid chunks never get here:
+        // `apply` skips their voxels, so a chunk that turns to data is always
+        // rock. The material fill is therefore Rock.
         if !matches!(self.chunks[idx], Chunk::Data(_)) {
             let fill = if matches!(self.chunks[idx], Chunk::Air) { 127 } else { -127 };
-            self.chunks[idx] = Chunk::Data(Box::new([fill; CHUNK_VOL]));
+            self.chunks[idx] = Chunk::Data(Box::new(ChunkData {
+                dist: Box::new([fill; CHUNK_VOL]),
+                material: None,
+            }));
         }
         if let Chunk::Data(data) = &mut self.chunks[idx] {
-            data[local_index(v & MASK)] = value;
+            data.dist[local_index(v & MASK)] = value;
         }
     }
 
@@ -208,8 +298,8 @@ impl Grid {
     pub fn copy_chunk(&self, c: IVec3, out: &mut [i8; CHUNK_VOL]) {
         match &self.chunks[self.chunk_index(c)] {
             Chunk::Air => out.fill(127),
-            Chunk::Rock => out.fill(-127),
-            Chunk::Data(data) => out.copy_from_slice(&data[..]),
+            Chunk::Rock | Chunk::Solid => out.fill(-127),
+            Chunk::Data(data) => out.copy_from_slice(&data.dist[..]),
         }
     }
 
@@ -217,6 +307,43 @@ impl Grid {
     /// The renderer builds its empty-space skipping map from this.
     pub fn chunk_has_surface(&self, c: IVec3) -> bool {
         matches!(self.chunks[self.chunk_index(c)], Chunk::Data(_))
+    }
+
+    /// How far voxel `v` is from the nearest solid rock, up to `reach_metres`.
+    /// `None` means no solid voxel was found close enough to clamp against.
+    ///
+    /// Carving air normally raises its distance to the shape's boundary. If an
+    /// indestructible voxel is closer than that boundary it cannot have been
+    /// removed, so the true distance stays the smaller one. Without this clamp
+    /// the band in front of the solid frame reads up to 1 m too far and the
+    /// raymarcher overshoots it: the speckled, hatched surfaces seen where
+    /// digging reaches the floor.
+    ///
+    /// 26 rays of at most five voxels are enough for a solid mass the size of
+    /// the frame, and cost a fraction of a sphere search per voxel. One voxel
+    /// is subtracted because the last solid voxel's centre is one voxel inside
+    /// the field's zero, so the result never over-estimates the distance.
+    fn solid_distance(&self, v: IVec3, reach_metres: f32) -> Option<f32> {
+        let steps = ((reach_metres + VOX) / VOX).ceil() as i32;
+        let mut best = f32::INFINITY;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    for n in 1..=steps {
+                        let s = v + IVec3::new(dx * n, dy * n, dz * n);
+                        if !self.material_voxel(s).is_solid() {
+                            continue;
+                        }
+                        let d = (((v - s).as_vec3() * VOX).length() - VOX).max(0.0);
+                        best = best.min(d);
+                    }
+                }
+            }
+        }
+        best.is_finite().then_some(best)
     }
 
     /// Cut, add or blend a shape into the terrain. Deterministic: only
@@ -241,6 +368,19 @@ impl Grid {
                     }
                     let v_lo = origin.max(lo);
                     let v_hi = (origin + IVec3::splat(CHUNK - 1)).min(hi);
+                    // Only a carve near solid rock can raise a distance past
+                    // the nearest surface, so only those chunks need the probe.
+                    let near_solid = (0..3).any(|dz| {
+                        (0..3).any(|dy| {
+                            (0..3).any(|dx| {
+                                let n = IVec3::new(cx - 1 + dx, cy - 1 + dy, cz - 1 + dz);
+                                n.cmpge(IVec3::ZERO).all()
+                                    && n.cmplt(self.size).all()
+                                    && self.solid[self.chunk_index(n)]
+                            })
+                        })
+                    });
+                    let clamp_solid = near_solid && matches!(op, Op::Carve);
                     let mut changed_lo = IVec3::splat(i32::MAX);
                     let mut changed_hi = IVec3::splat(i32::MIN);
                     for z in v_lo.z..=v_hi.z {
@@ -249,9 +389,34 @@ impl Grid {
                                 let v = IVec3::new(x, y, z);
                                 let old = self.voxel(v);
                                 let d_shape = shape.distance(v.as_vec3() * VOX);
-                                let new = quantize(op.combine(dequantize(old), d_shape));
+                                let mut new = quantize(op.combine(dequantize(old), d_shape));
                                 if new == old {
                                     continue;
+                                }
+                                // Solid terrain is the arena's frame: the shaped
+                                // hole stops at its face instead of cutting
+                                // through. Checked after `new == old` so chunks
+                                // of solid rock that the shape does not reach
+                                // cost only the distance test.
+                                if self.material_voxel(v).is_solid() {
+                                    continue;
+                                }
+                                // Carving air raises the stored distance to the
+                                // shape's own boundary. A solid voxel closer than
+                                // that boundary is still there, so keep the
+                                // smaller distance (see `solid_distance`).
+                                if clamp_solid && new > old {
+                                    let want = dequantize(new);
+                                    if want > 0.0 {
+                                        if let Some(d) = self.solid_distance(v, want) {
+                                            if d < want {
+                                                new = quantize(d);
+                                                if new == old {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 self.set_voxel(v, new);
                                 // Every change counts, even far from the surface:
@@ -326,12 +491,18 @@ impl Grid {
             let tag = match c {
                 Chunk::Air => 1u8,
                 Chunk::Rock => 2u8,
-                Chunk::Data(_) => 3u8,
+                Chunk::Solid => 3u8,
+                Chunk::Data(_) => 4u8,
             };
             h = (h ^ tag as u64).wrapping_mul(0x100000001b3);
             if let Chunk::Data(data) = c {
-                for b in data.iter() {
+                for b in data.dist.iter() {
                     h = (h ^ (*b as u8) as u64).wrapping_mul(0x100000001b3);
+                }
+                if let Some(material) = &data.material {
+                    for m in material.iter() {
+                        h = (h ^ (*m as u8) as u64).wrapping_mul(0x100000001b3);
+                    }
                 }
             }
         }
@@ -339,16 +510,42 @@ impl Grid {
     }
 }
 
+fn contains_solid(chunk: &Chunk) -> bool {
+    match chunk {
+        Chunk::Solid => true,
+        Chunk::Data(data) => data.material.as_ref().is_some_and(|m| m.iter().any(|&v| v.is_solid())),
+        _ => false,
+    }
+}
+
+/// The material of a whole `size` voxel cube, if it is the same at the centre
+/// and all eight corners. `None` means a material boundary runs through it and
+/// it has to be evaluated per voxel. Used for whole chunks in the cheap map pass
+/// and for 4^3 blocks inside `eval_chunk`.
+fn uniform_material(origin: IVec3, size: i32, material: fn(Vec3) -> Material) -> Option<Material> {
+    let centre = (origin.as_vec3() + Vec3::splat(size as f32 * 0.5 - 0.5)) * VOX;
+    let m = material(centre);
+    let last = size - 1;
+    for i in 0..8 {
+        let corner = IVec3::new((i & 1) * last, ((i >> 1) & 1) * last, ((i >> 2) & 1) * last);
+        if material((origin + corner).as_vec3() * VOX) != m {
+            return None;
+        }
+    }
+    Some(m)
+}
+
 /// Sample `f` over one chunk, in blocks of 4 x 4 x 4 voxels. The same "far from
 /// the surface" shortcut that skips whole chunks is applied per block: one
 /// evaluation at the block centre decides it, and only blocks near the surface
 /// pay for all 64 voxels. Most of an undecided chunk is empty air or solid rock
 /// next to a thin surface, so this cuts the evaluations of a typical map ~3x.
-fn eval_chunk(c: IVec3, f: fn(Vec3) -> f32) -> Chunk {
+fn eval_chunk(c: IVec3, f: fn(Vec3) -> f32, material: fn(Vec3) -> Material) -> Chunk {
     const BLOCK: i32 = 4;
     let block_half_diagonal = BLOCK as f32 * 0.5 * 3f32.sqrt() * VOX;
     let origin = c * CHUNK;
-    let mut data = Box::new([0i8; CHUNK_VOL]);
+    let mut dist = Box::new([0i8; CHUNK_VOL]);
+    let mut mats = Box::new([Material::Rock; CHUNK_VOL]);
     for bz in (0..CHUNK).step_by(BLOCK as usize) {
         for by in (0..CHUNK).step_by(BLOCK as usize) {
             for bx in (0..CHUNK).step_by(BLOCK as usize) {
@@ -362,14 +559,28 @@ fn eval_chunk(c: IVec3, f: fn(Vec3) -> f32) -> Chunk {
                 } else {
                     None
                 };
+                // Deep inside rock the material can be settled for the whole
+                // block in nine calls. Near the surface every rock voxel is
+                // asked, because a solid border that cuts through a block must
+                // not launder the destructive voxels beside it.
+                let block_mat = match fill {
+                    Some(-127) => uniform_material(origin + block, BLOCK, material),
+                    _ => None,
+                };
                 for lz in bz..bz + BLOCK {
                     for ly in by..by + BLOCK {
                         for lx in bx..bx + BLOCK {
                             let l = IVec3::new(lx, ly, lz);
-                            data[local_index(l)] = match fill {
+                            let p = (origin + l).as_vec3() * VOX;
+                            let i = local_index(l);
+                            let v = match fill {
                                 Some(v) => v,
-                                None => quantize(f((origin + l).as_vec3() * VOX)),
+                                None => quantize(f(p)),
                             };
+                            dist[i] = v;
+                            if v < 0 {
+                                mats[i] = block_mat.unwrap_or_else(|| material(p));
+                            }
                         }
                     }
                 }
@@ -379,12 +590,19 @@ fn eval_chunk(c: IVec3, f: fn(Vec3) -> f32) -> Chunk {
     // A chunk the centre test could not rule out may still quantize to all air
     // (the band clamps at 1 m) or all rock. Store it as uniform: it costs
     // nothing, and a renderer can skip it.
-    if data.iter().all(|&v| v == 127) {
+    let any_solid = mats.iter().any(|&m| m == Material::Solid);
+    if dist.iter().all(|&v| v == 127) {
         Chunk::Air
-    } else if data.iter().all(|&v| v == -127) {
-        Chunk::Rock
+    } else if dist.iter().all(|&v| v == -127) {
+        if !any_solid {
+            Chunk::Rock
+        } else if mats.iter().all(|&m| m == Material::Solid) {
+            Chunk::Solid
+        } else {
+            Chunk::Data(Box::new(ChunkData { dist, material: Some(mats) }))
+        }
     } else {
-        Chunk::Data(data)
+        Chunk::Data(Box::new(ChunkData { dist, material: any_solid.then_some(mats) }))
     }
 }
 
@@ -451,6 +669,28 @@ mod tests {
     }
 
     #[test]
+    fn a_blade_cuts_a_thin_slit_into_a_wall() {
+        // A wall of rock at z >= 8, cut along x at height 6, 1.5 m deep.
+        let mut g = Grid::from_fn(IVec3::new(4, 4, 4), |p| 8.0 - p.z);
+        let blade = Shape::Blade {
+            a: Vec3::new(4.0, 6.0, 8.0),
+            b: Vec3::new(10.0, 6.0, 8.0),
+            dir: Vec3::Z,
+            depth: 1.5,
+            half_thickness: 0.25,
+        };
+        g.apply(blade, Op::Carve);
+        assert!(g.sample(Vec3::new(7.0, 6.0, 8.8)) > 0.0, "the slit is open");
+        assert!(g.sample(Vec3::new(7.0, 6.9, 8.8)) < 0.0, "rock above the slit stays");
+        assert!(g.sample(Vec3::new(7.0, 5.1, 8.8)) < 0.0, "rock below the slit stays");
+        assert!(g.sample(Vec3::new(7.0, 6.0, 10.2)) < 0.0, "the slit stops at its depth");
+        assert!(g.sample(Vec3::new(12.0, 6.0, 8.8)) < 0.0, "and at its length");
+        // The bounds cover every voxel the shape can change.
+        let (lo, hi) = blade.bounds();
+        assert!(lo.x <= 4.0 && hi.x >= 10.0 && hi.z >= 9.5 && lo.y <= 5.75 && hi.y >= 6.25);
+    }
+
+    #[test]
     fn gradient_points_out_of_rock() {
         let mut g = world();
         let c = Vec3::splat(8.0);
@@ -496,6 +736,51 @@ mod tests {
         edit(&mut a);
         edit(&mut b);
         assert_eq!(a.checksum(), b.checksum());
+    }
+
+    #[test]
+    fn solid_terrain_cannot_be_carved() {
+        // Rock everywhere, but the bottom half is the arena's solid frame.
+        let mut g = Grid::from_fn_material(
+            IVec3::new(4, 4, 4),
+            |p| p.y - 8.0,
+            |p| if p.y < 4.0 { Material::Solid } else { Material::Rock },
+        );
+        assert!(g.sample(Vec3::new(8.0, 2.0, 8.0)) < 0.0);
+        assert_eq!(g.material(Vec3::new(8.0, 2.0, 8.0)), Material::Solid);
+        g.apply(Shape::Sphere { center: Vec3::new(8.0, 4.0, 8.0), radius: 3.0 }, Op::Carve);
+        assert!(g.sample(Vec3::new(8.0, 2.0, 8.0)) < 0.0, "solid stays rock");
+        assert_eq!(g.material(Vec3::new(8.0, 2.0, 8.0)), Material::Solid);
+        assert!(g.sample(Vec3::new(8.0, 6.5, 8.0)) > 0.0, "the rock above is carved away");
+    }
+
+    #[test]
+    fn a_carve_does_not_inflate_air_in_front_of_solid_rock() {
+        // Air above a solid floor at y = 4 (destructible rock would be above,
+        // but there is none here: the floor is the nearest surface).
+        let mut g = Grid::from_fn_material(
+            IVec3::new(4, 4, 4),
+            |p| p.y - 4.0,
+            |p| if p.y < 4.0 { Material::Solid } else { Material::Rock },
+        );
+        let probe = Vec3::new(8.0, 4.2, 8.0);
+        let before = g.sample(probe);
+        assert!((before - 0.2).abs() < 0.12, "air is 0.2 m above the floor: {before}");
+
+        // A crater centred on the floor cannot remove the solid rock. Without
+        // the clamp this raised the air's distance to the 1 m band and made the
+        // raymarcher overshoot the floor (the hatching seen when digging down).
+        g.apply(Shape::Sphere { center: Vec3::new(8.0, 4.0, 8.0), radius: 3.0 }, Op::Carve);
+        let after = g.sample(probe);
+        assert!(after < before + 0.15, "the floor is still the nearest surface: {before} -> {after}");
+        assert!(g.sample(Vec3::new(8.0, 3.9, 8.0)) < 0.0, "the floor is still there");
+    }
+
+    #[test]
+    fn checksum_notices_a_material_change() {
+        let rock = Grid::from_fn(IVec3::new(2, 2, 2), |p| p.y - 4.0);
+        let solid = Grid::from_fn_material(IVec3::new(2, 2, 2), |p| p.y - 4.0, |_| Material::Solid);
+        assert_ne!(rock.checksum(), solid.checksum(), "material is part of the terrain");
     }
 
     #[test]
