@@ -422,16 +422,28 @@ fn run_shot(cfg: &Config, path: &str) {
         let elapsed = ticks as f32 * DT;
         let fired = elapsed >= WEAPONS[weapon as usize].windup;
         if fired {
-            if let (Some(anim), Some(worm)) = (anims.first_mut(), world.worms.first()) {
+            if weapon == WHIP {
+                // The whip is a rope: it only looks right if it has been
+                // stepped through the swing, as the game would. Start the swing
+                // and replay `ticks` frames of it (the pictures are thrown away).
+                let worm = &world.worms[0];
+                let (fwd, side, lean) = sim::whip_frame(worm.aim_dir(), worm.face_yaw);
+                anims[0].fired();
+                anims[0].struck(WhipStyle::Sweep, false, fwd, side, lean);
+                for _ in 0..ticks {
+                    anims[0].update(&world.worms[0], DT);
+                    worms::draw(&world.worms, &positions, &mut anims, DT);
+                }
+            } else if let (Some(anim), Some(worm)) = (anims.first_mut(), world.worms.first()) {
                 anim.fired();
                 for _ in 0..ticks {
                     anim.update(worm, DT);
                 }
-                if weapon == WHIP {
-                    // The strike lands after the draw-back; start its swing
-                    // clock at the tick the sim would have fired it.
-                    anim.struck_at(WhipStyle::Sweep, 0.0, false, elapsed - WEAPONS[WHIP as usize].windup);
-                }
+            }
+        } else if weapon == WHIP {
+            // Not fired yet: just let the carried lash settle.
+            for _ in 0..30 {
+                worms::draw(&world.worms, &positions, &mut anims, DT);
             }
         }
     }
@@ -455,7 +467,7 @@ fn run_shot(cfg: &Config, path: &str) {
             anim.update(worm, 0.03);
         }
     }
-    let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&world.worms, &positions, &anims);
+    let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&world.worms, &positions, &mut anims, DT);
     for worm in &world.worms {
         capsules.extend(effects::charging(worm));
     }
@@ -622,8 +634,8 @@ fn run_bench(cfg: &Config) {
         .collect();
     worms[1].rope = Some(sim::Rope { anchor: Vec3::new(64.0, 60.0, 44.0), length: 10.0 });
     let positions: Vec<Vec3> = worms.iter().map(|w| w.pos).collect();
-    let anims: Vec<worms::Anim> = worms.iter().map(|_| worms::Anim::default()).collect();
-    let (capsules, _whip_glow, sdfs) = worms::draw(&worms, &positions, &anims);
+    let mut anims: Vec<worms::Anim> = worms.iter().map(|_| worms::Anim::default()).collect();
+    let (capsules, _whip_glow, sdfs) = worms::draw(&worms, &positions, &mut anims, DT);
     let with = FrameParams {
         camera: &views[0].1,
         capsules: &capsules,
@@ -715,6 +727,56 @@ fn run_bench(cfg: &Config) {
             grade: WORLD_GRADE,
         };
         let t = time_frames(&gpu, &mut renderer, &target, &params, frames);
+        println!("{:<14}{:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", "open hills", label, t.total, t.march, t.post, t.worst);
+    }
+
+    // Sequential rows are noisy on this iGPU when the clock drifts. Alternate
+    // "no blood" and "every mark" within the same run, as the worm benchmark
+    // does, so the delta is meaningful even if the absolute times move.
+    let no_blood = FrameParams {
+        camera: cam,
+        capsules: &[],
+        worms: &[],
+        blood: &[],
+        glow: &[],
+        smoke: &[],
+        decals: &[],
+        lights: &[],
+        soot: &[],
+        brush: None,
+        time: 0.0,
+        shadows: true,
+        ao: true,
+        outlines: true,
+        flash: 0.0,
+        grade: WORLD_GRADE,
+    };
+    let all_blood = FrameParams {
+        camera: cam,
+        capsules: &[],
+        worms: &[],
+        blood: &marks[..],
+        glow: &[],
+        smoke: &[],
+        decals: &[],
+        lights: &[],
+        soot: &[],
+        brush: None,
+        time: 0.0,
+        shadows: true,
+        ao: true,
+        outlines: true,
+        flash: 0.0,
+        grade: WORLD_GRADE,
+    };
+    let (mut a, mut b) = (None::<Timing>, None::<Timing>);
+    for _ in 0..5 {
+        let x = time_frames(&gpu, &mut renderer, &target, &no_blood, frames);
+        let y = time_frames(&gpu, &mut renderer, &target, &all_blood, frames);
+        a = Some(match a { Some(p) if p.total <= x.total => p, _ => x });
+        b = Some(match b { Some(p) if p.total <= y.total => p, _ => y });
+    }
+    for (label, t) in [("no blood (alt)", a.unwrap()), ("all stains (alt)", b.unwrap())] {
         println!("{:<14}{:<20}{:>9.2}{:>9.2}{:>9.2}{:>9.2}", "open hills", label, t.total, t.march, t.post, t.worst);
     }
 
@@ -1203,13 +1265,13 @@ impl Viewer {
                         self.feel.kick(&self.camera, shot_kick(weapon));
                     }
                 }
-                Event::Whip { worm, from, phase, style, flip, .. } => {
+                Event::Whip { worm, from, fwd, side, lean, style, flip } => {
                     // The lash is part of the worm's model, so the strike is an
                     // animation cue, not a spawned effect. The camera answers
                     // the crack, not a muzzle flash: a lateral shove with a
                     // small lens punch, timed to the swing.
                     if let Some(anim) = self.anims.get_mut(worm as usize) {
-                        anim.struck(style, phase, flip);
+                        anim.struck(style, flip, fwd, side, lean);
                     }
                     if worm == 0 {
                         let away = (from - self.camera.pos).length();
@@ -1412,7 +1474,7 @@ impl Viewer {
             }
         }
 
-        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.world.worms, &draw_pos, &self.anims);
+        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.world.worms, &draw_pos, &mut self.anims, dt);
         // A charge is state, not an event: draw it for every worm, so a Nova
         // spin-up is a warning you can see coming.
         for worm in &self.world.worms {

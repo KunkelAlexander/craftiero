@@ -8,7 +8,7 @@
 // fewer of them.
 
 use crate::feel;
-use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA, PLASMA_HOT, SMOKE, VIOLET};
+use crate::feel::{BEAM, BRASS, CYAN, DUST, EMBER, HOT, ICE, LIME, MAGENTA, PLASMA_HOT, SMOKE, VIOLET};
 use crate::renderer::{DrawPrim, Light, Soot, Sprite};
 use glam::Vec3;
 use sdf::Grid;

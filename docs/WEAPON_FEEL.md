@@ -124,7 +124,7 @@ at 2 must stay quiet even when it is the newest thing in the game.
 | 8 | Nova | the cavern eraser | a 1.2 s charge: the view narrows, a ring of light gathers and spins | white-out, a fireball that fills the crater, the ground rolling | a 3 s smoke column and a crater rim glowing orange, cooling to black | **5** |
 | 9 | Block | the wall | none: it is instant | the rock *slams* into place, a dust ring, one hard thud | dust settling off the new face | **2** |
 | 10 | Tractor | the bridge | a grinding hum while held | a continuous stream of lumps, each with a small impact | the new span, still dusty | **2** |
-| 11 | Plasma Whip | the cut | a 0.14 s coil: the carried lash tightens and brightens, the arm draws back | the crack, a fourteen-metre horizontal sweep that alternates direction, a white starburst at the rock, motion ghosts | a long shallow groove dug into the rock; no heat line | **3** |
+| 11 | Plasma Whip | the cut | the arm draws back over the first fifth of the 0.30 s swing, the rope paying out | a wide horizontal arc that alternates direction, the tip trailing the hand and cracking round, a white starburst where it bites rock, a fading trail | a thin flat-walled slit in the rock; no heat line | **3** |
 Two of these are already the best in the game and should be the template: the
 **Whip** (its cut is shaped by the weapon: a horizontal groove dug by the
 sweep) and the **Nova's aim ring** (the choice is heavy before the shot).
@@ -177,13 +177,14 @@ The target is currently the least expressive thing on screen. Needs:
   room. **Done, and turned up:** `Event::Hit` carries the push direction;
   `effects.rs::blood` throws roughly twice the old spray — about 120 droplets
   for a mid-strength hit, with a handful of fat gobs — then raycasts stains
-  around the feet, five on the wall behind, and a distant splatter if the
-  arterial jets reach a far surface. Every sixth droplet is a fast, flat jet
-  that can cross the arena, so the spray reads as gore and not only as a cloud.
-  Both droplets and stains are
+  around the feet, a fan 2-22 m out along the throw, five on the wall behind,
+  and a distant splatter if the arterial jets reach a far surface. Every sixth
+  droplet is a fast, flat jet that can cross the arena, so the spray reads as
+  gore and not only as a cloud. Both droplets and stains are
   billboards: a droplet is one bead quad, a stain is a decal that reads the
-  G-buffer surface and shades itself like the rock. Droplets live ~1 s (the
-  arterial jets ~1.5 s); marks
+  G-buffer surface and shades itself like the rock. Blood only paints the
+  terrain field, so a worm standing in the puddle is not turned red.
+  Droplets live ~1 s (the arterial jets ~1.5 s); marks
   live ten minutes up to an 8k pool, so the map keeps a fight's history. Blood
   is pure cosmetic particles, no collision and no sim state, and it never takes
   a capsule slot from a worm or a rocket (see the budget note below).
@@ -343,21 +344,36 @@ view. And the per-weapon camera recoil (phase 4, partly): a shot now shoves the
 view up, climbs the muzzle and punches the lens, instead of the old slide
 straight back along the aim — a dolly, which is why the recoil was invisible.
 
-The Plasma Whip is now a carried melee weapon, not a gun (phase 6, the ritual).
-Its lash is part of the worm's own model and is never put away: at rest it lies
-coiled across the front, roughly six metres of live cable that bends one way and
-then folds its tip back the other. It sways slowly, the worm takes a low wielding
-stance and its free arm counterbalances, and the whole pose breathes. The
-wind-up only coils it for 0.14 s; the strike extends it to fourteen metres and
-sweeps it flat across the front, alternating right-to-left and left-to-right so
-a held trigger never repeats one canned arc. It has no magazine. The plasma is a
-thick glowing core with an ink-dark edge and dark electric knots; the lash tapers
-to a thin point with no bright bulb at the end, and the sweep leaves fading
-motion ghosts. A crack against rock throws a white starburst. Where the sweep
-crosses rock, the sim samples the whole arc, stops the lash at the first surface
-(no tunnelling) and carves a shallow groove with an ordinary `Event::Edit`; there
-is no heat line and no glowing scar, just dug rock. The old crescent of tip puffs
-is gone: the lash is drawn from the same `whip_path` curve the sim hits and digs.
+The Plasma Whip is a carried melee weapon, not a gun, and its lash is a rope
+(reworked to feel like the Ratchet & Clank 3 plasma whip). The lash is part of
+the worm's own model and is never put away: it hangs from the hand, five metres
+of cable that sways with the worm and is only softly pulled towards a loose coil
+in front of it, so it trails when you run and settles when you stop. A swing
+takes 0.30 s. The arm draws back over the first fifth, the lash pays out to its
+full reach and comes across the front in one level arc (150 degrees, leaning up
+to 30 degrees towards the aim pitch), and is drawn back in. A held trigger chains
+swings with no pause, alternating right-to-left and left-to-right. The torso
+twists with the lash and the hand crosses the body with it, so nothing jumps.
+Fired during the double jump, it is an overhead smash instead.
+
+The sim and the viewer split the work (Pattern: State on the sim side). The sim
+owns the swing: a per-worm `Swing` advances each tick, and only the middle of the
+swing is live. Each tick it tests the wedge of the arc the lash just crossed, so
+a worm is hit at the moment the lash passes it, once per swing, and it cuts the
+rock the lash touches. The viewer owns the rope: a Verlet chain pinned to the
+hand and pulled along the sim's lash line (`sim::whip_dir`), stiffly near the
+hand and loosely at the tip, which is where the trailing bend comes from. It is
+cosmetic: the sim never reads it. Hits are about 22 damage (a smash 35), five or
+so to kill, with knockback 10.
+
+The cut is a new SDF shape, `Shape::Blade`: a thin slab that reaches into the
+rock along the lash, joined from contact to contact into one flat-walled slit
+about 0.5 m wide (two voxels: a thinner one cannot be stored in a 25 cm grid).
+It goes deepest where the lash is fastest, about 1.5 m in the middle of the
+swing (2 m for a smash), and only scratches at the ends. The old round groove
+(a chain of 2.35 m capsules) is gone. The plasma is a glowing core with an
+ink-dark edge and dark electric knots; the lash tapers to a thin point, and a
+swing leaves a fading trail. A crack against rock throws a white starburst.
 
 Hits now react (phase 3, mostly): the victim flashes white, flinches off its
 axis, sprays Liero-red blood that arcs out and stains the floor and walls, and a

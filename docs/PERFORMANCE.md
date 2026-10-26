@@ -310,34 +310,34 @@ slow on this GPU, and adding marks multiplies the cost of every terrain pixel.
 
 The new design removes both loops from the march pass. A stain is a decal quad
 drawn after the march: it reads the G-buffer's world point and normal, keeps the
-same plane/disc test, and shades the mark with the same sun ramp, point lights,
-fog and grade as the rock. A droplet is a round quad with a fake sphere normal.
-Both live in one storage buffer, one quad per mark, so the cost is screen
-coverage and overdraw, not a loop over every mark in the world. The same bench
-after the change (the clock had drifted, so compare the rows within the run,
-not the absolute numbers):
+same plane/disc test, samples the terrain field so it cannot paint a worm
+standing in the puddle, and shades the mark with the same sun ramp, point
+lights, fog and grade as the rock. A droplet is a round quad with a fake sphere
+normal. Both live in one storage buffer, one quad per mark, so the cost is
+screen coverage and overdraw, not a loop over every mark in the world.
 
-| Blood on screen | total (ms) | march (ms) |
-|---|---|---|
-| none | 40.83 | 35.77 |
-| 48 stains (the old cap) | 44.61 | 38.73 |
-| 1024 stains | 40.50 | 35.49 |
-| 8704 stains | 39.97 | 34.63 |
-| 512 droplets | 41.90 | 36.74 |
-| 8704 stains + 512 droplets | 42.59 | 37.12 |
+Sequential bench rows are useless here: the clock drifted enough that the
+48-mark row measured slower than the 8.7k row. The bench now alternates "no
+blood" and "all marks" within one run, best of five rounds each:
 
-No measurable scaling from 1k to 8.7k marks; the rows differ by less than the
-run-to-run noise (the 48-row sits above the 8k-row, which is plainly noise).
-The pool is now 8192 marks with a ten-minute life, against 48 marks living 14 s.
-The capsule uniform array also shrank from 384 to 256 primitives (12 to 8 tile
-words), because blood no longer occupies it at all.
+| Run | no blood, total / march (ms) | 8704 marks, total / march (ms) | delta |
+|---|---|---|---|
+| A | 39.44 / 34.62 | 40.30 / 33.86 | **+0.9 ms** |
+| B | 36.75 / 32.25 | 39.35 / 33.23 | **+2.6 ms** |
 
-Two costs remain worth knowing: every visible mark is one quad, so a screen
-completely covered by overlapping 0.5 m stains is fill-rate bound (not observed
-in the fight-sized test above), and the CPU rebuilds/uploads the blood buffer
-each frame. At 8704 marks the build measures **0.29 ms per frame** in the same
-bench (`blood sprite build`), and the upload is ~420 KB of small structs, far
-below the 64 MB terrain upload.
+So a full screen of 8704 marks costs roughly 1-3 ms, most of it in the sprite
+pass (the march difference is noise). The same bench's 512 droplet row was
+within a few ms of empty in the sequential run. The pool is now 8192 marks with
+a ten-minute life, against 48 marks living 14 s. The capsule uniform array also
+shrank from 384 to 256 primitives (12 to 8 tile words), because blood no longer
+occupies it at all.
+
+The CPU side is small too: rebuilding 8704 marks into sprites measures
+**0.13-0.26 ms per frame** (`blood sprite build` in the same bench), and the
+upload is ~420 KB of small structs, far below the 64 MB terrain upload. The one
+remaining cost to watch is fill rate: every visible mark is a quad, so a camera
+pressed into a floor covered in hundreds of overlapping stains will pay for that
+overdraw.
 
 ## What did not help (so nobody repeats it)
 

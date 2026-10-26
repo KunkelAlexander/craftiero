@@ -13,9 +13,9 @@ the networking concepts where they appear.
 world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
 integrated laptop GPU, and now fight: twelve weapons (rockets, a railgun, bombs,
 homing swarms, a teleport gun, a Nova that charges for a beat and then clears a
-cavern, a plasma whip whose living lash is always carried and cracks across a
-fourteen-metre horizontal arc, alternating left and right, before it smashes
-down after a double jump, a wall-thrower and a forming beam). Explosions carve the terrain,
+cavern, a plasma whip whose lash is a rope that hangs from the hand and lashes across
+a wide arc, alternating left and right and cutting a thin slit into the rock,
+before it smashes down after a double jump, a wall-thrower and a forming beam). Explosions carve the terrain,
 rock is cover, and a dead worm comes back
 after three seconds. Guns are oversized and kick; a lobbed shell draws a dotted
 arc to the point it will land on, a ricochet marks its first bounce, and a big
@@ -120,9 +120,8 @@ cargo test -p sdf -p sim -p viewer
 `--fire id[,ticks]` fires that weapon and takes the picture `ticks` later (so
 projectiles and blasts are in the air); `--weapon id` just holds it, with no
 shot, which is the way to look at a gun. The Nova's wind-up takes 72 ticks and
-the whip's coil takes 8, so `--fire 8,40` catches the Nova charging, `--fire 8,110`
-catches the blast, and `--fire 11,13` catches the whip fully extended at the
-start of its sweep.
+a whip swing lasts 18, so `--fire 8,40` catches the Nova charging, `--fire 8,110`
+catches the blast, and `--fire 11,9` catches the whip halfway through its swing.
 
 `--no-brush` hides the orange dig ring that otherwise sits on the terrain behind
 the character, and `--no-aim` hides the weapon aim aid: lobbed arcs, blast rings
