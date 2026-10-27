@@ -15,6 +15,7 @@ mod audio;
 mod camera;
 mod effects;
 mod feel;
+mod hud;
 mod renderer;
 mod shaders;
 mod world;
@@ -26,6 +27,7 @@ use camera::{Camera, CameraFeel, Kick, FOLLOW_DIST};
 use effects::Effects;
 use feel::shot_kick;
 use glam::{Vec2, Vec3};
+use hud::Hud;
 use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
 use sim::weapons::WHIP;
@@ -101,6 +103,8 @@ struct Config {
     brush: bool,
     /// `--no-aim`: hide the weapon aim aid (arcs, blast rings, ricochet marks) in a screenshot.
     aim: bool,
+    /// `--hud`: draw the HUD in a screenshot (the live game always has it).
+    hud: bool,
     shadows: bool,
     ao: bool,
     outlines: bool,
@@ -126,6 +130,7 @@ fn parse_args() -> Config {
         grade: true,
         brush: true,
         aim: true,
+        hud: false,
         shadows: true,
         ao: true,
         outlines: true,
@@ -177,6 +182,7 @@ fn parse_args() -> Config {
             "--no-grade" => c.grade = false,
             "--no-brush" => c.brush = false,
             "--no-aim" => c.aim = false,
+            "--hud" => c.hud = true,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
             "--no-outlines" => c.outlines = false,
@@ -502,6 +508,9 @@ fn run_shot(cfg: &Config, path: &str) {
     };
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     renderer.render(&mut encoder, &target.view, &params);
+    if cfg.hud {
+        Hud::new(&gpu.device, Offscreen::FORMAT).draw(&gpu, &mut encoder, &target.view, cfg.size, &world.worms[0]);
+    }
     gpu.queue.submit([encoder.finish()]);
     renderer.end_frame();
     let pixels = target.read(&gpu);
@@ -863,6 +872,8 @@ struct Viewer {
     surface_cfg: wgpu::SurfaceConfiguration,
     gpu: Gpu,
     renderer: Renderer,
+    /// Health, weapon and hit markers, drawn over the finished frame.
+    hud: Hud,
     /// The game state: terrain, worms. Worm 0 is the player.
     world: World,
     /// Fixed timestep: real time not yet turned into sim ticks.
@@ -977,6 +988,7 @@ impl Viewer {
             window,
             surface,
             surface_cfg,
+            hud: Hud::new(&gpu.device, format),
             gpu,
             renderer,
             world,
@@ -1229,6 +1241,7 @@ impl Viewer {
         let (sound_right, _) = self.camera.right_up();
         for event in self.world.drain_events() {
             self.effects.add(&event);
+            self.hud.event(&event);
             self.audio.play(&event, self.camera.pos, sound_right);
             // Camera dynamics: a blast pushes the view, a shot kicks it back,
             // a hit twitches it and a death is the biggest thump. All of it is
@@ -1537,6 +1550,12 @@ impl Viewer {
         };
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.renderer.render(&mut encoder, &view, &params);
+        self.hud.tick(dt);
+        // The free camera is a debug view, not a worm's: no worm HUD there.
+        if !self.fly {
+            let screen = (self.surface_cfg.width, self.surface_cfg.height);
+            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.world.worms[0]);
+        }
         self.gpu.queue.submit([encoder.finish()]);
         self.renderer.end_frame();
         self.window.pre_present_notify();

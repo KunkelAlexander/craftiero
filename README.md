@@ -99,9 +99,11 @@ Click the window to capture the mouse; Esc releases it, Esc again quits.
 | M | mute / unmute the sound |
 | R | regenerate the map (about half a second) |
 
-The window title is the HUD until M6: health, the weapon with its magazine (or
-"reloading"), kills and deaths, then fps, GPU milliseconds per pass, the sim, edit
-and upload cost, the brush size, the render scale and whether sound is on.
+The HUD (`viewer/src/hud.rs`, design in `mockups/hud_mockup_v5.html`) shows health,
+kills and deaths, the weapon with its slot rail, magazine and ready / reloading /
+charging state, and a hit marker on the reticle. The window title keeps the debug
+numbers: fps, GPU milliseconds per pass, the sim, edit and upload cost, the brush
+size, the render scale and whether sound is on.
 
 Headless modes (no window needed):
 

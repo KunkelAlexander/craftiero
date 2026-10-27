@@ -1,0 +1,361 @@
+<!doctype html>
+<!--
+  HUD mockup v5. Same brass-and-olive look as v4, but every number is labelled,
+  the bars always agree with the numbers, and one status line says what the
+  weapon is doing (ready / reloading / charging / melee).
+
+  Each component is a function of the sim's own fields (hp, ammo, mag, reload,
+  charge), so a later wgpu HUD can port the same mapping.
+
+  Views:  hud_mockup_v5.html          in-game frame, 1280x720
+          hud_mockup_v5.html#states   every state side by side, 1280x1000
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  svg { display: block; }
+  text { font-family: "Bahnschrift", "Segoe UI", sans-serif; }
+  .hpnum   { font-size: 44px; font-weight: 700; letter-spacing: .5px; }
+  .label   { font-size: 14px; font-weight: 700; letter-spacing: 2px; }
+  .kd      { font-size: 13px; font-weight: 700; letter-spacing: 1.6px; }
+  .kdnum   { font-size: 24px; font-weight: 700; }
+  .wname   { font-size: 25px; font-weight: 700; letter-spacing: 2px; }
+  .ammo    { font-size: 36px; font-weight: 700; }
+  .ammomag { font-size: 18px; font-weight: 600; }
+  .status  { font-size: 14px; font-weight: 700; letter-spacing: 1.8px; }
+  .key     { font-size: 13px; font-weight: 700; }
+  .dmg     { font-size: 22px; font-weight: 700; paint-order: stroke; stroke: #0b0905; stroke-width: 4px; stroke-linejoin: round; }
+  .title   { font-size: 24px; font-weight: 700; letter-spacing: 1px; }
+  .section { font-size: 15px; font-weight: 700; letter-spacing: 3px; }
+  .note    { font-size: 13px; font-weight: 600; letter-spacing: .6px; }
+  .banner  { font-size: 30px; font-weight: 700; letter-spacing: 6px; paint-order: stroke; stroke: #0b0905; stroke-width: 5px; stroke-linejoin: round; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+  .pulse { animation: pulse 1s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<svg id="root" xmlns="http://www.w3.org/2000/svg"></svg>
+<script>
+// ---------------------------------------------------------------- palette
+const C = {
+  brass: '#c99a55', brassLt: '#e6c07e', brassDk: '#7b582b',
+  text: '#f8ecd0', muted: '#d3c59f',
+  ready: '#b9dc7a', reload: '#9ab5d6', charge: '#ffa43c', warn: '#f4b043', danger: '#ff6a4a',
+};
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+function mix(c1, c2, t) {                      // '#rrggbb' x '#rrggbb' -> '#rrggbb'
+  const p = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+  const a = p(c1), b = p(c2);
+  return '#' + a.map((v, i) => Math.round(lerp(v, b[i], t)).toString(16).padStart(2, '0')).join('');
+}
+
+// ------------------------------------------------------- shared SVG defs
+const DEFS = `
+<defs>
+  <filter id="blur3" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="3"/></filter>
+  <filter id="blur6" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="6"/></filter>
+  <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+    <feGaussianBlur stdDeviation="2.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+    <feGaussianBlur stdDeviation="1.3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <linearGradient id="panelFill" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#2f2f1d" stop-opacity=".97"/>
+    <stop offset=".45" stop-color="#1a1b10" stop-opacity=".96"/>
+    <stop offset="1" stop-color="#0c0d08" stop-opacity=".98"/>
+  </linearGradient>
+  <radialGradient id="badgeGrad" cx=".36" cy=".30" r=".86">
+    <stop offset="0" stop-color="#3b3c27"/><stop offset=".62" stop-color="#1b1c12"/><stop offset="1" stop-color="#0a0b06"/>
+  </radialGradient>
+  <radialGradient id="novaGrad" cx=".5" cy=".45" r=".58">
+    <stop offset="0" stop-color="#fffaf0"/><stop offset=".42" stop-color="#ffe8b6"/>
+    <stop offset=".75" stop-color="#e8b45a"/><stop offset="1" stop-color="#b7762d" stop-opacity=".12"/>
+  </radialGradient>
+  <linearGradient id="topShade" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#090a05" stop-opacity=".46"/><stop offset=".22" stop-color="#090a05" stop-opacity="0"/>
+  </linearGradient>
+  <radialGradient id="vignette" cx=".5" cy=".5" r=".72">
+    <stop offset=".52" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#050503" stop-opacity=".56"/>
+  </radialGradient>
+  <linearGradient id="oliveWash" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#768145" stop-opacity=".17"/><stop offset=".55" stop-color="#768145" stop-opacity="0"/>
+  </linearGradient>
+  <linearGradient id="warmWash" x1="1" y1="1" x2="0" y2="0">
+    <stop offset="0" stop-color="#ff9b3d" stop-opacity=".10"/><stop offset=".55" stop-color="#ff9b3d" stop-opacity="0"/>
+  </linearGradient>
+</defs>`;
+
+// ---------------------------------------------------------- building blocks
+// Chamfered plate outline, like v4 but with a smaller corner cut.
+const chamfer = (w, h, c) => `M${c} 2 H${w - c} L${w - 2} ${c} V${h - c} L${w - c} ${h - 2} H${c} L2 ${h - c} V${c} Z`;
+
+function plate(w, h, c, { glow = .2, edge = C.brass } = {}) {
+  const d = chamfer(w, h, c);
+  return `
+    <path d="${d}" fill="#000" opacity=".6" filter="url(#blur6)" transform="translate(0 5)"/>
+    <path d="${d}" fill="none" stroke="${edge}" stroke-width="5" opacity="${glow}" filter="url(#blur3)"/>
+    <path d="${d}" fill="url(#panelFill)" stroke="${edge}" stroke-opacity=".92" stroke-width="1.6"/>
+    <path d="M${c + 3} 5 H${w - c - 3}" stroke="#ffe9b7" stroke-opacity=".28"/>`;
+}
+
+// Round emblem frame: dark disc, brass rim, four ticks.
+function ring(cx, cy, r, rim = '#d9b06e') {
+  const t = [[0, -1], [0, 1], [-1, 0], [1, 0]].map(([x, y]) =>
+    `<line x1="${cx + x * (r - 1)}" y1="${cy + y * (r - 1)}" x2="${cx + x * (r - 6)}" y2="${cy + y * (r - 6)}"/>`).join('');
+  return `
+    <circle cx="${cx}" cy="${cy}" r="${r + 2}" fill="#000" opacity=".45" filter="url(#blur3)"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="url(#badgeGrad)" stroke="${rim}" stroke-width="1.8"/>
+    <circle cx="${cx}" cy="${cy}" r="${r - 6}" fill="none" stroke="#5c4728"/>
+    <g stroke="#e5c487" stroke-width="1.4" opacity=".72">${t}</g>`;
+}
+
+// The worm's face from v4, drawn inside a ring of radius r.
+function wormBadge(cx, cy, r, danger) {
+  const k = r / 33;
+  return ring(cx, cy, r, danger ? C.danger : '#d9b06e') + `
+    <g transform="translate(${cx} ${cy}) scale(${k}) translate(-56 -50)">
+      <path d="M47 74 C37 69 38 55 49 53 C57 51 61 57 58 63 C56 68 49 68 48 63" fill="none" stroke="#2b120c" stroke-width="9" stroke-linecap="round"/>
+      <path d="M47 74 C37 69 38 55 49 53 C57 51 61 57 58 63 C56 68 49 68 48 63" fill="none" stroke="#ff8a3c" stroke-width="5.6" stroke-linecap="round"/>
+      <circle cx="59" cy="42" r="11" fill="#ff8a3c" stroke="#2b120c" stroke-width="2"/>
+      <path d="M52 36 L57 38 M66 36 L61 38" stroke="#2b120c" stroke-width="1.3" stroke-linecap="round"/>
+      <circle cx="55.5" cy="41" r="2" fill="#1b0d09"/><circle cx="62.5" cy="41" r="2" fill="#1b0d09"/>
+      <circle cx="56.1" cy="40.3" r=".65" fill="#fff6e2"/><circle cx="63.1" cy="40.3" r=".65" fill="#fff6e2"/>
+      <path d="${danger ? 'M54 49 Q59 45 64 49' : 'M54 46 Q59 50 64 46'}" fill="none" stroke="#2b120c" stroke-width="1.8" stroke-linecap="round"/>
+    </g>`;
+}
+
+// Weapon glyphs, procedural, centred on 0,0 and about 40 px wide.
+const GLYPH = {
+  nova: `<circle r="19" fill="url(#novaGrad)" opacity=".85" filter="url(#blur3)"/>
+         <path d="M0 -19 L5 -6 L19 0 L5 6 L0 19 L-5 6 L-19 0 L-5 -6 Z" fill="#fff7e4" filter="url(#glow)"/>
+         <circle r="3.5" fill="#fff"/>`,
+  railgun: `<path d="M-20 0 H18" stroke="#9ab5d6" stroke-width="3.4" stroke-linecap="round" filter="url(#glow)"/>
+            <path d="M-19 -8 L-8 0 L-19 8" fill="none" stroke="#cfe6ff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="19" r="3.4" fill="#fff"/>`,
+  blaster: `<g stroke="#b8e86a" stroke-width="4" stroke-linecap="round" filter="url(#glow)">
+              <path d="M-17 9 L-8 -3"/><path d="M-5 11 L4 -1"/><path d="M7 13 L16 1"/></g>`,
+  rocket: `<g transform="rotate(-35)">
+             <path d="M-17 -5 L-24 -11 V11 L-17 5 Z" fill="#e6753a" stroke="#2b1c0c"/>
+             <path d="M-17 -5 H5 L16 0 L5 5 H-17 Z" fill="#e8d8b0" stroke="#2b1c0c"/></g>`,
+  whip: `<path d="M-18 9 C-10 -15 4 15 18 -9" fill="none" stroke="#b6f06a" stroke-width="4" stroke-linecap="round" filter="url(#glow)"/>
+         <circle cx="18" cy="-9" r="3" fill="#fff"/>`,
+};
+
+// One data row per weapon the mockup shows. Real values live in sim::weapons::WEAPONS.
+// `slot` is the index in ARSENAL (keys 1-9 0 - =).
+const WEAPON = {
+  nova:    { name: 'NOVA',         slot: 8,  mag: 1,  reload: 8.0 },
+  rocket:  { name: 'ROCKET',       slot: 1,  mag: 4,  reload: 2.2 },
+  blaster: { name: 'NEON BLASTER', slot: 0,  mag: 72, reload: 1.1 },
+  whip:    { name: 'PLASMA WHIP',  slot: 11, mag: 0,  reload: 0 },
+};
+const KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '='];
+
+// ----------------------------------------------------------------- components
+// Segmented bar: `segs` cells, each 1/segs of `max`. The last lit cell may be partial,
+// so the picture and the number never disagree. `trail` is the recent-damage ghost.
+function segBar(x, y, w, h, segs, value, max, c0, c1, trail) {
+  const gap = 2, sw = (w - gap * (segs - 1)) / segs;
+  let s = `<rect x="${x - 2}" y="${y - 2}" width="${w + 4}" height="${h + 4}" rx="3" fill="#060704" stroke="${C.brassDk}"/>`;
+  for (let i = 0; i < segs; i++) {
+    const sx = x + i * (sw + gap);
+    const fill = clamp01(value / max * segs - i);
+    const ghost = clamp01((trail ?? value) / max * segs - i);
+    s += `<rect x="${sx}" y="${y}" width="${sw}" height="${h}" fill="#15160d"/>`;
+    if (ghost > fill) s += `<rect x="${sx + sw * fill}" y="${y}" width="${sw * (ghost - fill)}" height="${h}" fill="#fff0cf" opacity=".5"/>`;
+    if (fill > 0) s += `<rect x="${sx}" y="${y}" width="${sw * fill}" height="${h}" fill="${mix(c0, c1, i / (segs - 1))}"/>
+                        <rect x="${sx}" y="${y}" width="${sw * fill}" height="${Math.max(2, h * .22)}" fill="#fff8e6" opacity=".3"/>`;
+  }
+  return s;
+}
+
+// VITALS: 340x100. State: { hp, trail?, dead?, respawn? }
+function vitals({ hp, trail, dead = false, respawn = 3 }) {
+  const low = hp <= 25 && !dead;
+  const [c0, c1] = hp > 50 ? ['#f8dd75', '#e7aa3e'] : hp > 25 ? ['#f4b043', '#d9702a'] : ['#ff7a55', '#d8302a'];
+  const numColor = dead ? '#9a8a6a' : low ? '#ffb4a2' : C.text;
+  const note = dead ? `<text x="324" y="38" text-anchor="end" class="label" fill="${C.muted}">RESPAWN ${respawn}</text>`
+             : low  ? `<text x="324" y="38" text-anchor="end" class="label" fill="${C.danger}">LOW HEALTH</text>` : '';
+  return `
+    ${plate(340, 100, 20, { glow: low ? .55 : .2, edge: low ? '#e0644a' : C.brass })}
+    ${wormBadge(52, 50, 30, low || dead)}
+    <text x="100" y="62" class="label" fill="${C.brassLt}">HP</text>
+    <text x="130" y="64" class="hpnum" fill="${numColor}" filter="url(#softGlow)">${Math.round(hp)}</text>
+    ${note}
+    ${segBar(100, 72, 224, 16, 10, hp, 100, c0, c1, trail)}`;
+}
+
+// KILLS / DEATHS chip: 220x44. State: { kills, deaths, flourish? }
+function kdChip({ kills, deaths, flourish = false }) {
+  return `
+    ${plate(220, 44, 12)}
+    <text x="18" y="29" class="kd" fill="${C.brassLt}">KILLS</text>
+    <text x="68" y="31" class="kdnum" fill="${flourish ? '#fff6c8' : C.text}" ${flourish ? 'filter="url(#glow)"' : ''}>${kills}</text>
+    ${flourish ? `<text x="86" y="23" class="kd" fill="${C.ready}">+1</text>` : ''}
+    <line x1="116" y1="12" x2="116" y2="32" stroke="${C.brassDk}"/>
+    <text x="130" y="29" class="kd" fill="#d9a07e">DEATHS</text>
+    <text x="192" y="31" class="kdnum" fill="${C.text}">${deaths}</text>`;
+}
+
+// WEAPON cluster: 332x184 = slot rail (top 34) + plate (150).
+// State: { id, ammo, status: ready|reload|charge|melee, progress 0..1, slots: {index: 'reload'|'empty'} }
+function weaponCluster({ id, ammo, status = 'ready', progress = 0, slots = {} }) {
+  const w = WEAPON[id], big = w.mag > 8, melee = status === 'melee';
+  const fracAmmo = w.mag ? ammo / w.mag : 1;
+  const ammoColor = melee ? C.text : ammo === 0 ? C.danger : fracAmmo <= .25 && w.mag > 1 ? C.warn : '#f7de8f';
+  const pipColor = ammoColor === '#f7de8f' ? ['#f8e29b', '#e2ad4a'] : [ammoColor, ammoColor];
+
+  // rail: one slot per ARSENAL entry, keyed like the keyboard
+  let rail = '';
+  for (let i = 0; i < 12; i++) {
+    const x = i * 28, cur = i === w.slot, st = slots[i];
+    rail += cur
+      ? `<rect x="${x}" y="0" width="24" height="28" rx="3" fill="#ecc885" stroke="#fff0c8"/>
+         <text x="${x + 12}" y="19" text-anchor="middle" class="key" fill="#1a1208">${KEYS[i]}</text>
+         <path d="M${x + 7} 29 H${x + 17} L${x + 12} 35 Z" fill="#ecc885"/>`
+      : `<rect x="${x}" y="4" width="24" height="22" rx="3" fill="#14150c" fill-opacity=".92" stroke="#6d5128"/>
+         <text x="${x + 12}" y="20" text-anchor="middle" class="key" fill="${st ? '#8a7c5c' : C.muted}">${KEYS[i]}</text>
+         ${st ? `<rect x="${x + 3}" y="22" width="18" height="2.5" fill="${st === 'empty' ? C.danger : C.reload}"/>` : ''}`;
+  }
+
+  // ammo visual: one pip per round up to 8, else a bar (72 pips would be unreadable)
+  let ammoRow = '';
+  const ax = 100, aw = 212, ay = 94;
+  if (melee) {
+    ammoRow = '';
+  } else if (!big) {
+    const gap = 5, pw = Math.min(56, (aw - gap * (w.mag - 1)) / w.mag);
+    for (let i = 0; i < w.mag; i++) {
+      const px = ax + i * (pw + gap), on = i < ammo;
+      ammoRow += `<rect x="${px}" y="${ay}" width="${pw}" height="12" fill="${on ? mix(pipColor[0], pipColor[1], i / Math.max(1, w.mag - 1)) : '#15160d'}" stroke="${on ? '#fff0c8' : C.brassDk}" stroke-opacity="${on ? .35 : 1}"/>`;
+    }
+  } else {
+    ammoRow = segBar(ax, ay, aw, 12, 24, ammo, w.mag, pipColor[0], pipColor[1]);
+  }
+
+  // one status line: what the weapon is doing right now
+  const S = {
+    ready:  { t: 'READY',     col: C.ready,  r: '' },
+    reload: { t: 'RELOADING', col: C.reload, r: (w.reload * (1 - progress)).toFixed(1) + ' s' },
+    charge: { t: 'CHARGING',  col: C.charge, r: Math.round(progress * 100) + '%' },
+    melee:  { t: 'MELEE',     col: C.brassLt, r: '' },
+  }[status];
+  const bar = (status === 'reload' || status === 'charge')
+    ? `<rect x="${ax - 2}" y="134" width="${aw + 4}" height="9" rx="2" fill="#060704" stroke="${C.brassDk}"/>
+       <rect x="${ax}" y="136" width="${aw * progress}" height="5" fill="${S.col}" ${status === 'charge' ? 'filter="url(#softGlow)"' : ''}/>` : '';
+  const dot = status === 'ready' ? `<circle cx="${ax + 5}" cy="123" r="4" fill="${C.ready}" filter="url(#softGlow)"/>` : '';
+
+  return `
+    <g>${rail}</g>
+    <g transform="translate(0 34)">
+      ${plate(332, 150, 20)}
+      ${ring(52, 70, 33)}
+      <g transform="translate(52 70)">${GLYPH[id]}</g>
+      <text x="100" y="42" class="wname" fill="${C.text}">${w.name}</text>
+      ${melee
+        ? `<text x="100" y="82" class="ammo" fill="${C.text}">∞</text>`
+        : `<text x="100" y="82" class="ammo" fill="${ammoColor}" filter="url(#softGlow)">${ammo}<tspan class="ammomag" dx="8" fill="${C.muted}">/&#160;${w.mag}</tspan></text>`}
+      ${ammoRow}
+      ${dot}
+      <text x="${status === 'ready' ? ax + 16 : ax}" y="128" class="status" fill="${S.col}">${S.t}</text>
+      <text x="312" y="128" text-anchor="end" class="status" fill="${S.col}">${S.r}</text>
+      ${bar}
+    </g>`;
+}
+
+// RETICLE: v4's chevrons plus the confirmation layer. State: { hit: none|hit|kill, dmg }
+function reticle({ hit = 'none', dmg = 0 } = {}) {
+  const chev = ['M-5 -22 L0 -17 L5 -22', 'M-5 22 L0 17 L5 22', 'M-22 -5 L-17 0 L-22 5', 'M22 -5 L17 0 L22 5'];
+  const pick = (stroke, width, extra = '') =>
+    `<g stroke="${stroke}" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" fill="none" ${extra}>${chev.map(d => `<path d="${d}"/>`).join('')}</g>`;
+  const x = (r0, r1, col, wd) => [[1, 1], [-1, 1], [1, -1], [-1, -1]].map(([sx, sy]) =>
+    `<line x1="${sx * r0}" y1="${sy * r0}" x2="${sx * r1}" y2="${sy * r1}" stroke="${col}" stroke-width="${wd}" stroke-linecap="round"/>`).join('');
+  let confirm = '';
+  if (hit === 'hit')  confirm = `<g opacity=".8">${x(9, 16, '#0b0905', 5)}</g>${x(9, 16, '#fff', 2.6)}`;
+  if (hit === 'kill') confirm = `<g opacity=".8">${x(9, 21, '#0b0905', 6.5)}</g>${x(9, 21, '#ff5a3c', 3.8)}
+                                 <circle r="26" fill="none" stroke="#ff5a3c" stroke-opacity=".5" stroke-width="1.5"/>`;
+  const num = hit === 'none' ? '' : `<text x="30" y="-24" class="dmg" fill="${hit === 'kill' ? '#ff9a7a' : '#fff'}">${dmg}</text>`;
+  return `
+    ${pick('#0b0905', 4, 'opacity=".7"')}
+    ${pick('#f4dfad', 2, 'filter="url(#softGlow)"')}
+    <circle r="13" fill="none" stroke="#fff6df" stroke-opacity=".28"/>
+    <circle r="4.2" fill="none" stroke="#e7b45a" stroke-opacity=".9" stroke-width="1.2"/>
+    <circle r="1.7" fill="#e7b45a" filter="url(#softGlow)"/>
+    ${confirm}${num}`;
+}
+
+// ------------------------------------------------------------------- views
+const root = document.getElementById('root');
+const at = (x, y, inner) => `<g transform="translate(${x} ${y})">${inner}</g>`;
+const BG = '../screenshots/worm_in_game.png';
+
+function gameView() {
+  root.setAttribute('width', 1280); root.setAttribute('height', 720); root.setAttribute('viewBox', '0 0 1280 720');
+  document.body.style.cssText = 'width:1280px;height:720px';
+  root.innerHTML = DEFS + `
+    <image href="${BG}" width="1280" height="720" preserveAspectRatio="xMidYMid slice" style="filter:saturate(1.08) contrast(1.04) brightness(.95)"/>
+    <rect width="1280" height="720" fill="url(#oliveWash)"/>
+    <rect width="1280" height="720" fill="url(#warmWash)"/>
+    <rect width="1280" height="720" fill="url(#topShade)"/>
+    <rect width="1280" height="720" fill="url(#vignette)"/>
+    ${at(28, 24, kdChip({ kills: 4, deaths: 2 }))}
+    ${at(28, 596, vitals({ hp: 78, trail: 78 }))}
+    ${at(920, 512, weaponCluster({ id: 'nova', ammo: 1, status: 'ready' }))}
+    ${at(640, 360, reticle())}`;
+}
+
+// A cell shows the in-game picture behind a piece of HUD, so contrast is judged on the real thing.
+function cell(x, y, w, h, label, inner, { sx = 0, sy = 420 } = {}) {
+  return `
+    <text x="${x}" y="${y - 9}" class="note" fill="${C.muted}">${label}</text>
+    <svg x="${x}" y="${y}" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+      <image href="${BG}" x="${-sx}" y="${-sy}" width="1280" height="720" style="filter:saturate(1.08) contrast(1.04) brightness(.95)"/>
+      <rect width="${w}" height="${h}" fill="url(#oliveWash)"/>
+      ${inner}
+    </svg>
+    <rect x="${x - .5}" y="${y - .5}" width="${w + 1}" height="${h + 1}" fill="none" stroke="#3a3b26"/>`;
+}
+
+function statesView() {
+  root.setAttribute('width', 1280); root.setAttribute('height', 1000); root.setAttribute('viewBox', '0 0 1280 1000');
+  document.body.style.cssText = 'width:1280px;height:1000px';
+  const sec = (y, t) => `<text x="40" y="${y}" class="section" fill="${C.brassLt}">${t}</text><line x1="40" y1="${y + 8}" x2="1240" y2="${y + 8}" stroke="${C.brassDk}"/>`;
+  let s = DEFS + `<rect width="1280" height="1000" fill="#12130c"/>
+    <text x="40" y="46" class="title" fill="${C.text}">HUD v5 — every state</text>
+    <text x="40" y="68" class="note" fill="${C.muted}">Each panel is drawn on the real game frame. Values map 1:1 to sim fields: hp, ammo / mag, reload, charge.</text>`;
+
+  s += sec(106, 'VITALS');
+  const vy = 136, pad = 12;
+  s += cell(40,  vy, 364, 124, 'HEALTHY: gold, 10 segments of 10 HP', at(pad, pad, vitals({ hp: 100 })));
+  s += cell(420, vy, 364, 124, 'HURT: amber, pale trail = damage just taken', at(pad, pad, vitals({ hp: 54, trail: 78 })));
+  s += cell(800, vy, 364, 124, 'LOW: red bar, red edge glow, warning text', at(pad, pad, vitals({ hp: 18 })));
+
+  const ry = 298;
+  s += cell(40, ry, 364, 124, 'DEAD: respawn countdown replaces the warning', at(pad, pad, vitals({ hp: 0, dead: true, respawn: 3 })));
+  s += cell(420, ry, 236, 60, 'KILLS / DEATHS: labelled text', at(8, 8, kdChip({ kills: 4, deaths: 2 })));
+  s += cell(420, ry + 88, 236, 60, 'ON A KILL: the count flares, +1', at(8, 8, kdChip({ kills: 5, deaths: 2, flourish: true })));
+  const rs = { sx: 540, sy: 300 };
+  s += cell(676, ry, 116, 116, 'RETICLE', at(58, 58, reticle()), rs);
+  s += cell(808, ry, 116, 116, 'HIT: white X', at(58, 58, reticle({ hit: 'hit', dmg: 34 })), rs);
+  s += cell(940, ry, 116, 116, 'KILL: red X', at(58, 58, reticle({ hit: 'kill', dmg: 78 })), rs);
+
+  s += sec(480, 'WEAPON: slot rail on top, one status line, ammo always matches its pips');
+  const wy1 = 522, wy2 = 770, cw = 356, ch = 208, wp = 12, gx = [40, 412, 784];
+  const W = (c) => at(wp, wp, weaponCluster(c));
+  s += cell(gx[0], wy1, cw, ch, 'READY: one round, one pip, green dot', W({ id: 'nova', ammo: 1 }));
+  s += cell(gx[1], wy1, cw, ch, 'CHARGING: wind-up weapons, orange bar', W({ id: 'nova', ammo: 1, status: 'charge', progress: .72 }));
+  s += cell(gx[2], wy1, cw, ch, 'RELOADING: empty pips, blue bar, seconds left', W({ id: 'rocket', ammo: 0, status: 'reload', progress: .5 }));
+  s += cell(gx[0], wy2, cw, ch, 'MAGAZINE LEFT: 3 of 4 pips', W({ id: 'rocket', ammo: 3 }));
+  s += cell(gx[1], wy2, cw, ch, 'LOW AMMO: big magazines use a bar, turns amber', W({ id: 'blaster', ammo: 14, slots: { 1: 'reload', 2: 'empty' } }));
+  s += cell(gx[2], wy2, cw, ch, 'MELEE: no magazine, infinite', W({ id: 'whip', ammo: 0, status: 'melee' }));
+  root.innerHTML = s;
+}
+
+(location.hash === '#states' ? statesView : gameView)();
+</script>
+</body>
+</html>
