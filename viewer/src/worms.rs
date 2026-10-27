@@ -220,18 +220,60 @@ struct SwingPull {
     weight: f32,
 }
 
+/// What the worm's walk lends the carried lash. `phase` is the gait phase
+/// (it ticks slowly when idle and quickly when running), `run` is 0..1.
+#[derive(Clone, Copy)]
+struct Carry {
+    phase: f32,
+    run: f32,
+}
+
+/// The carried lash is a light, loose thing, not a hose. These four numbers are
+/// what make it so; they interact, so tune them together by eye.
+/// Radians of delay from the hand to the tip in the carried wave: the tip is
+/// always a little behind the handle, which is what makes it curl.
+const CARRY_WAVE: f32 = 2.4;
+/// How firmly each node is pulled to its moving target (1/s). It has to be near
+/// the sway's own speed (a run is about 8 rad/s), or the rope is a low-pass
+/// filter that smooths the sway away. The tip is looser than the root, so it
+/// follows with extra lag and overshoots a little.
+const CARRY_PULL: f32 = 10.0;
+/// How much of that pull the tip gives up (0 = as firm as the root).
+const CARRY_TIP_LOOSE: f32 = 0.35;
+/// Velocity kept per step. Lower than the swing's 0.996 so the sway settles
+/// instead of ringing.
+const CARRY_DAMP: f32 = 0.985;
+/// Half the swing's gravity: a lash of plasma should float, not droop.
+const CARRY_GRAVITY: f32 = 7.0;
+
 impl Rope {
-    /// The carried pose: a loose coil out in front and to the side, drooping
-    /// towards the tip. It is only a soft pull, so the rope still swings with
-    /// the worm; it just never lies in the dirt or knots up.
-    fn rest_point(anchor: Vec3, face: Vec3, right: Vec3, len: f32, t: f32) -> Vec3 {
-        anchor
-            + face * (len * 0.50 * t)
-            + right * (len * 0.20 * (t * std::f32::consts::PI).sin())
-            + Vec3::Y * (len * (0.10 * (t * std::f32::consts::PI).sin() - 0.20 * t * t))
+    /// The carried pose: a loose curl out in front. Each step of the walk sends
+    /// a wave down the lash, so the tip swings left and right in front of the
+    /// worm and lags the handle (an S-curve, not a swinging pole). Standing
+    /// still keeps a small, slow version of the same sway, so it is never dead.
+    /// It is only a soft pull, so the rope still swings with the worm; it just
+    /// never lies in the dirt or knots up.
+    fn rest_point(anchor: Vec3, face: Vec3, right: Vec3, len: f32, t: f32, carry: Carry) -> Vec3 {
+        // Fractions of the lash length. `* t` pins the root to the hand and lets
+        // the sway grow towards the tip.
+        let amp = 0.08 + 0.30 * carry.run;
+        let wave = carry.phase - t * CARRY_WAVE;
+        let side = amp * wave.sin() * t;
+        let lift = 0.08 * (t * std::f32::consts::PI).sin() - 0.10 * t * t + 0.04 * carry.run * (2.0 * wave).sin() * t;
+        anchor + face * (len * 0.60 * t) + right * (len * side) + Vec3::Y * (len * lift)
     }
 
-    fn step(&mut self, anchor: Vec3, face: Vec3, right: Vec3, swing: Option<SwingPull>, rs: f32, dt: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        anchor: Vec3,
+        face: Vec3,
+        right: Vec3,
+        carry: Carry,
+        swing: Option<SwingPull>,
+        rs: f32,
+        dt: f32,
+    ) {
         let rest_len = WHIP_REST * rs;
         let (len, w) = match swing {
             Some(s) => (s.reach.max(WHIP_REST) * rs, s.weight),
@@ -241,12 +283,16 @@ impl Rope {
         // A fresh rope, or one left far behind by a teleport, starts at rest.
         if !self.live || self.pos[0].distance(anchor) > 4.0 {
             for k in 0..LASH_NODES {
-                let p = Rope::rest_point(anchor, face, right, rest_len, k as f32 / n1);
+                let p = Rope::rest_point(anchor, face, right, rest_len, k as f32 / n1, carry);
                 self.pos[k] = p;
                 self.prev[k] = p;
             }
             self.live = true;
         }
+        // Light when carried, heavy and crisp in a swing: blend by how hard the
+        // swing is pulling, so the hand-over in both directions has no jolt.
+        let damp = CARRY_DAMP + (0.996 - CARRY_DAMP) * w;
+        let gravity = CARRY_GRAVITY + (14.0 - CARRY_GRAVITY) * w;
         let steps = ((dt * 120.0).ceil() as usize).clamp(1, 6);
         let h = dt / steps as f32;
         for _ in 0..steps {
@@ -255,18 +301,19 @@ impl Rope {
             for k in 1..LASH_NODES {
                 let t = k as f32 / n1;
                 // Inertia and gravity: the rope falls and swings on its own.
-                let vel = (self.pos[k] - self.prev[k]) * 0.996;
+                let vel = (self.pos[k] - self.prev[k]) * damp;
                 self.prev[k] = self.pos[k];
-                self.pos[k] += vel + Vec3::NEG_Y * (14.0 * h * h);
-                // The pulls. At rest a gentle one towards the carried coil; in a
-                // swing a stiff one towards the lash line near the hand and a
-                // loose one at the tip, which is what makes the tip trail.
-                let mut target = Rope::rest_point(anchor, face, right, rest_len, t);
-                let mut rate = 2.5;
+                self.pos[k] += vel + Vec3::NEG_Y * (gravity * h * h);
+                // The pulls. At rest a gentle one towards the moving carried
+                // curl, looser towards the tip; in a swing a stiff one towards
+                // the lash line near the hand and a loose one at the tip, which
+                // is what makes the tip trail.
+                let mut target = Rope::rest_point(anchor, face, right, rest_len, t, carry);
+                let mut rate = CARRY_PULL * (1.0 - CARRY_TIP_LOOSE * t);
                 if let Some(s) = swing {
                     let line = anchor + s.dir * (s.reach * rs * t);
                     target = target.lerp(line, s.weight);
-                    rate += (34.0 - 25.0 * t - 2.5) * s.weight;
+                    rate += (34.0 - 25.0 * t - rate) * s.weight;
                 }
                 self.pos[k] += (target - self.pos[k]) * (1.0 - (-rate * h).exp());
             }
@@ -1285,7 +1332,8 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
                 reach: whip_reach(WEAPONS[WHIP as usize].range, p),
                 weight: sw.on,
             });
-            anim.rope.step(anchor, face, right, pull, rs, dt.clamp(0.0, 0.05));
+            let carry = Carry { phase: anim.phase, run };
+            anim.rope.step(anchor, face, right, carry, pull, rs, dt.clamp(0.0, 0.05));
             if let Some(slot) = anims.get_mut(i) {
                 slot.rope = anim.rope;
             }
@@ -1766,6 +1814,53 @@ mod tests {
         // continuous: a warp across the body would be a step of 10 m or more.
         let biggest = tips.windows(2).map(|p| (p[1] - p[0]).length()).fold(0.0, f32::max);
         assert!(biggest < 5.0, "the tip never teleports: {biggest} m in one frame");
+    }
+
+    /// How far left/right of the hand the carried lash is at the tip and at its
+    /// middle, frame by frame, once it has had a second to settle in. The worm
+    /// faces +Z, so its right is -X.
+    fn carried_sway(forward_vel: f32, frames: usize) -> Vec<(f32, f32)> {
+        let mut w = worm(Action::Walk, true);
+        w.forward_vel = forward_vel;
+        w.vel = Vec3::new(0.0, 0.0, forward_vel);
+        w.current = WHIP as usize;
+        let (_, right) = basis(w.face_yaw);
+        let mut anim = Anim::default();
+        capsules_after(&w, &mut anim, 60);
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            capsules_after(&w, &mut anim, 1);
+            let hand = anim.rope.pos[0];
+            out.push((
+                (anim.rope.pos[LASH_NODES - 1] - hand).dot(right),
+                (anim.rope.pos[LASH_NODES / 2] - hand).dot(right),
+            ));
+        }
+        out
+    }
+
+    fn spread(sway: &[(f32, f32)]) -> (f32, f32) {
+        let tips = sway.iter().map(|s| s.0);
+        (tips.clone().fold(f32::MAX, f32::min), tips.fold(f32::MIN, f32::max))
+    }
+
+    #[test]
+    fn the_carried_lash_swings_left_and_right_as_the_worm_walks() {
+        let sway = carried_sway(9.0, 240);
+        let (lo, hi) = spread(&sway);
+        assert!(lo < -0.4 && hi > 0.4, "the tip crosses the front: {lo} .. {hi}");
+        // It curls: the tip is behind the middle, so for part of every cycle
+        // they are on opposite sides of the line from the hand (an S).
+        assert!(sway.iter().any(|&(tip, mid)| tip * mid < -0.02), "the lash curls into an S");
+    }
+
+    #[test]
+    fn an_idle_lash_sways_much_less_than_a_running_one_but_is_never_dead() {
+        let (idle_lo, idle_hi) = spread(&carried_sway(0.0, 240));
+        let (run_lo, run_hi) = spread(&carried_sway(9.0, 240));
+        let (idle, run) = (idle_hi - idle_lo, run_hi - run_lo);
+        assert!(idle > 0.05, "never dead still: {idle}");
+        assert!(idle < 0.7 * run, "but much calmer than a run: {idle} vs {run}");
     }
 
     #[test]

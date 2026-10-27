@@ -129,6 +129,14 @@ Two of these are already the best in the game and should be the template: the
 **Whip** (its cut is shaped by the weapon: a horizontal groove dug by the
 sweep) and the **Nova's aim ring** (the choice is heavy before the shot).
 
+**Whip, carried:** between swings the lash is not a pose, it is a light rope
+(`worms.rs::Rope`). Each step of the gait sends a wave down it (`CARRY_WAVE`), so
+the tip curls left and right in front of the worm and trails the hand; standing
+still keeps a small, slow sway and a run swings wider. It is pulled loosely
+(`CARRY_PULL`, looser at the tip), damped and floated (`CARRY_DAMP`,
+`CARRY_GRAVITY`) so it never reads as a stiff hose, and a swing takes over by
+blending those back to the crisp values.
+
 ## 6. The systems the feel needs
 
 ### 6.1 A weapon id on the blast
