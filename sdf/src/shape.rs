@@ -57,8 +57,14 @@ impl Shape {
                 let (centre, axes, half) = blade_frame(a, b, dir, depth, half_thickness);
                 let d = p - centre;
                 let local = Vec3::new(d.dot(axes[0]), d.dot(axes[1]), d.dot(axes[2]));
-                let q = local.abs() - half;
-                q.max(Vec3::ZERO).length() + q.x.max(q.y).max(q.z).min(0.0)
+                // A rounded box: same extents, edges rounded by the sheet's
+                // half thickness. A sharp-cornered 0.5 m slab is only two
+                // voxels wide, and its corners alias into a staircase on the
+                // stored grid; the rounded one has no crease to alias, and
+                // consecutive blades along a cut join without notches.
+                let r = half_thickness.min(half.x).min(half.y);
+                let q = local.abs() - (half - Vec3::splat(r));
+                q.max(Vec3::ZERO).length() + q.x.max(q.y).max(q.z).min(0.0) - r
             }
         }
     }

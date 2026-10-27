@@ -691,6 +691,24 @@ mod tests {
     }
 
     #[test]
+    fn a_blade_has_rounded_edges_but_keeps_its_extents() {
+        let blade = Shape::Blade {
+            a: Vec3::new(4.0, 6.0, 8.0),
+            b: Vec3::new(10.0, 6.0, 8.0),
+            dir: Vec3::Z,
+            depth: 1.5,
+            half_thickness: 0.25,
+        };
+        // The very corner of the box is rounded away...
+        assert!(blade.distance(Vec3::new(4.02, 6.23, 9.48)) > 0.0, "the corner is rounded");
+        // ...but the flat middle of each face is still where it was.
+        assert!(blade.distance(Vec3::new(7.0, 6.2, 8.8)) < 0.0, "inside near the wall");
+        assert!(blade.distance(Vec3::new(7.0, 6.3, 8.8)) > 0.0, "outside past the face");
+        assert!(blade.distance(Vec3::new(7.0, 6.0, 9.45)) < 0.0, "inside near the end");
+        assert!(blade.distance(Vec3::new(7.0, 6.0, 9.55)) > 0.0, "outside past the end");
+    }
+
+    #[test]
     fn gradient_points_out_of_rock() {
         let mut g = world();
         let c = Vec3::splat(8.0);

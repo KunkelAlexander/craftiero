@@ -3,7 +3,7 @@
 A real-time 3D worm shooter in the spirit of *Liero*, on **fully destructible,
 formable terrain stored as a signed distance field (SDF)**. Rust, wgpu, no
 external assets. Cel shaded, with Okami-like ink outlines. Smooth, fast
-gameplay beats graphics.
+gameplay beats graphics. 
 
 It is also a learning project: the code is commented to explain *why*, names the
 patterns from *Game Programming Patterns* where they are used, and will explain

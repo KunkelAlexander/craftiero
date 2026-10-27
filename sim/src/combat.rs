@@ -113,7 +113,11 @@ const WHIP_MIN_CUT: f32 = 0.3;
 /// How many bearings one tick's slice of the swing is sampled at when it cuts.
 /// The tip moves a couple of metres per tick; three samples keep the slit
 /// following a curved wall instead of cutting corners.
-const WHIP_CUT_STEPS: usize = 3;
+const WHIP_CUT_STEPS: usize = 5;
+/// How much of the way each new contact is pulled from the last one, 0..1. The
+/// surface under the lash is bumpy, and a slit that followed every bump would be
+/// a zigzag; a low-pass over the contacts keeps the bite and drops the jitter.
+const WHIP_CUT_FOLLOW: f32 = 0.6;
 /// Largest gap between two surface contacts that the slit will bridge. A larger
 /// jump means the lash left one rock face and found another, so the cut should
 /// stop rather than slice through the air between them.
@@ -285,6 +289,26 @@ fn in_whip_fan(p: Vec3, origin: Vec3, s: &Swing, pa: f32, pb: f32, range: f32) -
             e >= a.min(b) - ang && e <= a.max(b) + ang
         }
     }
+}
+
+/// Where along the ray the surface really is. `Grid::raycast` stops within a
+/// step of it (an eighth of a metre or more on a grazing ray), which is plenty
+/// for a bullet but shows as a zigzag when a slit is cut along the contacts. A
+/// few bisection steps between the last safe point and the hit pin it down.
+fn refine_hit(grid: &sdf::Grid, origin: Vec3, dir: Vec3, hit: f32) -> f32 {
+    let (mut lo, mut hi) = ((hit - sdf::VOX).max(0.0), hit);
+    if grid.sample(origin + dir * lo) < 0.0 {
+        return hit; // already inside at the start of the bracket: nothing to bisect
+    }
+    for _ in 0..5 {
+        let mid = (lo + hi) * 0.5;
+        if grid.sample(origin + dir * mid) < 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    (lo + hi) * 0.5
 }
 
 /// Is the straight line from the emitter to a body point clear of rock? The
@@ -828,9 +852,15 @@ impl World {
                 s.cut = None;
                 continue;
             };
-            let at = origin + dir * t;
+            let raw = origin + dir * refine_hit(&self.grid, origin, dir, t);
+            // Smooth the path of contacts (but not the first one, which has
+            // nothing to follow). The bridge test below still sees the raw gap.
+            let at = match s.cut {
+                Some((prev, _)) => prev.lerp(raw, WHIP_CUT_FOLLOW),
+                None => raw,
+            };
             if let Some((prev, prev_dir)) = s.cut {
-                let gap = at.distance(prev);
+                let gap = raw.distance(prev);
                 let u = (p - WHIP_ACTIVE.0) / (WHIP_ACTIVE.1 - WHIP_ACTIVE.0);
                 let depth = peak * (std::f32::consts::PI * u).sin();
                 if gap > 0.02 && gap <= WHIP_CUT_BRIDGE && depth >= WHIP_MIN_CUT {

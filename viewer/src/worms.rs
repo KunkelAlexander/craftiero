@@ -256,11 +256,13 @@ impl Rope {
     fn rest_point(anchor: Vec3, face: Vec3, right: Vec3, len: f32, t: f32, carry: Carry) -> Vec3 {
         // Fractions of the lash length. `* t` pins the root to the hand and lets
         // the sway grow towards the tip.
-        let amp = 0.08 + 0.30 * carry.run;
+        let amp = 0.16 + 0.60 * carry.run;
         let wave = carry.phase - t * CARRY_WAVE;
         let side = amp * wave.sin() * t;
         let lift = 0.08 * (t * std::f32::consts::PI).sin() - 0.10 * t * t + 0.04 * carry.run * (2.0 * wave).sin() * t;
-        anchor + face * (len * 0.60 * t) + right * (len * side) + Vec3::Y * (len * lift)
+        // Less forward than sideways: the lash must not just hang in front of the
+        // worm. The two together stay inside the rope's length (0.5² + 0.76²).
+        anchor + face * (len * 0.45 * t) + right * (len * side) + Vec3::Y * (len * lift)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -369,11 +371,24 @@ struct Swung {
     strike: f32,
     yaw: f32,
     on: f32,
+    /// The landing after the blow: 0 until the lash has crossed, a bump near the
+    /// end of the swing where the body settles. It is the squash that sells the
+    /// weight of the strike (Disney's follow-through).
+    follow: f32,
 }
 
 impl Swung {
-    const REST: Swung = Swung { cock: 0.0, strike: 0.0, yaw: 0.0, on: 0.0 };
+    const REST: Swung = Swung { cock: 0.0, strike: 0.0, yaw: 0.0, on: 0.0, follow: 0.0 };
 }
+
+/// How far the whip hand runs across the body with the swing, in metres. The
+/// hand goes where the lash goes: out to the lash's side at the start of a
+/// sweep, across the front at the end. Flip the sign if it ever looks backwards.
+const WHIP_ARM_THROW: f32 = 0.85;
+/// How far the free arm counter-swings, opposite the whip hand, in metres.
+const WHIP_FREE_ARM_THROW: f32 = 0.45;
+/// How far the whole body lunges into the blow, in metres of world space.
+const WHIP_LUNGE: f32 = 0.35;
 
 fn swung(anim: &Anim) -> Swung {
     let Some(p) = swing_phase(anim) else {
@@ -388,7 +403,8 @@ fn swung(anim: &Anim) -> Swung {
     // Ramps in and out at the ends of the swing, so a chain flows through the
     // rest pose without the body snapping.
     let on = smooth(p / 0.10) * (1.0 - smooth((p - 0.90) / 0.10));
-    Swung { cock, strike, yaw, on }
+    let follow = smooth((p - 0.55) / 0.20) * (1.0 - smooth((p - 0.80) / 0.20));
+    Swung { cock, strike, yaw, on, follow }
 }
 
 // --- weapons --------------------------------------------------------------
@@ -1003,10 +1019,15 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
             // The torso twists to follow the lash across the front (positive
             // twist is towards the worm's right, like `yaw`), so the swing runs
             // through the whole body and a held trigger alternates sides.
-            pose.lean += -0.22 * whip_cock + 0.28 * whip_strike;
-            pose.twist += 0.34 * sw.yaw * sw.on;
-            pose.roll += -0.10 * sw.yaw * sw.on;
-            pose.wide *= 1.0 + 0.04 * whip_strike;
+            pose.lean += -0.42 * whip_cock + 0.45 * whip_strike;
+            pose.twist += 0.85 * sw.yaw * sw.on;
+            pose.roll += -0.20 * sw.yaw * sw.on;
+            // Squash and stretch, with the feet planted: crouch into the
+            // wind-up, spring tall through the blow, and settle heavily as the
+            // lash lands. Stretch alone would read as a hop; the crouch first is
+            // what makes it a lunge.
+            pose.stretch *= 1.0 - 0.10 * whip_cock + 0.06 * whip_strike - 0.08 * sw.follow;
+            pose.wide *= 1.0 + 0.05 * whip_cock + 0.04 * whip_strike + 0.06 * sw.follow;
         }
         if flinch > 0.0 {
             // A hit knocks the body off its axis for a beat. The flash says
@@ -1256,10 +1277,10 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
             // the shoulder, then throw the arm across the front of the body.
             // The hand rides the lash's side (`yaw`), so it crosses the body
             // with the swing instead of jumping to one side.
-            hand_l += Vec3::new(-0.10 * sw.yaw * sw.on, 0.22 * stance, 0.12 * stance);
+            hand_l += Vec3::new(-WHIP_FREE_ARM_THROW * sw.yaw * sw.on, 0.22 * stance + 0.22 * whip_strike, 0.12 * stance);
             hand_r += Vec3::new(0.04 * stance, -0.02 * stance, 0.10 * stance);
-            hand_r += Vec3::new(0.18, 0.24, -0.34) * whip_cock;
-            hand_r += Vec3::new(-0.45 * sw.yaw * sw.on, -0.10 * whip_strike, 0.38 * whip_strike);
+            hand_r += Vec3::new(0.30, 0.42, -0.50) * whip_cock;
+            hand_r += Vec3::new(WHIP_ARM_THROW * sw.yaw * sw.on, -0.10 * whip_strike, 0.55 * whip_strike);
         }
         let hand_r = hand_r - look * (kick_back * 0.55 * kick) + Vec3::Y * (kick_rise * 0.10 * kick);
         let shoulder_l = Vec3::new(-0.30, 1.18, 0.02);
@@ -1298,14 +1319,15 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
         if gun_id == WHIP {
             let stance = whip_ready * if ground { 1.0 } else { 0.35 };
             sdf_hand_r += Vec3::new(0.04 * stance, -0.02 * stance, 0.10 * stance) / ms;
-            sdf_hand_r += Vec3::new(0.18, 0.24, -0.34) * whip_cock / ms;
-            sdf_hand_r += Vec3::new(-0.45 * sw.yaw * sw.on, -0.10 * whip_strike, 0.38 * whip_strike) / ms;
+            sdf_hand_r += Vec3::new(0.30, 0.42, -0.50) * whip_cock / ms;
+            sdf_hand_r += Vec3::new(WHIP_ARM_THROW * sw.yaw * sw.on, -0.10 * whip_strike, 0.55 * whip_strike) / ms;
         }
         sdf_hand_r += -look * (kick_back * 0.55 * kick / ms) + Vec3::Y * (kick_rise * 0.10 * kick / ms);
         let mut sdf_hand_l = SDF_HAND_L;
         if gun_id == WHIP {
             let stance = whip_ready * if ground { 1.0 } else { 0.35 };
-            sdf_hand_l += Vec3::new(-0.10 * sw.yaw * sw.on, 0.22 * stance, 0.12 * stance) / ms;
+            sdf_hand_l +=
+                Vec3::new(-WHIP_FREE_ARM_THROW * sw.yaw * sw.on, 0.22 * stance + 0.22 * whip_strike, 0.12 * stance) / ms;
         }
 
         // The weapon. Each id gets its own oversized, distinct silhouette built
@@ -1315,7 +1337,10 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
         //
         // The SDF body bobs and sways with the gait. The gun rides the same
         // offset, so the hands and the weapon never separate.
-        let sdf_off = Vec3::Y * lift + rig.right * sway(0.5);
+        // The whip lunges the whole body forward into the blow (visual only: the
+        // sim's position does not move), and back as it recovers.
+        let lunge = if gun_id == WHIP { face * (WHIP_LUNGE * (whip_strike - 0.4 * whip_cock)) } else { Vec3::ZERO };
+        let sdf_off = Vec3::Y * lift + rig.right * sway(0.5) + lunge;
         let hand_r_world = rig.at(sdf_hand_r.x * ms, sdf_hand_r.y * ms, sdf_hand_r.z * ms) + sdf_off;
         let fwd = (rig.right * look.x + rig.up * look.y + rig.face * look.z).normalize_or_zero();
         // The gun itself travels the rest of the kick, and the muzzle climbs as
@@ -1760,6 +1785,9 @@ mod tests {
         assert!(mid.strike > 0.9 && mid.yaw.abs() < 0.05, "thrown through the middle: {}", mid.strike);
         let end = swing_at(WHIP_SWING_TIME, false);
         assert_eq!((end.cock, end.strike, end.on), (0.0, 0.0, 0.0), "and the follow-through is over");
+        // The body settles after the blow, not during the wind-up, and is level again at the end.
+        assert_eq!((start.follow, end.follow), (0.0, 0.0));
+        assert!(swing_at(WHIP_SWING_TIME * 0.8, false).follow > 0.9, "it lands heavily as the lash arrives");
         // The lash crosses from one side to the other, and the next swing mirrors it.
         assert!(swing_at(0.02, false).yaw > 0.9 && swing_at(0.28, false).yaw < -0.9);
         assert!(swing_at(0.02, true).yaw < -0.9 && swing_at(0.28, true).yaw > 0.9);
