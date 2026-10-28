@@ -711,15 +711,20 @@ fn weapon(
             out.push(g.plate((0.20, 0.0, 0.17), (0.09, 0.02, 0.07), trim));
         }
         BOMB => {
-            // A tosser holding one enormous bomb in a three-claw cradle, fuse lit.
+            // A landmine held out flat on an arm, like a tray: the squat disc,
+            // its dome, a glowing trigger light and studs round the rim, the
+            // same parts as the one that lies on the ground.
             out.push(g.plate((0.08, 0.0, 0.02), (0.07, 0.10, 0.15), RUST));
-            out.push(g.tube((0.24, 0.0, 0.0), (0.52, 0.19, 0.0), 0.035, DARKMETAL));
-            out.push(g.tube((0.24, 0.0, 0.0), (0.50, -0.12, 0.14), 0.035, DARKMETAL));
-            out.push(g.tube((0.24, 0.0, 0.0), (0.50, -0.12, -0.14), 0.035, DARKMETAL));
-            out.push(g.flange(0.46, 0.29, 0.07, DARKMETAL));
-            out.push(g.ball((0.74, 0.0, 0.0), 0.30, BOMBSHELL));
-            out.push(g.tube((0.82, 0.05, 0.15), (0.94, 0.12, 0.28), 0.022, RUST));
-            out.push(g.ball((0.96, 0.13, 0.30), 0.06, EMBER).glowing());
+            // (Gun coordinates are forward, side, up.)
+            out.push(g.tube((0.24, 0.0, -0.02), (0.56, 0.0, -0.10), 0.04, DARKMETAL));
+            out.push(g.tube((0.74, 0.0, -0.14), (0.74, 0.0, 0.0), 0.31, BOMBSHELL));
+            out.push(g.tube((0.74, 0.0, -0.08), (0.74, 0.0, -0.03), 0.325, OLIVE));
+            out.push(g.tube((0.74, 0.0, 0.0), (0.74, 0.0, 0.06), 0.19, OLIVE));
+            out.push(g.ball((0.74, 0.0, 0.08), 0.055, EMBER).glowing());
+            for k in 0..4 {
+                let a = k as f32 * TAU / 4.0 + TAU / 8.0;
+                out.push(g.ball((0.74 + a.cos() * 0.24, a.sin() * 0.24, 0.01), 0.04, BOMBSHELL));
+            }
             out.push(g.plate((0.02, 0.0, -0.20), (0.05, 0.08, 0.12), DARKMETAL));
             out.push(g.plate((0.10, 0.09, 0.02), (0.03, 0.012, 0.10), trim));
         }

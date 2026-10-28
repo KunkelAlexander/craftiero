@@ -9,7 +9,7 @@
 use crate::camera::Kick;
 use glam::Vec3;
 use sim::weapons::{
-    BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR,
+    BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, LAVA, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR,
     WHIP,
 };
 
@@ -98,6 +98,7 @@ pub fn flash(weapon: u8) -> (Vec3, f32) {
         TELEPORT => (VIOLET, 0.44),
         NOVA => (ICE, 0.65),
         WHIP => (PLASMA, 0.44),
+        LAVA => (Vec3::new(1.0, 0.42, 0.06), 0.26),
         _ => (HOT, 0.34),
     }
 }
@@ -304,6 +305,8 @@ pub fn shot_kick(weapon: u8) -> Kick {
         BOMB => (0.008, 0.020, 0.2, 0.5),
         BUILD => (0.010, 0.020, 0.15, 0.3),
         TRACTOR => (0.004, 0.008, 0.05, 0.1),
+        // Thirty a second: it has to be nearly nothing, or the screen shakes.
+        LAVA => (0.002, 0.004, 0.03, 0.05),
         _ => (0.006, 0.015, 0.2, 0.4),
     };
     // A lash hits across the body rather than away from the shoulder.

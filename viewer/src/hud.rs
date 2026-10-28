@@ -30,7 +30,7 @@ fn rgb(hex: u32) -> Colour {
 }
 
 const MARGIN: f32 = 28.0;
-const SLOT_KEYS: &str = "1234567890-=";
+const SLOT_KEYS: &str = "1234567890-=[]\\";
 
 const BRASS: u32 = 0xc99a55;
 const BRASS_LIGHT: u32 = 0xe6c07e;
@@ -214,9 +214,11 @@ impl Hud {
 
         // The rail: one slot per weapon, keyed like the keyboard. A blue mark
         // under a slot means it is reloading, a red one that it is empty.
+        // Right-aligned with the plate: fourteen slots are wider than it.
+        let rail = x + 332.0 - worm.weapons.len() as f32 * 28.0 + 4.0;
         for (i, gun) in worm.weapons.iter().enumerate() {
             let def = &WEAPONS[gun.id as usize];
-            let sx = x + i as f32 * 28.0;
+            let sx = rail + i as f32 * 28.0;
             let current = i == worm.current;
             self.rect(sx, y - 32.0, 24.0, 24.0, if current { BRASS_LIGHT } else { BRASS });
             self.rect(sx + 1.0, y - 31.0, 22.0, 22.0, if current { BRASS_LIGHT } else { PLATE });

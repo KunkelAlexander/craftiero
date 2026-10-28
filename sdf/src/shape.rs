@@ -19,7 +19,17 @@ pub enum Shape {
     /// `2 * half_thickness` thick across the sheet. Where a capsule leaves a
     /// round tunnel, this leaves a flat-walled slit, like a wire through cheese.
     Blade { a: Vec3, b: Vec3, dir: Vec3, depth: f32, half_thickness: f32 },
+    /// A flat cylinder (disc) around `axis` (a unit vector), `half_height`
+    /// either side of its centre, dragged from centre `a` to centre `b`. With
+    /// `a == b` it is a plain disc pressed into the ground; the whip drags it
+    /// along its path, so one swing is one smooth flat-bottomed groove instead
+    /// of a row of separate holes. `axis` is the surface normal.
+    Cylinder { a: Vec3, b: Vec3, axis: Vec3, radius: f32, half_height: f32 },
 }
+
+/// How much a cylinder's rim is rounded, in metres. Same reason as the blade:
+/// a sharp thin disc aliases on the stored grid.
+const CYLINDER_ROUND: f32 = 0.2;
 
 /// The blade's own frame: its centre, its three unit axes (along the cut,
 /// into the rock, across the sheet) and its half extents in those axes.
@@ -66,6 +76,21 @@ impl Shape {
                 let q = local.abs() - (half - Vec3::splat(r));
                 q.max(Vec3::ZERO).length() + q.x.max(q.y).max(q.z).min(0.0) - r
             }
+            Shape::Cylinder { a, b, axis, radius, half_height } => {
+                // Closest point on the centre path, found in the disc's plane
+                // (the path's part along the axis does not move the footprint).
+                let ab = b - a;
+                let ab_flat = ab - axis * ab.dot(axis);
+                let t = ((p - a).dot(ab_flat) / ab_flat.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                // Then 2D: distance along the axis and distance from it, and
+                // the exact rounded-rectangle distance in that plane.
+                let d = p - (a + ab * t);
+                let along = d.dot(axis);
+                let across = (d - axis * along).length();
+                let r = CYLINDER_ROUND.min(radius).min(half_height);
+                let q = glam::Vec2::new(across - (radius - r), along.abs() - (half_height - r));
+                q.max(glam::Vec2::ZERO).length() + q.x.max(q.y).min(0.0) - r
+            }
         }
     }
 
@@ -87,6 +112,13 @@ impl Shape {
                 let (centre, axes, half) = blade_frame(a, b, dir, depth, half_thickness);
                 let e = axes[0].abs() * half.x + axes[1].abs() * half.y + axes[2].abs() * half.z;
                 (centre - e, centre + e)
+            }
+            Shape::Cylinder { a, b, axis, radius, half_height } => {
+                // Along each world axis: the height's projection plus the
+                // disc's rim, which reaches radius * sin(angle to the axis).
+                let rim = (Vec3::ONE - axis * axis).max(Vec3::ZERO);
+                let e = axis.abs() * half_height + Vec3::new(rim.x.sqrt(), rim.y.sqrt(), rim.z.sqrt()) * radius;
+                (a.min(b) - e, a.max(b) + e)
             }
         }
     }

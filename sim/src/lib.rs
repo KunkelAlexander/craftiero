@@ -17,6 +17,7 @@
 
 pub mod combat;
 pub mod input;
+pub mod lava;
 pub mod movement;
 pub mod rng;
 pub mod weapons;
@@ -28,8 +29,9 @@ pub use combat::{
     WHIP_ACTIVE, WHIP_LEAN, WHIP_REST, WHIP_SMASH_DOWN, WHIP_SMASH_UP, WHIP_SWEEP, WHIP_SWING_TIME,
 };
 pub use input::Input;
+pub use lava::{LavaBit, STAMP_RADIUS};
 pub use weapons::{WeaponDef, WeaponState, ARSENAL, WEAPONS};
 pub use world::{
-    dig_target, Action, Event, Rope, World, Worm, DIG_RADIUS, DT, EYE_HEIGHT, WORM_HEIGHT,
-    WORM_RADIUS,
+    dig_target, Action, Event, Rope, World, Worm, Zone, ZoneKind, DIG_RADIUS, DT, EYE_HEIGHT,
+    WORM_HEIGHT, WORM_RADIUS,
 };

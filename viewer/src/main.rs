@@ -30,7 +30,7 @@ use glam::{Vec2, Vec3};
 use hud::Hud;
 use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
-use sim::weapons::WHIP;
+use sim::weapons::{Kind, WHIP};
 use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -199,8 +199,8 @@ const SEED: u32 = 1;
 /// stop the grass competing with the weapons without making the map look dead.
 const WORLD_GRADE: f32 = 0.35;
 
-/// The weapon a number-row key picks: 1 to 9 are the first nine, then 0, `-`
-/// and `=`.
+/// The weapon a number-row key picks: 1 to 9 are the first nine, then 0, `-`,
+/// `=`, `[`, `]` and the backslash.
 fn weapon_key(key: KeyCode) -> Option<u8> {
     Some(match key {
         KeyCode::Digit1 => 0,
@@ -215,6 +215,9 @@ fn weapon_key(key: KeyCode) -> Option<u8> {
         KeyCode::Digit0 => 9,
         KeyCode::Minus => 10,
         KeyCode::Equal => 11,
+        KeyCode::BracketLeft => 12,
+        KeyCode::BracketRight => 13,
+        KeyCode::Backslash => 14,
         _ => return None,
     })
 }
@@ -336,9 +339,18 @@ fn main() {
 /// wgpu picks Vulkan first on Windows. The Intel Vulkan driver this was
 /// developed on crashes inside `request_device`, while DX12 works, so Windows
 /// defaults to DX12. `WGPU_BACKEND=vulkan` (or dx12, metal, gl) overrides it.
+///
+/// DX12 also compiles our big raymarch shader with FXC by default, which takes
+/// 45+ s on an Intel iGPU (the window stays white). DXC does the same in a
+/// fraction of that, but wgpu loads it as a DLL: if `dxcompiler.dll` (and its
+/// `dxil.dll`) sit next to the exe we use it, otherwise wgpu's default applies.
 fn prefer_dx12_on_windows(mut desc: wgpu::InstanceDescriptor) -> wgpu::InstanceDescriptor {
     if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
         desc.backends = wgpu::Backends::DX12;
+        let dxc = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.join("dxcompiler.dll")));
+        if let Some(dxc) = dxc.filter(|p| p.exists()) {
+            desc.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::DynamicDxc { dxc_path: dxc.to_string_lossy().into_owned() };
+        }
     }
     desc
 }
@@ -379,8 +391,11 @@ fn shot_world(cfg: &Config) -> (World, Effects) {
         if let Some((weapon, ticks)) = cfg.fire {
             world.drain_events();
             for t in 0..=ticks {
-                world.step(&[Input { fire: t == 0, weapon, pitch: 0.05, ..look }]);
+                // A hose keeps the trigger down; everything else is one pull.
+                let held = t == 0 || WEAPONS[weapon as usize].kind == Kind::Spray;
+                world.step(&[Input { fire: held, weapon, pitch: 0.05, ..look }]);
                 effects.trails(&world.projectiles);
+                effects.lava(&world.lava);
                 for e in world.drain_events() {
                     effects.add(&e);
                     match e {
@@ -486,6 +501,9 @@ fn run_shot(cfg: &Config, path: &str) {
     capsules.extend(effects::projectiles(&world.projectiles, 1.0));
     capsules.extend(effects.core_capsules());
     let mut sprites = effects.sprites();
+    let (lava_glow, lava_body) = effects::lava_sprites(&world.lava, 1.0);
+    sprites.glow.extend(lava_glow);
+    sprites.smoke.extend(lava_body);
     sprites.glow.extend(whip_glow);
     sprites.sort_smoke(cam.pos);
     let params = FrameParams {
@@ -1227,6 +1245,7 @@ impl Viewer {
             // A trail is history: it has to be emitted per sim tick, not per
             // frame, or it would grow with the frame rate.
             self.effects.trails(&self.world.projectiles);
+            self.effects.lava(&self.world.lava);
             self.landings();
             self.acc -= DT;
             ticks += 1;
@@ -1506,6 +1525,9 @@ impl Viewer {
         // so alpha smoke draws back-to-front. Blood never touches the capsule
         // pool, so spray cannot trim a worm, the aim aid or a rocket.
         let mut sprites = self.effects.sprites();
+        let (lava_glow, lava_body) = effects::lava_sprites(&self.world.lava, alpha);
+        sprites.glow.extend(lava_glow);
+        sprites.smoke.extend(lava_body);
         sprites.glow.extend(whip_glow);
         sprites.sort_smoke(render_camera.pos);
         // Show where a dig would land (or, flying, where the brush would).

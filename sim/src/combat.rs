@@ -7,8 +7,8 @@
 
 use crate::input::Input;
 use crate::rng::Rng;
-use crate::weapons::{Kind, Special, WeaponDef, WeaponState, ARSENAL, WEAPONS, WHIP};
-use crate::world::{body_axis, body_fits, Action, Event, World, DT, WORM_HEIGHT, WORM_RADIUS};
+use crate::weapons::{Kind, Special, WeaponDef, WeaponState, ARSENAL, LAVA, WEAPONS, WHIP};
+use crate::world::{body_axis, body_fits, Action, Event, World, Zone, ZoneKind, DT, WORM_HEIGHT, WORM_RADIUS};
 use glam::{Quat, Vec3};
 use sdf::{Op, Shape};
 
@@ -47,6 +47,12 @@ const MUZZLE: f32 = 0.8;
 const FLASH_AHEAD: f32 = 0.2;
 /// Build lumps join the terrain with a rounded crease this wide, like clay.
 const BUILD_SMOOTH: f32 = 0.4;
+/// Burning: a worm in touch with molten lava burns for `BURN_TIME` more seconds,
+/// and takes `BURN_DAMAGE` every `BURN_TICK` seconds. Standing in lava kills in
+/// about six seconds; running through it costs about a third of your health.
+const BURN_TIME: f32 = 1.5;
+const BURN_TICK: f32 = 0.25;
+const BURN_DAMAGE: f32 = 4.0;
 /// Extra room around a worm (and a spawn point) that a lump must leave free,
 /// because the rounded join adds a little material beyond the lump's radius.
 const BUILD_MARGIN: f32 = 0.15;
@@ -66,11 +72,22 @@ const WALL_HALF_T: f32 = 0.30;
 /// Centre height above the feet. The bottom sinks below the ground, so a small
 /// dip or slope ahead cannot leave a gap for a bolt to fly through.
 const WALL_LIFT: f32 = 2.45;
+/// Aiming steeper than this (the sine of the pitch, about 30 degrees) lays the
+/// block flat: a floor when looking down, a roof when looking up. The roof
+/// starts this far above the eye and the floor ends this far below the feet.
+const WALL_SLAB_SLOPE: f32 = 0.5;
+const WALL_ROOF_GAP: f32 = 0.9;
+const WALL_FLOOR_GAP: f32 = 0.15;
 /// Keep the wall this clear of a worm or a spawn point.
 const WALL_MARGIN: f32 = 0.12;
 /// Round the join with the old terrain a little, but keep the box's faces flat
 /// and its corners crisp: this is a wall, not a lump.
 const WALL_SMOOTH: f32 = 0.16;
+/// A mine ignores enemies for this long after it is dropped, so it cannot go
+/// off in the face of whoever it was dropped next to before they can react.
+const MINE_ARM: f32 = 0.8;
+/// Height above the mine from which it checks for cover.
+const MINE_EYE: f32 = 0.3;
 /// A bouncing projectile slower than this comes to rest (a dropped bomb).
 const RESTING_SPEED: f32 = 1.0;
 /// How much slack the whip's hit test gives a worm's body around the lash. The
@@ -98,10 +115,13 @@ pub const WHIP_ACTIVE: (f32, f32) = (0.20, 0.85);
 /// front, which is what makes the double-jump follow-up read as a slam.
 pub const WHIP_SMASH_UP: f32 = 1.35;
 pub const WHIP_SMASH_DOWN: f32 = -1.20;
-/// How deep, in metres, the fastest part of a swing cuts into rock. The slit is
-/// two voxels wide (a thinner one cannot be stored in a 25 cm grid) and tapers
-/// to nothing at both ends of the swing.
-const WHIP_CUT_DEPTH: f32 = 1.5;
+/// How deep, in metres, the fastest part of a swing cuts into rock. The cut
+/// tapers to nothing at both ends of the swing. (The smash still cuts a thin
+/// slit, two voxels wide: a thinner one cannot be stored in a 25 cm grid.)
+const WHIP_CUT_DEPTH: f32 = 0.8;
+/// Radius of the flat disc the sweep drags through the rock, so the groove is
+/// twice this wide.
+const WHIP_CUT_RADIUS: f32 = 0.35;
 const WHIP_SMASH_DEPTH: f32 = 2.0;
 /// The overhead smash is a committed blow in the air, so it hits harder than a
 /// swing of the chain.
@@ -329,6 +349,9 @@ impl World {
     pub(crate) fn step_weapons(&mut self, i: usize, input: &Input) {
         let worm = &mut self.worms[i];
         worm.invuln = (worm.invuln - DT).max(0.0);
+        if worm.on_ground {
+            worm.smashed = false;
+        }
         for w in &mut worm.weapons {
             w.cooldown = (w.cooldown - DT).max(0.0);
             // Each weapon reloads on its own timer, so you can switch away and
@@ -355,10 +378,15 @@ impl World {
         // this: one tick of trigger is enough to start it.)
         let current = worm.current;
         let def = &WEAPONS[worm.weapons[current].id as usize];
+        let smash_spent = worm.smashed;
         let w = &mut worm.weapons[current];
         // The whip is melee: it has no magazine, so holding the trigger simply
-        // starts the next coil as soon as the last swing has recovered.
-        let ready = w.cooldown <= 0.0 && w.reload <= 0.0 && (def.kind == Kind::Whip || w.ammo > 0);
+        // starts the next coil as soon as the last swing has recovered. After a
+        // smash it waits for the landing, so one double jump is one stomp.
+        let ready = w.cooldown <= 0.0
+            && w.reload <= 0.0
+            && (def.kind == Kind::Whip || w.ammo > 0)
+            && !(def.kind == Kind::Whip && smash_spent);
         let mut fire = false;
         if ready && (input.fire || w.charge > 0.0) {
             w.charge += DT;
@@ -669,6 +697,14 @@ impl World {
                 self.grid.apply(shape, op);
                 self.events.push(Event::Edit { shape, op });
             }
+            // A bit of lava leaves the muzzle like a bullet but is not a
+            // projectile: it is fluid from the first tick (see `lava.rs`).
+            Kind::Spray => {
+                for _ in 0..def.pellets {
+                    let dir = spread_dir(&mut self.rng, shot, def.spread);
+                    self.spawn_lava_bit(muzzle, dir * def.speed, def.lifetime, i as u8);
+                }
+            }
             Kind::Whip => self.whip_start(i, muzzle, shot),
         }
     }
@@ -718,22 +754,35 @@ impl World {
             let (s, c) = worm.face_yaw.sin_cos();
             Vec3::new(s, 0.0, c)
         };
-        // Leave a little air in front of the wall instead of burying it in the
-        // rock that is already there.
-        let clear = self
-            .grid
-            .raycast(worm.eye(), dir, WALL_AHEAD + WALL_HALF_T + 0.5)
-            .unwrap_or(f32::MAX);
-        let ahead = WALL_AHEAD.min(clear - WALL_HALF_T - 0.1);
-        if ahead < WALL_MIN_AHEAD {
-            return None;
-        }
-        let centre = worm.pos + dir * ahead + Vec3::Y * WALL_LIFT;
-        let shape = Shape::Box {
-            centre,
-            half: Vec3::new(WALL_HALF_W, WALL_HALF_H, WALL_HALF_T),
-            yaw: dir.x.atan2(dir.z),
+        let (centre, half) = if aim.y.abs() > WALL_SLAB_SLOPE {
+            // Looking steeply up or down: the same slab lies flat instead, as a
+            // floor under the feet or a roof over the head. Its width stays
+            // across the view and its depth takes the wall's height, so it
+            // reaches out ahead of the worm as well as around it.
+            let y = if aim.y > 0.0 {
+                worm.eye().y + WALL_ROOF_GAP + WALL_HALF_T
+            } else {
+                worm.pos.y - WALL_FLOOR_GAP - WALL_HALF_T
+            };
+            let at = worm.pos + dir * WALL_AHEAD;
+            (Vec3::new(at.x, y, at.z), Vec3::new(WALL_HALF_W, WALL_HALF_T, WALL_HALF_H))
+        } else {
+            // Leave a little air in front of the wall instead of burying it in
+            // the rock that is already there.
+            let clear = self
+                .grid
+                .raycast(worm.eye(), dir, WALL_AHEAD + WALL_HALF_T + 0.5)
+                .unwrap_or(f32::MAX);
+            let ahead = WALL_AHEAD.min(clear - WALL_HALF_T - 0.1);
+            if ahead < WALL_MIN_AHEAD {
+                return None;
+            }
+            (
+                worm.pos + dir * ahead + Vec3::Y * WALL_LIFT,
+                Vec3::new(WALL_HALF_W, WALL_HALF_H, WALL_HALF_T),
+            )
         };
+        let shape = Shape::Box { centre, half, yaw: dir.x.atan2(dir.z) };
         // Never materialise rock through a living worm (including the owner) or
         // a spawn point: a wall that clips a body would shove it out, and one
         // over a spawn could wall a respawn in.
@@ -775,6 +824,7 @@ impl World {
         } else {
             false
         };
+        self.worms[owner].smashed = style == WhipStyle::Smash;
         let (fwd, side, lean) = whip_frame(aim, self.worms[owner].face_yaw);
         self.worms[owner].swing =
             Some(Swing { style, flip, t: 0.0, fwd, side, lean, hit: 0, cut: None });
@@ -867,13 +917,31 @@ impl World {
                     // Start a hair in front of the surface so the slit opens
                     // cleanly instead of leaving a lip.
                     const LEAD: f32 = 0.15;
-                    let into = (prev_dir + dir).normalize_or_zero();
-                    let shape = Shape::Blade {
-                        a: prev - prev_dir * LEAD,
-                        b: at - dir * LEAD,
-                        dir: if into == Vec3::ZERO { dir } else { into },
-                        depth: depth + LEAD,
-                        half_thickness: WHIP_KERF,
+                    let shape = if s.style == WhipStyle::Smash {
+                        let into = (prev_dir + dir).normalize_or_zero();
+                        Shape::Blade {
+                            a: prev - prev_dir * LEAD,
+                            b: at - dir * LEAD,
+                            dir: if into == Vec3::ZERO { dir } else { into },
+                            depth: depth + LEAD,
+                            half_thickness: WHIP_KERF,
+                        }
+                    } else {
+                        // A flat disc pressed into the surface and dragged
+                        // from the last contact to this one: the segments of
+                        // one swing join into a single groove. The disc's
+                        // axis is the surface normal, so it lies flat on a
+                        // wall as well as on the ground.
+                        let n = self.grid.gradient(at);
+                        let axis = if n.length_squared() > 1.0e-6 { n.normalize() } else { -dir };
+                        let sink = axis * (depth * 0.5 - LEAD);
+                        Shape::Cylinder {
+                            a: prev - sink,
+                            b: at - sink,
+                            axis,
+                            radius: WHIP_CUT_RADIUS,
+                            half_height: depth * 0.5 + LEAD * 0.5,
+                        }
                     };
                     self.grid.apply(shape, Op::Carve);
                     self.events.push(Event::Edit { shape, op: Op::Carve });
@@ -982,14 +1050,21 @@ impl World {
         // Take the list out so we can call `&mut self` methods while looping,
         // then put the survivors back.
         let old = std::mem::take(&mut self.projectiles);
+        let blasts = std::mem::take(&mut self.blasts);
         let mut keep = Vec::with_capacity(old.len());
         'next: for mut pr in old {
             let def = &WEAPONS[pr.weapon as usize];
             pr.life -= DT;
+            if let Special::Mine(radius) = def.special {
+                if self.mine_triggered(&pr, def, radius, &blasts) {
+                    self.impact(&pr, def, None);
+                    continue 'next;
+                }
+            }
             if let Special::Homing(turn) = def.special {
                 self.steer(&mut pr, turn);
             }
-            pr.vel.y -= def.gravity * DT;
+            pr.vel.y -= def.gravity * self.gravity_at(pr.pos) * DT;
 
             // A Cluster shell flies through worms and bursts only at rock or at
             // the end of its fuse. Bursting on someone put all seven bomblets on
@@ -1040,7 +1115,7 @@ impl World {
             if pr.life <= 0.0 {
                 // The end of the flight is an impact with nothing: shells burst,
                 // orbs land and rockets blow up where they are.
-                if def.blast_radius > 0.0 || matches!(def.special, Special::Cluster(..) | Special::Teleport) {
+                if def.blast_radius > 0.0 || matches!(def.special, Special::Cluster(..) | Special::Teleport | Special::Gravity(..)) {
                     self.impact(&pr, def, None);
                 }
                 continue;
@@ -1050,6 +1125,34 @@ impl World {
         // A burst this tick put its children into the (emptied) list: keep them.
         keep.append(&mut self.projectiles);
         self.projectiles = keep;
+    }
+
+    /// Mine: does it go off this tick? Either a blast from last tick reached it
+    /// (armed or not, and rock in between is cover, as for worms), or, once
+    /// armed, an enemy is within `radius` of it with a clear line. The owner can
+    /// walk over their own mine; a blast still sets it off.
+    fn mine_triggered(&self, pr: &Projectile, def: &WeaponDef, radius: f32, blasts: &[(Vec3, f32)]) -> bool {
+        // Look from a little above the mine: it rests on the ground, and a ray
+        // that starts in the rock would see it as cover.
+        let eye = pr.pos + Vec3::Y * MINE_EYE;
+        let blasted = blasts.iter().any(|&(at, reach)| {
+            let d = at.distance(eye);
+            d < reach && (d < 0.1 || self.grid.raycast(at, (eye - at) / d, d).is_none())
+        });
+        if blasted {
+            return true;
+        }
+        if def.lifetime - pr.life < MINE_ARM {
+            return false;
+        }
+        self.worms.iter().enumerate().any(|(j, worm)| {
+            if j == pr.owner as usize || !worm.alive {
+                return false;
+            }
+            let (a, b) = worm.axis();
+            let near = closest_point_on_segment(pr.pos, a, b);
+            near.distance(pr.pos) - WORM_RADIUS < radius && lash_clear(&self.grid, eye, near)
+        })
     }
 
     /// Homing: turn the velocity towards the nearest living enemy, by at most
@@ -1132,12 +1235,53 @@ impl World {
         self.events.push(Event::Teleported { worm: owner as u8, from, to });
     }
 
+    pub(crate) fn ignite(&mut self, victim: usize, by: u8) {
+        let worm = &mut self.worms[victim];
+        if worm.alive {
+            worm.burn = BURN_TIME;
+            worm.burn_by = by;
+        }
+    }
+
+    /// Every tick: burning worms take damage on the `BURN_TICK` beat. (Touching
+    /// lava is what sets them alight: see `scorch_with_lava`.)
+    pub(crate) fn step_burning(&mut self) {
+        for j in 0..self.worms.len() {
+            let worm = &mut self.worms[j];
+            if worm.burn <= 0.0 {
+                continue;
+            }
+            if !worm.alive {
+                worm.burn = 0.0;
+                continue;
+            }
+            // A burn tick is a multiple of `BURN_TICK` seconds left being
+            // crossed: it needs no timer of its own.
+            let (before, after) = (worm.burn, worm.burn - DT);
+            worm.burn = after.max(0.0);
+            if (before / BURN_TICK).floor() != (after / BURN_TICK).floor() {
+                let by = worm.burn_by as usize;
+                self.damage(j, BURN_DAMAGE, LAVA, by, Vec3::ZERO);
+            }
+        }
+    }
+
+    fn start_zone(&mut self, kind: ZoneKind, centre: Vec3, radius: f32, seconds: f32, owner: u8) {
+        self.zones.push(Zone { kind, centre, radius, left: seconds, owner });
+        self.events.push(Event::ZoneStarted { kind, pos: centre, radius, seconds });
+    }
+
     /// A projectile ended its flight against rock or a worm.
     fn impact(&mut self, pr: &Projectile, def: &WeaponDef, victim: Option<usize>) {
         let dir = pr.vel.normalize_or_zero();
         match def.special {
             Special::Cluster(count, child) => return self.burst(pr, dir, count, child),
             Special::Teleport => return self.teleport(pr, dir, victim),
+            Special::Gravity(scale, radius, seconds) => {
+                // On a worm or on rock, the zone is centred where the orb stopped.
+                let at = self.free_point(pr.pos, dir, PROJECTILE_RADIUS).unwrap_or(pr.pos);
+                return self.start_zone(ZoneKind::Gravity(scale), at, radius, seconds, pr.owner);
+            }
             _ => {}
         }
         if def.blast_radius > 0.0 {
@@ -1194,6 +1338,7 @@ impl World {
             }
         };
         self.events.push(Event::Explosion { weapon, pos, normal, radius: def.blast_radius });
+        self.blasts.push((pos, def.blast_radius));
 
         for v in 0..self.worms.len() {
             if !self.worms[v].alive {
@@ -1258,7 +1403,7 @@ fn closest_point_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
     a + ab * t
 }
 
-fn point_segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+pub(crate) fn point_segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
     p.distance(closest_point_on_segment(p, a, b))
 }
 
@@ -1266,7 +1411,8 @@ fn point_segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
 mod tests {
     use super::*;
     use crate::weapons::{
-        BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+        BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, HEAVY, LAVA, MOON, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT,
+        TRACTOR, WHIP,
     };
     use glam::IVec3;
     use sdf::Grid;
@@ -1350,6 +1496,202 @@ mod tests {
 
     fn duel() -> World {
         arena(flat, &[(16.0, 16.0), (16.0, 26.0)])
+    }
+
+    #[test]
+    fn an_orb_starts_a_gravity_zone_where_it_lands() {
+        let mut w = arena(flat, &[(16.0, 4.0)]);
+        let events = hold(&mut w, MOON, 0.0, 90);
+        let zone = events.iter().find_map(|e| match e {
+            Event::ZoneStarted { kind, pos, radius, .. } => Some((*kind, *pos, *radius)),
+            _ => None,
+        });
+        let (kind, pos, radius) = zone.expect("the orb landed and started a zone");
+        assert_eq!(kind, ZoneKind::Gravity(0.3));
+        assert!(pos.z > 8.0 && pos.y < 5.0, "it landed on the floor ahead: {pos}");
+        assert_eq!(radius, 14.0);
+        assert_eq!(w.zones.len(), 1);
+    }
+
+    #[test]
+    fn a_shell_lobbed_inside_a_moon_zone_peaks_higher() {
+        let peak = |zone: bool| {
+            let mut w = arena(flat, &[(16.0, 4.0)]);
+            if zone {
+                w.zones.push(Zone { kind: ZoneKind::Gravity(0.3), centre: Vec3::new(16.0, 6.0, 16.0), radius: 30.0, left: 8.0, owner: 0 });
+            }
+            hold(&mut w, CLUSTER, 0.0, 1);
+            let mut top = 0.0f32;
+            for _ in 0..40 {
+                w.step(&[]);
+                top = w.projectiles.iter().map(|p| p.pos.y).fold(top, f32::max);
+            }
+            top
+        };
+        let (inside, outside) = (peak(true), peak(false));
+        assert!(inside > outside + 2.0, "inside {inside} vs outside {outside}");
+    }
+
+    /// Worm 0 holds the lava gun's trigger down for `ticks` ticks, aiming a
+    /// little above level (about 6 degrees) so the stream lands inside the arena.
+    fn hose(w: &mut World, ticks: usize) -> Vec<Event> {
+        let mut events = Vec::new();
+        for _ in 0..ticks {
+            w.step(&[Input { fire: true, weapon: LAVA, pitch: 0.1, ..Input::default() }]);
+            events.extend(w.drain_events());
+        }
+        events
+    }
+
+    fn lava_ammo(w: &World) -> u16 {
+        w.worms[0].weapons.iter().find(|s| s.id == LAVA).expect("everyone carries it").ammo
+    }
+
+    /// Three worms: 0 holds the gun, 1 and 2 stand away from the stream.
+    fn lava_arena() -> World {
+        arena(flat, &[(16.0, 4.0), (28.0, 28.0), (4.0, 28.0)])
+    }
+
+    #[test]
+    fn holding_the_trigger_throws_a_bit_every_tick_and_letting_go_stops_it() {
+        let mut w = lava_arena();
+        let events = hose(&mut w, 30);
+        let shots = events.iter().filter(|e| matches!(e, Event::Shot { weapon: LAVA, .. })).count();
+        assert!((29..=30).contains(&shots), "60 Hz for half a second: {shots}");
+        assert_eq!(w.lava.len(), shots);
+        assert_eq!(lava_ammo(&w), 200 - shots as u16);
+        run(&mut w, 30);
+        assert_eq!(w.lava.len(), shots, "nothing more once the trigger is up");
+        let farthest = w.lava.iter().map(|b| b.pos.z).fold(0.0, f32::max);
+        assert!(farthest > 4.0 + 8.0, "the stream leaves the gun fast and far: {farthest}");
+    }
+
+    #[test]
+    fn a_stream_lands_in_front_of_the_worm_and_pools_on_the_floor() {
+        let mut w = lava_arena();
+        hose(&mut w, 90);
+        run(&mut w, 90);
+        assert!(w.lava.len() >= 40, "{} bits", w.lava.len());
+        assert!(w.lava.iter().all(|b| b.pos.y < 4.0 + 0.8), "all are on the floor by now");
+        assert!(w.lava.iter().all(|b| w.grid.sample(b.pos) > crate::lava::LAVA_BIT_RADIUS * 0.5), "none sinks in");
+        let reach = w.lava.iter().map(|b| b.pos.z).fold(0.0, f32::max);
+        assert!(reach > 4.0 + 8.0, "a fire hose: it carries past 8 m even level: {reach}");
+    }
+
+    #[test]
+    fn lava_runs_downhill() {
+        let mut w = arena(ramp, &[(28.0, 28.0)]);
+        let at = Vec3::new(14.0, 4.0 + 14.0 * 30f32.to_radians().tan() + 0.6, 16.0);
+        for k in 0..30 {
+            w.spawn_lava_bit(at + Vec3::new(0.0, 0.0, (k % 6) as f32 * 0.5), Vec3::ZERO, 5.0, 0);
+        }
+        let start = w.lava.iter().map(|b| b.pos.x).sum::<f32>() / 30.0;
+        run(&mut w, 120);
+        let end = w.lava.iter().map(|b| b.pos.x).sum::<f32>() / w.lava.len() as f32;
+        assert!(end < start - 1.0, "the ramp rises towards +x, so the lava ends lower: {start} -> {end}");
+    }
+
+    #[test]
+    fn lava_freezes_into_rock_that_is_one_surface_with_no_gaps() {
+        let mut w = lava_arena();
+        let before = w.grid.checksum();
+        let mut events = hose(&mut w, 90);
+        events.extend(run(&mut w, 600));
+        assert!(w.lava.is_empty(), "every bit froze or went: {} left", w.lava.len());
+        assert!(w.grid.checksum() != before, "the terrain changed");
+        let frozen: Vec<Vec3> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::LavaFroze { pos } => Some(*pos),
+                _ => None,
+            })
+            .collect();
+        assert!(frozen.len() >= 35, "most of the bits froze onto the rock: {}", frozen.len());
+        // Gaps: the midpoint of any two neighbouring bits must be inside rock
+        // now. A pile of separate balls would leave air between them.
+        let mut pairs = 0;
+        for (i, a) in frozen.iter().enumerate() {
+            for b in &frozen[i + 1..] {
+                if a.distance(*b) < 0.9 {
+                    pairs += 1;
+                    let mid = (*a + *b) * 0.5;
+                    assert!(w.grid.sample(mid) < 0.1, "a gap at {mid}: {}", w.grid.sample(mid));
+                }
+            }
+        }
+        assert!(pairs > 20, "the bits lay close together: {pairs} pairs");
+    }
+
+    /// Stop the stream, then stand worm 1 on the last bit that left the gun.
+    fn stand_in_the_lava(w: &mut World) {
+        let at = w.lava.last().expect("the hose threw some").pos;
+        w.worms[1].reset_motion(Vec3::new(at.x, 4.05, at.z));
+    }
+
+    #[test]
+    fn a_worm_in_the_lava_burns_and_the_thrower_gets_the_kill_but_a_far_one_is_fine() {
+        let mut w = lava_arena();
+        hose(&mut w, 40);
+        run(&mut w, 40);
+        stand_in_the_lava(&mut w);
+        run(&mut w, 20);
+        assert!(w.worms[1].burn > 0.0, "touching lava sets it alight");
+        assert!(w.worms[1].hp < MAX_HP);
+        // Standing in it while it cools costs a good part of the health; a worm
+        // that was already hurt does not survive.
+        w.worms[1].hp = 8.0;
+        for _ in 0..600 {
+            w.step(&[]);
+            if !w.worms[1].alive {
+                break;
+            }
+            w.worms[1].invuln = 0.0;
+        }
+        assert!(!w.worms[1].alive, "a hurt worm that stays dies");
+        assert_eq!(w.worms[0].kills, 1);
+        assert_eq!(w.worms[2].hp, MAX_HP, "far from the stream nothing burns");
+        assert_eq!(w.worms[2].burn, 0.0);
+    }
+
+    #[test]
+    fn the_hose_does_not_burn_the_worm_holding_it() {
+        let mut w = lava_arena();
+        hose(&mut w, 60);
+        assert_eq!(w.worms[0].burn, 0.0, "the bits leave from the muzzle, touching the shooter");
+        assert_eq!(w.worms[0].hp, MAX_HP);
+    }
+
+    #[test]
+    fn lava_never_sets_rock_on_a_worm() {
+        let mut w = lava_arena();
+        hose(&mut w, 40);
+        run(&mut w, 40);
+        stand_in_the_lava(&mut w);
+        for _ in 0..600 {
+            w.step(&[]);
+            w.worms[1].hp = MAX_HP;
+        }
+        assert!(body_fits(&w.grid, w.worms[1].pos), "the worm is not sealed in");
+    }
+
+    #[test]
+    fn the_magazine_is_200_bits_and_the_world_never_holds_more_than_the_cap() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        let events = hose(&mut w, 300);
+        let shots = events.iter().filter(|e| matches!(e, Event::Shot { weapon: LAVA, .. })).count();
+        assert_eq!(shots, 200, "then it reloads");
+        for _ in 0..400 {
+            w.spawn_lava_bit(Vec3::new(16.0, 8.0, 16.0), Vec3::ZERO, 5.0, 0);
+        }
+        assert_eq!(w.lava.len(), crate::lava::LAVA_MAX);
+    }
+
+    #[test]
+    fn a_heavy_orb_pulls_harder() {
+        let mut w = arena(flat, &[(16.0, 4.0)]);
+        hold(&mut w, HEAVY, 0.0, 90);
+        assert_eq!(w.zones.len(), 1);
+        assert_eq!(w.zones[0].kind, ZoneKind::Gravity(2.5));
     }
 
     #[test]
@@ -1672,21 +2014,60 @@ mod tests {
     }
 
     #[test]
-    fn a_bomb_drops_to_the_ground_rests_and_goes_off_at_its_fuse() {
-        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 30.0)]);
+    fn a_mine_drops_to_the_ground_and_lies_there_without_a_fuse() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 40.0)]);
         shoot(&mut w, BOMB, 0.0);
         run(&mut w, 30); // falls, hops once or twice, then creeps to rest
-        let bomb = &w.projectiles[0];
-        assert_eq!(bomb.vel, Vec3::ZERO, "at rest");
-        assert!(bomb.pos.y > 4.0 && bomb.pos.y < 4.4, "on the ground: {:?}", bomb.pos);
-        let hole = Vec3::new(16.0, 3.0, 16.0);
-        assert!(w.grid.sample(hole) < 0.0);
+        let mine = &w.projectiles[0];
+        assert_eq!(mine.vel, Vec3::ZERO, "at rest");
+        assert!(mine.pos.y > 4.0 && mine.pos.y < 4.4, "on the ground: {:?}", mine.pos);
 
-        let events = run(&mut w, 50);
-        assert!(w.projectiles.is_empty());
-        assert_eq!(explosions(&events), 1);
-        assert!(w.grid.sample(hole) > 0.0, "the crater is below where the bomb lay");
-        assert!(w.worms[0].hp < 70.0, "standing on your own bomb hurts: {}", w.worms[0].hp);
+        // The owner stands right on it, the enemy is far away: nothing happens.
+        let events = run(&mut w, 120);
+        assert_eq!(w.projectiles.len(), 1, "still waiting");
+        assert_eq!(explosions(&events), 0);
+    }
+
+    #[test]
+    fn a_mine_goes_off_when_an_enemy_comes_close_but_not_before_it_is_armed() {
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 40.0)]);
+        shoot(&mut w, BOMB, 0.0);
+        run(&mut w, 60); // past the arming time
+        let at = w.projectiles[0].pos;
+        // 2 m away: inside the trigger radius, nowhere near touching.
+        w.worms[1].pos = Vec3::new(at.x + 2.0, 4.05, at.z);
+        w.worms[1].vel = Vec3::ZERO;
+        let events = run(&mut w, 3);
+        assert_eq!(explosions(&events), 1, "set off by proximity");
+        assert!(w.worms[1].hp < MAX_HP);
+
+        // A fresh mine ignores that same enemy while it is still arming.
+        let mut w = arena(flat, &[(16.0, 16.0), (16.0, 40.0)]);
+        shoot(&mut w, BOMB, 0.0);
+        run(&mut w, 5);
+        let at = w.projectiles[0].pos;
+        w.worms[1].pos = Vec3::new(at.x + 2.0, 4.05, at.z);
+        w.worms[1].vel = Vec3::ZERO;
+        let events = run(&mut w, 5);
+        assert_eq!(explosions(&events), 0, "not armed yet");
+    }
+
+    #[test]
+    fn a_blast_sets_off_a_mine_but_rock_in_between_protects_it() {
+        let blast_next_to_mine = |f: fn(Vec3) -> f32, at: Vec3| {
+            let mut w = arena(f, &[(16.0, 16.0), (16.0, 40.0)]);
+            shoot(&mut w, BOMB, 0.0);
+            run(&mut w, 30);
+            let mine = w.projectiles[0].pos;
+            w.explode(mine + at, ROCKET, 1);
+            let events = run(&mut w, 3);
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Explosion { weapon: BOMB, .. }))
+                .count()
+        };
+        assert_eq!(blast_next_to_mine(flat, Vec3::new(0.0, 0.3, 2.0)), 1, "the mine goes off with it");
+        assert_eq!(blast_next_to_mine(flat, Vec3::new(0.0, 0.3, 40.0)), 0, "out of reach it does not");
     }
 
     #[test]
@@ -1833,6 +2214,34 @@ mod tests {
             events.iter().any(|e| matches!(e, Event::Shot { weapon: BLASTER, .. })),
             "and the new weapon still fires"
         );
+    }
+
+    #[test]
+    fn the_block_weapon_lies_flat_when_aimed_steeply_up_or_down() {
+        for pitch in [0.7_f32, -0.7] {
+            let mut w = arena(flat, &[(16.0, 16.0)]);
+            let events = shoot(&mut w, BUILD, pitch);
+            let shape = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::Edit { shape: shape @ Shape::Box { .. }, .. } => Some(*shape),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a slab is placed at pitch {pitch}"));
+            let Shape::Box { centre, half, .. } = shape else { unreachable!() };
+            assert!(half.y < half.z && half.y < half.x, "flat, not upright: {half:?}");
+            let worm = &w.worms[0];
+            if pitch > 0.0 {
+                assert!(centre.y > worm.eye().y, "a roof over the head: {}", centre.y);
+                assert!(w.grid.sample(centre) < -0.2, "solid at its centre");
+            } else {
+                assert!(centre.y < worm.pos.y, "a floor under the feet: {}", centre.y);
+            }
+            let (a, b) = worm.axis();
+            for p in [a, (a + b) * 0.5, b] {
+                assert!(shape.distance(p) > 0.0, "the slab is not on the worm: {p:?}");
+            }
+        }
     }
 
     #[test]
@@ -2033,7 +2442,7 @@ mod tests {
     }
 
     #[test]
-    fn the_whip_cuts_a_thin_horizontal_slit_in_a_wall_without_tunnelling() {
+    fn the_whip_drags_a_flat_cylinder_along_a_wall_without_tunnelling() {
         // Flat ground and a wall 8 m ahead. Aim level, so the swing crosses the
         // wall in one plane.
         let mut w = arena(walled, &[(16.0, 16.0)]);
@@ -2044,8 +2453,8 @@ mod tests {
         let blades: Vec<(Vec3, Vec3, f32, f32)> = events
             .iter()
             .filter_map(|e| match e {
-                Event::Edit { shape: Shape::Blade { a, b, depth, half_thickness, .. }, op: Op::Carve } => {
-                    Some((*a, *b, *depth, *half_thickness))
+                Event::Edit { shape: Shape::Cylinder { a, b, radius, half_height, .. }, op: Op::Carve } => {
+                    Some((*a, *b, *half_height * 2.0, *radius))
                 }
                 _ => None,
             })
@@ -2064,8 +2473,8 @@ mod tests {
         assert!(max.y - min.y < 1.0, "the slit is level: y {}..{}", min.y, max.y);
         assert!(max.x - min.x > 4.0, "it runs along the wall: x {}..{}", min.x, max.x);
         let deepest = blades.iter().map(|b| b.2).fold(0.0, f32::max);
-        assert!(deepest > 1.0 && deepest < 2.0, "it bites about a metre and a half: {deepest}");
-        assert!(blades.iter().all(|b| b.3 <= 0.3), "and stays narrow");
+        assert!(deepest > 0.5 && deepest < 1.5, "it presses in under a metre: {deepest}");
+        assert!(blades.iter().all(|b| b.3 <= 0.6), "and stays narrow");
         // The wall is 8 m thick on this map; the slit never goes through.
         assert!(w.grid.sample(Vec3::new(16.0, hand_y, 27.0)) < 0.0, "no tunnel through the wall");
         // Rock just above the slit is untouched.
@@ -2143,6 +2552,25 @@ mod tests {
                 .any(|e| matches!(e, Event::Whip { style: WhipStyle::Smash, .. })),
             "the follow-up smashes downwards"
         );
+    }
+
+    #[test]
+    fn holding_the_trigger_in_the_double_jump_smashes_only_once_per_airtime() {
+        let mut w = arena(flat, &[(16.0, 16.0)]);
+        w.worms[0].current = WHIP as usize;
+        let height = w.worms[0].pos.y + 6.0;
+        let mut whips = 0;
+        for _ in 0..60 {
+            // Hover in the double jump: the test is about the trigger, not the fall.
+            let worm = &mut w.worms[0];
+            worm.pos.y = height;
+            worm.vel = Vec3::ZERO;
+            worm.on_ground = false;
+            worm.action = Action::DoubleJump;
+            w.step(&[Input { fire: true, weapon: WHIP, pitch: LEVEL, ..Input::default() }]);
+            whips += w.drain_events().iter().filter(|e| matches!(e, Event::Whip { .. })).count();
+        }
+        assert_eq!(whips, 1, "one stomp, however long the button is held");
     }
 
     #[test]

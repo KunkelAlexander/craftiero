@@ -13,7 +13,8 @@ use crate::renderer::{DrawPrim, Light, Soot, Sprite};
 use glam::Vec3;
 use sdf::Grid;
 use sim::weapons::{BLASTER, BOMB, BOMBLET, BOUNCER, CLUSTER, NOVA, ROCKET, SWARM, TELEPORT, WHIP};
-use sim::{AimPath, Event, Projectile, Worm, DT};
+use sim::weapons::LAVA as LAVA_GUN;
+use sim::{AimPath, Event, LavaBit, Projectile, Worm, ZoneKind, DT, STAMP_RADIUS};
 use std::f32::consts::TAU;
 
 /// Gameplay effects share the renderer's 256-slot core pool with the worms,
@@ -44,6 +45,15 @@ const BOMBSHELL: Vec3 = Vec3::new(0.16, 0.15, 0.17);
 /// droplets are self-lit so they stay legible in a dark crater; the splats are
 /// darker because a stain on rock should look like a stain, not a lamp.
 const BLOOD: Vec3 = Vec3::new(0.78, 0.035, 0.045);
+/// Fresh lava: orange, hotter than fire.
+const LAVA: Vec3 = Vec3::new(1.0, 0.42, 0.06);
+/// The hottest lava, the orange it settles to, and the dull red crust it ends
+/// as. Deliberately not near white: a glowing surface is tone-mapped, and a
+/// bright yellow would roll off to a flat cream blob with no shape left.
+const LAVA_HOT: Vec3 = Vec3::new(0.85, 0.27, 0.04);
+const LAVA_MID: Vec3 = Vec3::new(0.70, 0.12, 0.02);
+const LAVA_CRUST: Vec3 = Vec3::new(0.30, 0.06, 0.03);
+const STEAM: Vec3 = Vec3::new(0.52, 0.50, 0.49);
 const BLOOD_DARK: Vec3 = Vec3::new(0.50, 0.018, 0.028);
 /// The scorch a shot leaves on rock: near-black, so it reads as a burn, not a
 /// hole, and never competes with the weapon's own colour.
@@ -174,8 +184,20 @@ fn ammo(weapon: u8, at: Vec3, vel: Vec3, out: &mut Vec<DrawPrim>) {
             out.push(ball(at, 0.17, LIME).glowing());
         }
         BOMB => {
-            out.push(ball(at, 0.30, BOMBSHELL));
-            out.push(ball(at + up * 0.30, 0.06, EMBER).glowing());
+            // A landmine: a squat disc that always lies flat (whichever way it
+            // tumbled), with a raised dome, a glowing trigger light and studs
+            // around the rim. The sim keeps it a little above the ground, so the
+            // body sinks below `at` to sit on it.
+            let flat = Vec3::Y;
+            out.push(DrawPrim::cylinder(at - flat * 0.13, at + flat * 0.03, 0.36, BOMBSHELL, false));
+            out.push(DrawPrim::cylinder(at - flat * 0.03, at + flat * 0.02, 0.375, OLIVE, false));
+            out.push(DrawPrim::cylinder(at + flat * 0.03, at + flat * 0.08, 0.22, OLIVE, false));
+            out.push(ball(at + flat * 0.10, 0.06, EMBER).glowing());
+            for k in 0..4 {
+                let a = k as f32 * TAU / 4.0 + TAU / 8.0;
+                let stud = at + Vec3::new(a.cos(), 0.0, a.sin()) * 0.28 + flat * 0.04;
+                out.push(ball(stud, 0.045, BOMBSHELL));
+            }
         }
         CLUSTER => {
             // A brass shell with a hot tracer tip.
@@ -218,6 +240,38 @@ pub fn projectiles(list: &[Projectile], alpha: f32) -> Vec<DrawPrim> {
         ammo(p.weapon, at, p.vel, &mut out);
     }
     out
+}
+
+/// The lava as billboards: per bit one solid, soft-edged orange blob (alpha
+/// blended, so a hundred of them overlap into an opaque mass instead of adding
+/// up to white) and a faint wide halo (additive) that makes it glow. They are
+/// sprites and not capsules because a hose has a hundred bits in flight, and the
+/// raymarcher's primitive list (shared with the worms) has 256 places. A fresh
+/// bit is bright orange, then it goes deeper red-orange, then it dulls to a red
+/// crust as it cools, and the halo goes out: the colour is the clock that tells
+/// you how soon it sets. Returns `(glow, body)`.
+pub fn lava_sprites(list: &[LavaBit], alpha: f32) -> (Vec<Sprite>, Vec<Sprite>) {
+    let mut glow = Vec::with_capacity(list.len());
+    let mut body = Vec::with_capacity(list.len());
+    for (k, b) in list.iter().enumerate() {
+        let at = b.pos - b.vel * DT * (1.0 - alpha);
+        let c = b.cooled();
+        // Three-stop ramp: hot -> orange (by 0.5) -> crust.
+        let colour = if c < 0.5 { LAVA_HOT.lerp(LAVA_MID, c * 2.0) } else { LAVA_MID.lerp(LAVA_CRUST, (c - 0.5) * 2.0) };
+        // A slow shimmer, different for every bit, so the surface seethes.
+        let shimmer = 1.0 + 0.10 * (b.age * 7.0 + k as f32 * 1.9).sin();
+        let seed = k as f32 * 1.37;
+        // As big as the rock it becomes: the stamp's radius plus the bulge its
+        // smooth join adds. Drawn smaller, the lava shrank into a scatter of
+        // dots and then froze into a lump twice its size.
+        let size = (STAMP_RADIUS + 0.3) * shimmer;
+        body.push(Sprite::ball(at + Vec3::Y * 0.3, size, colour, 0.97, seed, 0.15));
+        let heat = (1.0 - c / 0.8).max(0.0);
+        if heat > 0.0 {
+            glow.push(Sprite::ball(at + Vec3::Y * 0.3, size * 2.0, LAVA, 0.16 * heat, seed, 0.6));
+        }
+    }
+    (glow, body)
 }
 
 /// The air trace a projectile leaves: a small puff of smoke (or frost, or hot
@@ -600,11 +654,31 @@ pub struct Effects {
     /// Counts sim ticks, so a trail's spacing follows the fight rather than the
     /// display's frame rate.
     trail_tick: u32,
+    /// The same for the lava's embers, smoke and lights.
+    lava_tick: u32,
     /// Dynamic lights thrown by blasts, flashes and plasma.
     lights: Vec<LightFx>,
     /// Soot spheres on the terrain, left by blasts.
     soot: Vec<SootFx>,
+    /// Zones that are running: each sends out a ring every second, so the
+    /// edge of a low-gravity bubble stays readable for as long as it lasts.
+    zones: Vec<ZoneFx>,
 }
+
+/// How a running zone is drawn: where, how far it reaches, and its colour.
+#[derive(Clone, Copy)]
+struct ZoneFx {
+    at: Vec3,
+    radius: f32,
+    colour: Vec3,
+    left: f32,
+    /// Seconds until the next ring.
+    next: f32,
+}
+
+/// Seconds between a zone's rings, and how long each takes to spread out.
+const ZONE_PULSE: f32 = 1.0;
+const ZONE_RING_LIFE: f32 = 1.4;
 
 /// A patch of soot that fades over half a minute.
 #[derive(Clone, Copy)]
@@ -663,6 +737,11 @@ impl Effects {
             // the `Impact` events the cut sends. The start of a swing has
             // nothing to flash.
             Event::Whip { .. } => {}
+            // The hose fires thirty times a second: a flash, spikes and a wisp of
+            // smoke each time would be a strobe. One small glow at the nozzle.
+            Event::Shot { weapon, pos, .. } if weapon == LAVA_GUN => {
+                self.push_burst(Effect::puff(pos, Vec3::ZERO, 0.30, LAVA, 0.10, 0.0).glow().front());
+            }
             Event::Shot { weapon, pos, .. } => {
                 // A hot flash at the muzzle in the weapon's own colour (the
                 // tracer's direction is known to `main`), plus a wisp of smoke
@@ -708,6 +787,20 @@ impl Effects {
                     )
                     .glow(),
                 );
+            }
+            Event::ZoneStarted { kind, pos, radius, seconds } => {
+                let colour = match kind {
+                    ZoneKind::Gravity(scale) if scale < 1.0 => Vec3::new(0.55, 0.80, 1.0),
+                    ZoneKind::Gravity(_) => Vec3::new(1.0, 0.45, 0.30),
+                };
+                self.push_light(pos, colour, radius, 2.0, 0.5);
+                self.zones.push(ZoneFx { at: pos, radius, colour, left: seconds, next: 0.0 });
+            }
+            Event::LavaFroze { pos } => {
+                // Steam off the rock as it sets.
+                let seed = pos.x * 3.1 + pos.z * 1.7;
+                let drift = Vec3::new(noise(seed) - 0.5, 0.0, noise(seed + 2.0) - 0.5) * 0.5;
+                self.push_dust(Effect::puff(pos + Vec3::Y * 0.4, Vec3::Y * 0.9 + drift, 0.26, STEAM, 1.3, -0.3));
             }
             Event::Teleported { from, to, .. } => {
                 for at in [from, to] {
@@ -1299,6 +1392,45 @@ impl Effects {
         }
     }
 
+    /// Embers, smoke and light from the molten lava. Call it once per sim tick
+    /// (like `trails`), so how much comes off does not depend on the frame rate.
+    pub fn lava(&mut self, list: &[LavaBit]) {
+        self.lava_tick = self.lava_tick.wrapping_add(1);
+        let n = list.len();
+        if n == 0 {
+            return;
+        }
+        let t = self.lava_tick;
+        // An ember lifts off a bit every other tick; which bit and where it
+        // drifts come from the tick count, as everywhere in this file.
+        if t % 2 == 0 {
+            let k = (t as usize * 7) % n;
+            let b = list[k];
+            if b.cooled() < 0.85 {
+                let seed = t as f32 * 1.3 + k as f32;
+                let drift = Vec3::new(noise(seed) - 0.5, 0.0, noise(seed + 3.1) - 0.5) * 0.8;
+                let rise = Vec3::Y * (1.0 + 1.5 * noise(seed + 7.0));
+                self.push_dust(Effect::puff(b.pos + Vec3::Y * 0.3, rise + drift, 0.07, LAVA, 0.9, -0.3).glow());
+            }
+        }
+        // Now and then a curl of smoke from another one.
+        if t % 9 == 0 {
+            let b = list[(t as usize * 5) % n];
+            self.push_dust(Effect::puff(b.pos + Vec3::Y * 0.5, Vec3::Y * 1.1, 0.30, STEAM, 1.6, -0.2));
+        }
+        // Three lights spread through the list light the rock around the lava;
+        // they dim as their bit cools.
+        if t % 3 == 0 {
+            for q in 0..3 {
+                let b = list[(q * n) / 3];
+                let power = 2.5 * (1.0 - b.cooled());
+                if power > 0.05 {
+                    self.push_light(b.pos + Vec3::Y * 0.6, LAVA, 5.0, power, 0.1);
+                }
+            }
+        }
+    }
+
     pub fn update(&mut self, dt: f32) {
         for e in self
             .list
@@ -1328,6 +1460,16 @@ impl Effects {
             l.age += dt;
         }
         self.lights.retain(|l| l.age < l.life);
+        for i in 0..self.zones.len() {
+            self.zones[i].left -= dt;
+            self.zones[i].next -= dt;
+            if self.zones[i].next <= 0.0 {
+                let ZoneFx { at, radius, colour, .. } = self.zones[i];
+                self.push_burst(Effect::ring(at, Vec3::Y, radius, colour, ZONE_RING_LIFE));
+                self.zones[i].next += ZONE_PULSE;
+            }
+        }
+        self.zones.retain(|z| z.left > 0.0);
         for s in &mut self.soot {
             s.age += dt;
         }
@@ -1684,6 +1826,19 @@ mod tests {
         e.hot = true;
         let sprite = line_sprite(&e).expect("a trail sprite");
         assert!(sprite.a[3] < 0.25, "the wake is a thin streak, not a bubble: {}", sprite.a[3]);
+    }
+
+    #[test]
+    fn every_bit_of_lava_is_a_blob_and_a_cooled_one_is_darker_and_does_not_glow() {
+        use sim::Vec3 as V;
+        let fresh = LavaBit { pos: V::ZERO, vel: V::ZERO, age: 0.0, life: 5.0, owner: 0 };
+        let cold = LavaBit { age: 5.0, ..fresh };
+        assert!(lava_sprites(&[], 1.0).1.is_empty());
+        let (glow, body) = lava_sprites(&[fresh, cold], 1.0);
+        assert_eq!(body.len(), 2);
+        assert_eq!(glow.len(), 1, "only the molten one glows");
+        let brightness = |s: &Sprite| s.b[0] + s.b[1] + s.b[2];
+        assert!(brightness(&body[0]) > brightness(&body[1]) * 2.0);
     }
 
     #[test]

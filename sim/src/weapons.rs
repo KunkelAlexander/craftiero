@@ -38,10 +38,18 @@ pub const TRACTOR: u8 = 10;
 pub const WHIP: u8 = 11;
 /// What a Cluster shell splits into. Not in the arsenal: only the shell makes it.
 pub const BOMBLET: u8 = 12;
+/// Lobbed orbs that change gravity around where they land, for a few seconds.
+pub const MOON: u8 = 13;
+pub const HEAVY: u8 = 14;
+/// A garden hose of lava: a stream of molten bits that flows where it lands,
+/// burns whatever it touches, and freezes to rock a few seconds later.
+pub const LAVA: u8 = 15;
 
 /// Every weapon a player carries, in slot order. (The 2D game let you pick five
 /// of them on a loadout screen; that comes back with the menus, M6.)
-pub const ARSENAL: [u8; 12] = [BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, CLUSTER, SWARM, TELEPORT, NOVA, BUILD, TRACTOR, WHIP];
+pub const ARSENAL: [u8; 15] = [
+    BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, CLUSTER, SWARM, TELEPORT, NOVA, BUILD, TRACTOR, WHIP, MOON, HEAVY, LAVA,
+];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -54,6 +62,10 @@ pub enum Kind {
     Build,
     /// Adds one rectangular wall of terrain just ahead of the worm.
     Wall,
+    /// Holds the trigger down and throws a stream of lava bits (see `lava.rs`):
+    /// one bit of `pellets` per shot, `speed` out of the muzzle, molten for
+    /// `lifetime` seconds before it freezes.
+    Spray,
     /// A melee lash: a left-to-right sweep that damages what it touches and
     /// digs a shallow groove along its path. Fired after a double jump, it becomes an
     /// overhead smash instead.
@@ -71,6 +83,13 @@ pub enum Special {
     Cluster(u8, u8),
     /// Where it lands, its owner appears (or swaps places with the worm it hit).
     Teleport,
+    /// A mine: it rests where it lands and goes off when an enemy comes within
+    /// this many metres (once armed), or when another blast reaches it.
+    Mine(f32),
+    /// Where it lands it starts a Gravity zone: the pull is multiplied by the
+    /// first number, inside a sphere of the second number's radius (metres), for
+    /// the third number of seconds.
+    Gravity(f32, f32, f32),
 }
 
 pub struct WeaponDef {
@@ -163,7 +182,7 @@ impl WeaponDef {
     }
 }
 
-pub static WEAPONS: [WeaponDef; 13] = [
+pub static WEAPONS: [WeaponDef; 16] = [
     WeaponDef {
         name: "Neon Blaster",
         kind: Kind::Projectile,
@@ -264,14 +283,15 @@ pub static WEAPONS: [WeaponDef; 13] = [
         loft: 0.0,
     },
     WeaponDef {
-        name: "Bomb",
+        name: "Mine",
         kind: Kind::Projectile,
         damage: 0.0,
-        // Dropped at your feet. It also goes off the moment an enemy touches
-        // it, so it doubles as a mine. It falls, bounces once or twice and
-        // comes to rest (see `bounce` and `gravity`), then waits for its fuse.
+        // Dropped at your feet. It falls, bounces once or twice and comes to
+        // rest (see `bounce` and `gravity`), then waits: `lifetime` is how long
+        // it lies there unspent. It goes off when an enemy steps within
+        // `Special::Mine`'s radius, touches it, or a blast reaches it.
         speed: 0.0,
-        lifetime: 1.2,
+        lifetime: 40.0,
         cooldown: 0.8,
         mag: 2,
         reload: 3.0,
@@ -284,7 +304,7 @@ pub static WEAPONS: [WeaponDef; 13] = [
         pellets: 1,
         gravity: 25.0,
         bounce: 0.3,
-        special: Special::None,
+        special: Special::Mine(2.5),
         windup: 0.0,
         loft: 0.0,
     },
@@ -486,6 +506,81 @@ pub static WEAPONS: [WeaponDef; 13] = [
         terrain: 4.0,
         pellets: 1,
         gravity: 10.0,
+        bounce: 0.0,
+        special: Special::None,
+        windup: 0.0,
+        loft: 0.0,
+    },
+    WeaponDef {
+        name: "Moon Orb",
+        kind: Kind::Projectile,
+        damage: 0.0,
+        // A lob, so it can be thrown over cover onto the enemy. 0.3x gravity
+        // makes a worm's jump three times as high and its fall a drift: an
+        // easy target for the railgun, and a long swing for the rope.
+        speed: 26.0,
+        lifetime: 2.2,
+        cooldown: 1.0,
+        mag: 2,
+        reload: 6.0,
+        spread: 0.0,
+        range: 0.0,
+        blast_radius: 0.0,
+        blast_damage: 0.0,
+        knockback: 0.0,
+        terrain: 0.0,
+        pellets: 1,
+        gravity: 14.0,
+        bounce: 0.0,
+        special: Special::Gravity(0.3, 14.0, 8.0),
+        windup: 0.0,
+        loft: 0.25,
+    },
+    WeaponDef {
+        name: "Heavy Orb",
+        kind: Kind::Projectile,
+        damage: 0.0,
+        // The opposite: jumps are a hop and falls are quick. Pins an enemy to
+        // the ground, or drops one who was in the air.
+        speed: 26.0,
+        lifetime: 2.2,
+        cooldown: 1.0,
+        mag: 2,
+        reload: 6.0,
+        spread: 0.0,
+        range: 0.0,
+        blast_radius: 0.0,
+        blast_damage: 0.0,
+        knockback: 0.0,
+        terrain: 0.0,
+        pellets: 1,
+        gravity: 14.0,
+        bounce: 0.0,
+        special: Special::Gravity(2.5, 14.0, 8.0),
+        windup: 0.0,
+        loft: 0.25,
+    },
+    WeaponDef {
+        name: "Lava Gun",
+        kind: Kind::Spray,
+        damage: 0.0,
+        // A fire hose: a bit every tick, which at this speed leaves them 0.7 m
+        // apart, close enough to read as one tight stream. Muzzle speed 42 m/s
+        // against the lava's gravity of 40 carries about 11 m level and about
+        // 38 m at a 30 degree arc. `lifetime` is how long a bit stays molten.
+        speed: 42.0,
+        lifetime: 3.5,
+        cooldown: 0.01,
+        mag: 200,
+        reload: 3.0,
+        spread: 0.004,
+        range: 0.0,
+        blast_radius: 0.0,
+        blast_damage: 0.0,
+        knockback: 0.0,
+        terrain: 0.0,
+        pellets: 1,
+        gravity: 0.0,
         bounce: 0.0,
         special: Special::None,
         windup: 0.0,

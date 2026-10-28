@@ -13,6 +13,7 @@
 
 use crate::combat::{Projectile, Swing, WhipStyle, MAX_HP};
 use crate::input::Input;
+use crate::lava::LavaBit;
 use crate::rng::Rng;
 use crate::weapons::{WeaponState, ARSENAL, WEAPONS};
 use glam::{Vec2, Vec3};
@@ -46,7 +47,7 @@ const HAND_FORWARD: f32 = 0.808;
 /// field is one lookup: `distance < radius` means touching, and the gradient
 /// says which way to push out. The spheres are one radius apart, so they
 /// overlap and leave no gap a thin ledge could slip through.
-const BODY_SPHERES: [f32; 3] = [WORM_RADIUS, WORM_HEIGHT * 0.5, WORM_HEIGHT - WORM_RADIUS];
+pub(crate) const BODY_SPHERES: [f32; 3] = [WORM_RADIUS, WORM_HEIGHT * 0.5, WORM_HEIGHT - WORM_RADIUS];
 
 /// A surface counts as ground when its normal is within ~70 degrees of up.
 /// Steeper is a wall: the worm slides along it instead of standing on it.
@@ -204,12 +205,18 @@ pub struct Worm {
     pub respawn_timer: f32,
     /// Seconds of spawn protection left.
     pub invuln: f32,
+    /// Seconds of burning left (lava), and who lit it, for the kill credit.
+    pub burn: f32,
+    pub burn_by: u8,
     /// One entry per weapon in `ARSENAL`, in the same order.
     pub weapons: Vec<WeaponState>,
     /// Index into `weapons`.
     pub current: usize,
     /// The plasma-whip swing in progress, if any (see `combat::Swing`).
     pub swing: Option<Swing>,
+    /// The overhead smash was used in this airtime. It is a stomp: one per
+    /// double jump, so holding the trigger does not chain them. Cleared on landing.
+    pub(crate) smashed: bool,
     pub kills: i32,
     pub deaths: i32,
 }
@@ -243,9 +250,12 @@ impl Worm {
             alive: true,
             respawn_timer: 0.0,
             invuln: 0.0,
+            burn: 0.0,
+            burn_by: 0,
             weapons: ARSENAL.iter().map(|&id| WeaponState::full(id)).collect(),
             current: 0,
             swing: None,
+            smashed: false,
             kills: 0,
             deaths: 0,
         }
@@ -389,6 +399,29 @@ pub enum Event {
     /// `worm` jumped from `from` to `to` (the Teleport gun).
     Teleported { worm: u8, from: Vec3, to: Vec3 },
     Respawned { worm: u8 },
+    /// A `Zone` appeared: the viewer draws its ring and the audio sounds it.
+    ZoneStarted { kind: ZoneKind, pos: Vec3, radius: f32, seconds: f32 },
+    /// A bit of lava turned to rock at `pos` (the terrain edit comes separately).
+    LavaFroze { pos: Vec3 },
+}
+
+/// What a `Zone` does to whoever is inside it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ZoneKind {
+    /// Gravity is multiplied by this (0.3 = moon, 2.5 = heavy).
+    Gravity(f32),
+}
+
+/// A timed region of the world with an effect: a sphere that lives for `left`
+/// seconds. Plain data (no behaviour, no pointers), so a snapshot can carry the
+/// list to clients and they draw the same zones the host simulates.
+#[derive(Clone, Copy, Debug)]
+pub struct Zone {
+    pub kind: ZoneKind,
+    pub centre: Vec3,
+    pub radius: f32,
+    pub left: f32,
+    pub owner: u8,
 }
 
 pub struct World {
@@ -396,12 +429,20 @@ pub struct World {
     pub grid: Grid,
     pub worms: Vec<Worm>,
     pub projectiles: Vec<Projectile>,
+    /// Timed effects in the world (low gravity). They expire on their own.
+    pub zones: Vec<Zone>,
+    /// Molten lava, flowing. Each bit freezes into the terrain when it cools.
+    pub lava: Vec<LavaBit>,
     /// Where worms start, and come back after dying.
     pub spawns: Vec<Vec3>,
     /// Ticks simulated so far. Online, this is the shared clock that snapshots
     /// and inputs are labelled with ("tick 1234").
     pub tick: u32,
     pub(crate) events: Vec<Event>,
+    /// Where and how big the explosions of the last tick were. Mines read it on
+    /// the next tick, so a blast sets them off one tick later and a row of
+    /// mines goes off as a ripple instead of all in one call stack.
+    pub(crate) blasts: Vec<(Vec3, f32)>,
     pub(crate) rng: Rng,
 }
 
@@ -425,9 +466,12 @@ impl World {
             grid,
             worms,
             projectiles: Vec::with_capacity(64),
+            zones: Vec::new(),
+            lava: Vec::new(),
             spawns,
             tick: 0,
             events: Vec::new(),
+            blasts: Vec::new(),
             rng: Rng::new(seed),
         }
     }
@@ -436,13 +480,30 @@ impl World {
         std::mem::take(&mut self.events)
     }
 
+    /// The gravity multiplier at `p`: 1.0 in open world, and the newest
+    /// Gravity zone's scale inside one (zones do not stack, so two overlapping
+    /// shifts cannot multiply into something absurd).
+    pub fn gravity_at(&self, p: Vec3) -> f32 {
+        self.zones
+            .iter()
+            .rev()
+            .find_map(|z| match z.kind {
+                ZoneKind::Gravity(scale) if p.distance(z.centre) < z.radius => Some(scale),
+                _ => None,
+            })
+            .unwrap_or(1.0)
+    }
+
     /// Advance the game by one tick (`DT`). `inputs[i]` drives worm `i`; a
     /// worm without an input stands still.
     pub fn step(&mut self, inputs: &[Input]) {
         for i in 0..self.worms.len() {
             let input = clean(&inputs.get(i).copied().unwrap_or_default());
             if self.worms[i].alive {
-                step_worm(&mut self.grid, &mut self.worms[i], &input, &mut self.events);
+                // Gravity is read at the middle of the body: a zone's edge
+                // cuts the worm in half, not by where its feet happen to be.
+                let gravity = self.gravity_at(self.worms[i].pos + Vec3::Y * (WORM_HEIGHT * 0.5));
+                step_worm(&mut self.grid, &mut self.worms[i], &input, gravity, &mut self.events);
                 self.step_weapons(i, &input);
                 self.step_swing(i);
             } else {
@@ -450,6 +511,12 @@ impl World {
             }
         }
         self.step_projectiles();
+        self.step_lava();
+        self.step_burning();
+        for z in &mut self.zones {
+            z.left -= DT;
+        }
+        self.zones.retain(|z| z.left > 0.0);
         self.tick += 1;
     }
 }
@@ -476,10 +543,10 @@ fn clean(i: &Input) -> Input {
     }
 }
 
-fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, events: &mut Vec<Event>) {
+fn step_worm(grid: &mut Grid, worm: &mut Worm, input: &Input, gravity: f32, events: &mut Vec<Event>) {
     // The rules (walk, jump, climb, rope) live in `movement`; the world stays
     // responsible for terrain edits.
-    crate::movement::step(grid, worm, input);
+    crate::movement::step(grid, worm, input, gravity);
 
     // Safety net: nothing legitimate leaves the world (outside counts as rock),
     // but a bug or a freak push must never lose a worm for good.
@@ -797,6 +864,42 @@ mod tests {
 
     fn walk(yaw: f32) -> Input {
         Input { move_dir: Vec2::new(0.0, 1.0), yaw, ..Input::default() }
+    }
+
+    /// Drop a worm from 8 m up and say how far it fell in 20 ticks.
+    fn fall_in_20_ticks(zone: Option<Zone>) -> f32 {
+        let mut w = world(flat, (16.0, 16.0));
+        w.worms[0].pos.y = 12.0;
+        w.zones.extend(zone);
+        run(&mut w, 20, Input::default());
+        12.0 - w.worms[0].pos.y
+    }
+
+    fn gravity_zone(scale: f32, seconds: f32) -> Zone {
+        Zone { kind: ZoneKind::Gravity(scale), centre: Vec3::new(16.0, 10.0, 16.0), radius: 14.0, left: seconds, owner: 0 }
+    }
+
+    #[test]
+    fn a_worm_falls_slower_in_a_moon_zone_and_faster_in_a_heavy_one() {
+        let normal = fall_in_20_ticks(None);
+        let moon = fall_in_20_ticks(Some(gravity_zone(0.3, 8.0)));
+        let heavy = fall_in_20_ticks(Some(gravity_zone(2.5, 8.0)));
+        assert!(moon < normal * 0.5, "moon {moon} vs normal {normal}");
+        assert!(heavy > normal * 1.5, "heavy {heavy} vs normal {normal}");
+    }
+
+    #[test]
+    fn a_zone_expires_and_gravity_is_exactly_normal_again() {
+        let mut w = world(flat, (16.0, 16.0));
+        w.zones.push(gravity_zone(0.3, 0.5));
+        let inside = Vec3::new(16.0, 10.0, 16.0);
+        assert_eq!(w.gravity_at(inside), 0.3);
+        assert_eq!(w.gravity_at(Vec3::new(40.0, 10.0, 16.0)), 1.0, "outside the sphere");
+        run(&mut w, 29, Input::default());
+        assert_eq!(w.zones.len(), 1, "still alive just before its time");
+        run(&mut w, 2, Input::default());
+        assert!(w.zones.is_empty());
+        assert_eq!(w.gravity_at(inside), 1.0);
     }
 
     #[test]

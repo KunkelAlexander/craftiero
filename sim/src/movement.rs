@@ -165,8 +165,10 @@ fn approach(x: f32, target: f32, step: f32) -> f32 {
 }
 
 /// One tick of movement. The caller (`world::step_worm`) does the digging
-/// afterwards, so the climb can never fight a dig.
-pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
+/// afterwards, so the climb can never fight a dig. `gravity` multiplies the
+/// pull (1.0 normally; a Gravity zone changes it). The jump speeds do not
+/// change, so a lighter pull is a higher jump and a heavier one a lower jump.
+pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input, gravity: f32) {
     worm.yaw = input.yaw;
     worm.pitch = input.pitch;
     // The viewer's camera can be off the look ray (over the shoulder), in which
@@ -230,7 +232,7 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
             worm.coyote = 0;
             jump_used = true;
         } else {
-            step_rope(grid, worm, input);
+            step_rope(grid, worm, input, gravity);
             return;
         }
     }
@@ -271,7 +273,7 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input) {
     if worm.on_ground {
         step_ground(grid, worm, input, wish, mag, intended_yaw);
     } else {
-        step_air(grid, worm, input, wish, mag, intended_yaw, jump_pressed && !jump_used);
+        step_air(grid, worm, input, wish, mag, intended_yaw, jump_pressed && !jump_used, gravity);
     }
 }
 
@@ -371,6 +373,7 @@ fn step_air(
     mag: f32,
     intended_yaw: f32,
     jump_pressed: bool,
+    gravity: f32,
 ) {
     let before_move = worm.vel;
 
@@ -378,7 +381,7 @@ fn step_air(
         if worm.tumble_timer == 0 {
             worm.action = Action::Freefall;
         }
-        worm.vel.y -= GRAVITY * DT;
+        worm.vel.y -= GRAVITY * gravity * DT;
     } else {
         // A worm that was placed in the air (a respawn, a teleport, a rope
         // release that did not align) keeps the momentum it has.
@@ -436,7 +439,7 @@ fn step_air(
             worm.vel.z = capped.z;
             worm.forward_vel = capped.dot(f);
         }
-        worm.vel.y -= GRAVITY * DT;
+        worm.vel.y -= GRAVITY * gravity * DT;
 
         // Jump cut: release the button while rising and the rest of the rise
         // is capped at `JUMP_CUT`.
@@ -735,7 +738,7 @@ fn try_mantle(grid: &Grid, worm: &mut Worm, n: Vec3) -> bool {
 
 // ---------------------------------------------------------------- rope ----
 
-fn step_rope(grid: &Grid, worm: &mut Worm, input: &Input) {
+fn step_rope(grid: &Grid, worm: &mut Worm, input: &Input, gravity: f32) {
     let hand = worm.hand();
     if let Some(rope) = &mut worm.rope {
         let base = if input.reel > 0.0 {
@@ -760,7 +763,7 @@ fn step_rope(grid: &Grid, worm: &mut Worm, input: &Input) {
         let add = (SWING_MAX_SPEED * w - flat_vel.dot(dir)).clamp(0.0, SWING_ACCEL * DT);
         vel += dir * add;
     }
-    vel.y -= ROPE_GRAVITY * DT;
+    vel.y -= ROPE_GRAVITY * gravity * DT;
 
     if let (Some(rope), true) = (worm.rope, input.reel > 0.0) {
         let to_anchor = rope.anchor - hand;

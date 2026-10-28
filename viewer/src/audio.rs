@@ -17,7 +17,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use glam::Vec3;
 use sim::weapons::{
-    BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WHIP,
+    BLASTER, BOMB, BOMBLET, BOUNCER, BUILD, CLUSTER, LAVA, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR,
+    WHIP,
 };
 use sim::Event;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -300,7 +301,22 @@ impl Sfx {
             }
             // Terrain edits are continuous (digging, the tractor) or already
             // have a louder explosion. The tractor's own `Shot` covers it.
-            Event::Edit { .. } | Event::Respawned { .. } => {}
+            Event::ZoneStarted { pos, kind, .. } => {
+                // A low swell for the moon and a dropping thud for the heavy
+                // pull, so the two read apart with the eyes shut.
+                let (f0, f1) = match kind {
+                    sim::ZoneKind::Gravity(scale) if scale < 1.0 => (180.0, 420.0),
+                    sim::ZoneKind::Gravity(_) => (160.0, 45.0),
+                };
+                self.add(
+                    Voice::new(vec![
+                        Layer::sine(0.50, 0.02, 2.2, 0.9, f0, f1),
+                        Layer::noise(0.14, 0.02, 2.0, 0.7, 1_400.0),
+                    ]),
+                    Place::at(pos, listener, right),
+                );
+            }
+            Event::Edit { .. } | Event::LavaFroze { .. } | Event::Respawned { .. } => {}
         }
     }
 
@@ -439,6 +455,14 @@ impl Sfx {
                 Voice::new(vec![
                     Layer::noise(0.13, 0.001, 26.0, 0.08, 1_200.0),
                     Layer::sine(0.10, 0.001, 18.0, 0.16, 170.0, 80.0),
+                ]),
+            ],
+            LAVA => vec![
+                // One short wet hiss. Thirty a second run together into the
+                // sound of a hose, so each one stays quiet and brief.
+                Voice::new(vec![
+                    Layer::noise(0.12, 0.002, 18.0, 0.09, 2_400.0),
+                    Layer::sine(0.09, 0.002, 14.0, 0.12, 120.0, 70.0),
                 ]),
             ],
             // The railgun and the whip are heard through their own `Beam` and
