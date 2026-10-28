@@ -447,6 +447,8 @@ pub struct World {
     pub zones: Vec<Zone>,
     /// Molten lava, flowing. Each bit freezes into the terrain when it cools.
     pub lava: Vec<LavaBit>,
+    /// The cheat: firing costs no ammo. Set by whoever hosts the match.
+    pub infinite_ammo: bool,
     /// Where worms start, and come back after dying.
     pub spawns: Vec<Vec3>,
     /// Ticks simulated so far. Online, this is the shared clock that snapshots
@@ -482,6 +484,7 @@ impl World {
             projectiles: Vec::with_capacity(64),
             zones: Vec::new(),
             lava: Vec::new(),
+            infinite_ammo: false,
             spawns,
             tick: 0,
             events: Vec::new(),

@@ -938,6 +938,8 @@ struct Viewer {
     fly: bool,
     camera: Camera,
     keys: HashSet<KeyCode>,
+    /// How much of the cheat code has been typed so far (see `cheat_progress`).
+    cheat: usize,
     lmb: bool,
     rmb: bool,
     grabbed: bool,
@@ -1040,6 +1042,7 @@ impl Viewer {
             fly,
             camera,
             keys: HashSet::new(),
+            cheat: 0,
             lmb: false,
             rmb: false,
             grabbed: false,
@@ -1143,6 +1146,12 @@ impl Viewer {
     }
 
     fn key_pressed(&mut self, event_loop: &ActiveEventLoop, key: KeyCode) {
+        self.cheat = cheat_progress(self.cheat, key);
+        if self.cheat == KONAMI.len() {
+            self.cheat = 0;
+            let on = self.game.toggle_infinite_ammo();
+            println!("cheat: infinite ammo {}", if on { "on" } else { "off" });
+        }
         match key {
             KeyCode::Escape => {
                 if self.grabbed {
@@ -1676,6 +1685,35 @@ impl Viewer {
     }
 }
 
+/// The classic cheat code. Typing it toggles infinite ammo. (B and A also walk
+/// the worm a step, which is how it always felt on a console too.)
+const KONAMI: [KeyCode; 10] = [
+    KeyCode::ArrowUp,
+    KeyCode::ArrowUp,
+    KeyCode::ArrowDown,
+    KeyCode::ArrowDown,
+    KeyCode::ArrowLeft,
+    KeyCode::ArrowRight,
+    KeyCode::ArrowLeft,
+    KeyCode::ArrowRight,
+    KeyCode::KeyB,
+    KeyCode::KeyA,
+];
+
+/// Feed one key press to the code matcher: how many keys of `KONAMI` have been
+/// typed in a row after it. A wrong key starts over, but counts as the first
+/// key if it could be one. A third Up in a row keeps the two Ups it follows,
+/// so Up Up Up Down... still works (the only repeat in the code).
+fn cheat_progress(so_far: usize, key: KeyCode) -> usize {
+    if key == KONAMI[so_far] {
+        so_far + 1
+    } else if key == KONAMI[0] {
+        if so_far == 2 { 2 } else { 1 }
+    } else {
+        0
+    }
+}
+
 struct App {
     cfg: Config,
     viewer: Option<Viewer>,
@@ -1762,6 +1800,19 @@ fn run_window(cfg: Config) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_cheat_code_needs_the_whole_sequence_and_forgives_a_stutter() {
+        let run = |keys: &[KeyCode]| keys.iter().fold(0, |p, &k| cheat_progress(p, k));
+        assert_eq!(run(&KONAMI), KONAMI.len());
+        assert_ne!(run(&KONAMI[..9]), KONAMI.len());
+        let mut stutter = vec![KeyCode::ArrowUp];
+        stutter.extend(KONAMI);
+        assert_eq!(run(&stutter), KONAMI.len(), "an extra Up in front still works");
+        let mut wrong = KONAMI.to_vec();
+        wrong[4] = KeyCode::ArrowRight;
+        assert_ne!(run(&wrong), KONAMI.len());
+    }
+
     use super::*;
     use glam::IVec3;
 

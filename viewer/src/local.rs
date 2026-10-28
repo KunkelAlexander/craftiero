@@ -123,6 +123,11 @@ impl LocalGame {
         self.replica.advance(DT);
     }
 
+    /// The infinite-ammo cheat (see `Host::toggle_infinite_ammo`). Returns whether it is on.
+    pub fn toggle_infinite_ammo(&mut self) -> bool {
+        self.host.toggle_infinite_ammo()
+    }
+
     /// The fly-mode brush: a developer tool that edits the host's terrain (see
     /// `Host::debug_edit`). It shows up on screen with the next tick.
     pub fn debug_edit(&mut self, shape: Shape, op: Op) {

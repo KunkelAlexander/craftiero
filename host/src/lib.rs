@@ -107,6 +107,14 @@ impl Host {
         self.world.edit(shape, op);
     }
 
+    /// The infinite-ammo cheat, for the viewer's cheat code. Like `debug_edit`,
+    /// it is a local developer switch and not something a client can ask for.
+    /// Returns the new state.
+    pub fn toggle_infinite_ammo(&mut self) -> bool {
+        self.world.infinite_ammo = !self.world.infinite_ammo;
+        self.world.infinite_ammo
+    }
+
     /// Advance the match by one tick. Returns the world as it is now, plus the
     /// events of this tick. Sending it (or not) is up to the caller.
     pub fn tick(&mut self) -> Snapshot {

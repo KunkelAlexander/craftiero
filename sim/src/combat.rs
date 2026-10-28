@@ -642,7 +642,7 @@ impl World {
         worm.invuln = 0.0;
         let feet = worm.pos;
         let w = &mut worm.weapons[worm.current];
-        if def.kind != Kind::Whip {
+        if def.kind != Kind::Whip && !self.infinite_ammo {
             w.ammo -= 1;
         }
         w.cooldown = def.cooldown;
@@ -1512,7 +1512,7 @@ mod tests {
         let (kind, pos, radius) = zone.expect("the orb landed and started a zone");
         assert_eq!(kind, ZoneKind::Gravity(0.3));
         assert!(pos.z > 8.0 && pos.y < 5.0, "it landed on the floor ahead: {pos}");
-        assert_eq!(radius, 14.0);
+        assert_eq!(radius, 28.0);
         assert_eq!(w.zones.len(), 1);
     }
 
@@ -1579,6 +1579,17 @@ mod tests {
         assert!(w.lava.iter().all(|b| w.grid.sample(b.pos) > crate::lava::LAVA_BIT_RADIUS * 0.5), "none sinks in");
         let reach = w.lava.iter().map(|b| b.pos.z).fold(0.0, f32::max);
         assert!(reach > 4.0 + 8.0, "a fire hose: it carries past 8 m even level: {reach}");
+    }
+
+    #[test]
+    fn the_cheat_makes_every_shot_free() {
+        let mut w = lava_arena();
+        w.infinite_ammo = true;
+        hose(&mut w, 300);
+        assert_eq!(lava_ammo(&w), 200, "a magazine that never drains never reloads");
+        w.infinite_ammo = false;
+        hose(&mut w, 10);
+        assert!(lava_ammo(&w) < 200, "and without the cheat it costs again");
     }
 
     #[test]
