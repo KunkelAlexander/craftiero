@@ -47,13 +47,13 @@ mod tests {
     use super::*;
 
     fn snapshot(tick: u32, events: Vec<Event>) -> Snapshot {
-        Snapshot { tick, players: Vec::new(), projectiles: Vec::new(), winner: None, events }
+        Snapshot { tick, worms: Vec::new(), projectiles: Vec::new(), zones: Vec::new(), lava: Vec::new(), events }
     }
 
     #[test]
     fn sends_every_nth_tick_and_keeps_every_event() {
         let mut throttle = Throttle::new(2);
-        let boom = |x| Event::Explosion { pos: sim::vec2(x, 0.0), radius: 1.0 };
+        let boom = |x| Event::Explosion { weapon: 0, pos: sim::vec3(x, 0.0, 0.0), normal: sim::Vec3::Y, radius: 1.0 };
 
         assert!(throttle.push(snapshot(1, vec![boom(1.0)])).is_none());
         let sent = throttle.push(snapshot(2, vec![boom(2.0)])).expect("tick 2 is due");

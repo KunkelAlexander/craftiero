@@ -1,24 +1,7 @@
-// The wire between a client and a host.
-//
-// `Loopback` is a fake network that lives inside one process: two queues of
-// bytes, one per direction. It behaves like a perfect connection (nothing is
-// lost, reordered or delayed), which is also roughly what a WebSocket gives
-// you: WebSocket runs over TCP, which is *reliable* (every message arrives)
-// and *ordered* (in the order sent). The price of that comfort is that one
-// delayed packet holds up everything behind it ("head-of-line blocking").
-//
-//   client_send ─ up ──> host_recv
-//   client_recv <─ down ─ host_send
-//
-// `RelayLink` (further down) is the second kind of wire: a real WebSocket to
-// the relay server, which passes our bytes on to the other players.
+// The wire to the relay. (The in-process wire, `Loopback`, was ported to
+// `viewer/src/local.rs` at M4.)
 
-use std::collections::VecDeque;
-
-use protocol::{
-    decode_client, decode_from_relay, decode_host, encode_client, encode_host, encode_to_relay, ClientMsg, FromRelay,
-    HostMsg, ToRelay,
-};
+use protocol::{decode_from_relay, encode_to_relay, FromRelay, ToRelay};
 
 use crate::socket::{Socket, SocketState};
 
@@ -28,50 +11,6 @@ pub const RELAY_URL: &str = match option_env!("RELAY_URL") {
     Some(url) => url,
     None => "ws://127.0.0.1:9001/ws",
 };
-
-#[derive(Default)]
-pub struct Loopback {
-    up: VecDeque<Vec<u8>>,
-    down: VecDeque<Vec<u8>>,
-    /// Running totals, so the HUD can show what the game costs in bandwidth.
-    pub bytes_up: u64,
-    pub bytes_down: u64,
-}
-
-impl Loopback {
-    // ---- the client's end ----
-    pub fn client_send(&mut self, msg: &ClientMsg) {
-        let bytes = encode_client(msg);
-        self.bytes_up += bytes.len() as u64;
-        self.up.push_back(bytes);
-    }
-
-    pub fn client_recv(&mut self) -> Option<HostMsg> {
-        // Garbage is skipped, never fatal (see `protocol::decode_host`).
-        while let Some(bytes) = self.down.pop_front() {
-            if let Some(msg) = decode_host(&bytes) {
-                return Some(msg);
-            }
-        }
-        None
-    }
-
-    // ---- the host's end ----
-    pub fn host_send(&mut self, msg: &HostMsg) {
-        let bytes = encode_host(msg);
-        self.bytes_down += bytes.len() as u64;
-        self.down.push_back(bytes);
-    }
-
-    pub fn host_recv(&mut self) -> Option<ClientMsg> {
-        while let Some(bytes) = self.up.pop_front() {
-            if let Some(msg) = decode_client(&bytes) {
-                return Some(msg);
-            }
-        }
-        None
-    }
-}
 
 /// Turns a growing byte total into "bytes per second", refreshed once a second.
 #[derive(Default)]

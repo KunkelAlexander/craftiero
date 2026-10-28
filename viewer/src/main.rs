@@ -16,6 +16,7 @@ mod camera;
 mod effects;
 mod feel;
 mod hud;
+mod local;
 mod renderer;
 mod shaders;
 mod world;
@@ -28,6 +29,7 @@ use effects::Effects;
 use feel::shot_kick;
 use glam::{Vec2, Vec3};
 use hud::Hud;
+use local::LocalGame;
 use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
 use sim::weapons::{Kind, WHIP};
@@ -297,14 +299,26 @@ fn crosshair_aim(grid: &Grid, cam: &Camera, eye: Vec3) -> Option<Vec3> {
     Some(dir.lerp(to, blend).normalize_or_zero()).filter(|a| *a != Vec3::ZERO)
 }
 
-fn carve(grid: &mut Grid, at: Vec3, radius: f32) {
-    grid.apply(Shape::Sphere { center: at, radius }, Op::Carve);
+/// The brush's two edits, as data: the fly mode sends them through the host
+/// (`LocalGame::debug_edit`), the headless demo applies them straight to a grid.
+fn carve_edit(at: Vec3, radius: f32) -> (Shape, Op) {
+    (Shape::Sphere { center: at, radius }, Op::Carve)
 }
 
 /// Build: new material pushed out along the wall, blended into it like clay.
-fn build(grid: &mut Grid, at: Vec3, radius: f32) {
+fn build_edit(grid: &Grid, at: Vec3, radius: f32) -> (Shape, Op) {
     let n = grid.gradient(at);
-    grid.apply(Shape::Sphere { center: at + n * radius * 0.5, radius }, Op::Smooth(radius * 0.5));
+    (Shape::Sphere { center: at + n * radius * 0.5, radius }, Op::Smooth(radius * 0.5))
+}
+
+fn carve(grid: &mut Grid, at: Vec3, radius: f32) {
+    let (shape, op) = carve_edit(at, radius);
+    grid.apply(shape, op);
+}
+
+fn build(grid: &mut Grid, at: Vec3, radius: f32) {
+    let (shape, op) = build_edit(grid, at, radius);
+    grid.apply(shape, op);
 }
 
 /// A few craters and a blob, so `--shot --edits` shows what edits look like.
@@ -892,8 +906,9 @@ struct Viewer {
     renderer: Renderer,
     /// Health, weapon and hit markers, drawn over the finished frame.
     hud: Hud,
-    /// The game state: terrain, worms. Worm 0 is the player.
-    world: World,
+    /// The match: a host that steps the sim and the replica of it that gets
+    /// drawn (`game.replica.world`), joined by an in-memory wire. See `local.rs`.
+    game: LocalGame,
     /// Fixed timestep: real time not yet turned into sim ticks.
     acc: f32,
     /// Where each worm was before the last tick, for drawing between ticks.
@@ -988,7 +1003,8 @@ impl Viewer {
 
         println!("window {}x{} px, display scale {:.2}", size.width, size.height, window.scale_factor());
         let audio = Audio::new();
-        let mut world = World::new(world::build(), &world::SPAWNS, SEED);
+        let mut game = LocalGame::new(world::build(), &world::SPAWNS, SEED);
+        let world = &mut game.replica.world;
         let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
         let anims = vec![worms::Anim::default(); world.worms.len()];
@@ -999,7 +1015,7 @@ impl Viewer {
         if !fly {
             // Start already behind the worm; otherwise the first frame would
             // ease in from the spawn overview.
-            camera.follow(camera_target(world.worms[0].pos), FOLLOW_DIST, &world.grid);
+            camera.follow(camera_target(world.worms[game.replica.me as usize].pos), FOLLOW_DIST, &world.grid);
         }
         let now = Instant::now();
         Viewer {
@@ -1009,7 +1025,7 @@ impl Viewer {
             hud: Hud::new(&gpu.device, format),
             gpu,
             renderer,
-            world,
+            game,
             acc: 0.0,
             prev_pos,
             anims,
@@ -1050,6 +1066,11 @@ impl Viewer {
             sync_ms: 0.0,
             synced: 0,
         }
+    }
+
+    /// The worm this window plays: the slot the host gave us.
+    fn me(&self) -> usize {
+        self.game.replica.me as usize
     }
 
     fn set_grab(&mut self, grab: bool) {
@@ -1157,27 +1178,27 @@ impl Viewer {
                 if !self.fly {
                     // Coming back from the fly camera: put the worm camera
                     // where it belongs instead of sweeping in from the sky.
-                    let target = camera_target(self.world.worms[0].pos);
-                    self.camera.follow(target, FOLLOW_DIST, &self.world.grid);
+                    let target = camera_target(self.game.replica.world.worms[self.me()].pos);
+                    self.camera.follow(target, FOLLOW_DIST, &self.game.replica.world.grid);
                     self.feel.snap(target);
                 }
             }
             KeyCode::KeyR => {
-                self.world = World::new(world::build(), &world::SPAWNS, SEED);
+                self.game = LocalGame::new(world::build(), &world::SPAWNS, SEED);
                 self.effects = Effects::default();
                 self.audio.stop_all();
                 self.feel = CameraFeel::default();
-                let n = self.world.worms.len();
+                let n = self.game.replica.world.worms.len();
                 self.step_dist = vec![0.0; n];
                 self.before = vec![(true, 0.0); n];
-                self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
+                self.prev_pos = self.game.replica.world.worms.iter().map(|w| w.pos).collect();
                 self.anims = vec![worms::Anim::default(); n];
                 self.renderer = Renderer::new(
                     &self.gpu,
                     self.surface_cfg.format,
                     (self.surface_cfg.width, self.surface_cfg.height),
                     self.renderer.scale(),
-                    &mut self.world.grid,
+                    &mut self.game.replica.world.grid,
                 );
             }
             // The number row picks the weapon with that id; `-` and `=` are the
@@ -1192,7 +1213,7 @@ impl Viewer {
 
     /// What the keyboard and mouse ask worm 0 to do this tick.
     fn worm_input(&self) -> Input {
-        let worm = &self.world.worms[0];
+        let worm = &self.game.replica.world.worms[self.me()];
         if self.fly {
             // The free camera has the keys: the worm just stands and looks as before.
             return Input { yaw: worm.yaw, pitch: worm.pitch, weapon: self.weapon, ..Input::default() };
@@ -1210,7 +1231,7 @@ impl Viewer {
             pitch: self.camera.pitch,
             // The camera is off the look ray, so tell the sim where the
             // crosshair actually is (see `crosshair_aim`).
-            aim: crosshair_aim(&self.world.grid, &aim_cam, worm.eye()),
+            aim: crosshair_aim(&self.game.replica.world.grid, &aim_cam, worm.eye()),
             jump: held(KeyCode::Space),
             dig: self.grabbed && held(KeyCode::ShiftLeft),
             rope: self.grabbed && self.rmb,
@@ -1234,18 +1255,18 @@ impl Viewer {
         let t = Instant::now();
         let mut ticks = 0;
         while self.acc >= DT {
-            self.prev_pos = self.world.worms.iter().map(|w| w.pos).collect();
+            self.prev_pos = self.game.replica.world.worms.iter().map(|w| w.pos).collect();
             // Landing impact must be read before the tick: `movement::land`
             // clears `vel.y`, so afterwards every landing looks like zero.
             self.before.clear();
-            self.before.extend(self.world.worms.iter().map(|w| (w.on_ground, w.vel.y)));
+            self.before.extend(self.game.replica.world.worms.iter().map(|w| (w.on_ground, w.vel.y)));
             input.seq = self.seq;
             self.seq = self.seq.wrapping_add(1);
-            self.world.step(&[input]);
+            self.game.tick(input);
             // A trail is history: it has to be emitted per sim tick, not per
             // frame, or it would grow with the frame rate.
-            self.effects.trails(&self.world.projectiles);
-            self.effects.lava(&self.world.lava);
+            self.effects.trails(&self.game.replica.world.projectiles);
+            self.effects.lava(&self.game.replica.world.lava);
             self.landings();
             self.acc -= DT;
             ticks += 1;
@@ -1258,9 +1279,10 @@ impl Viewer {
         // sim. The renderer needs no event for terrain edits: it asks the grid
         // which chunks changed.
         let (sound_right, _) = self.camera.right_up();
-        for event in self.world.drain_events() {
+        let me = self.me() as u8;
+        for event in self.game.replica.drain_events() {
             self.effects.add(&event);
-            self.hud.event(&event);
+            self.hud.event(&event, me);
             self.audio.play(&event, self.camera.pos, sound_right);
             // Camera dynamics: a blast pushes the view, a shot kicks it back,
             // a hit twitches it and a death is the biggest thump. All of it is
@@ -1293,7 +1315,7 @@ impl Viewer {
                     if let Some(anim) = self.anims.get_mut(worm as usize) {
                         anim.fired();
                     }
-                    if worm == 0 {
+                    if worm == me {
                         self.feel.kick(&self.camera, shot_kick(weapon));
                     }
                 }
@@ -1305,7 +1327,7 @@ impl Viewer {
                     if let Some(anim) = self.anims.get_mut(worm as usize) {
                         anim.struck(style, flip, fwd, side, lean);
                     }
-                    if worm == 0 {
+                    if worm == me {
                         let away = (from - self.camera.pos).length();
                         let falloff = (1.0 - away / 24.0).clamp(0.0, 1.0);
                         self.feel.kick(&self.camera, shot_kick(WHIP));
@@ -1319,30 +1341,30 @@ impl Viewer {
                     if let Some(anim) = self.anims.get_mut(victim as usize) {
                         anim.hurt(damage);
                     }
-                    self.effects.blood(pos, dir, damage, &self.world.grid);
+                    self.effects.blood(pos, dir, damage, &self.game.replica.world.grid);
                     let away = (pos - self.camera.pos).length();
                     // The player being hit is always felt hardest.
-                    let hurt = if victim == 0 { 1.6 } else { 1.0 };
+                    let hurt = if victim == me { 1.6 } else { 1.0 };
                     let look = feel::hit(weapon);
                     self.feel.shake(look.shake * hurt * (1.0 - away / 18.0).clamp(0.0, 1.0));
                     // Taking a hit blinks the frame; hitting someone else does
                     // not, or a blaster duel would strobe.
-                    if victim == 0 {
+                    if victim == me {
                         self.feel.burst((0.12 + look.shake * 6.0).min(0.45));
                     }
                 }
                 Event::Died { victim, killer, pos } => {
                     // A death is a fountain, not a puff: the body comes apart
                     // in front of the killer.
-                    self.effects.blood(pos, Vec3::Y, 120.0, &self.world.grid);
+                    self.effects.blood(pos, Vec3::Y, 120.0, &self.game.replica.world.grid);
                     let away = (pos - self.camera.pos).length();
-                    let amount = if victim == 0 { 0.080 } else { 0.045 };
+                    let amount = if victim == me { 0.080 } else { 0.045 };
                     self.feel.shake(amount * (1.0 - away / 30.0).clamp(0.0, 1.0));
                     // A kill is the one confirmation the player should feel:
                     // a short white frame, not a full explosion white-out.
-                    if killer == 0 && victim != 0 {
+                    if killer == me && victim != me {
                         self.feel.burst(0.30);
-                    } else if victim == 0 {
+                    } else if victim == me {
                         self.feel.burst(0.22);
                     }
                 }
@@ -1352,7 +1374,7 @@ impl Viewer {
             // sliding there from where it stood, and the camera must not fly
             // across the map after it.
             if let Event::Respawned { worm } | Event::Teleported { worm, .. } = event {
-                let at = self.world.worms[worm as usize].pos;
+                let at = self.game.replica.world.worms[worm as usize].pos;
                 self.prev_pos[worm as usize] = at;
                 self.feel.snap(camera_target(at));
                 if let Some(d) = self.step_dist.get_mut(worm as usize) {
@@ -1369,7 +1391,7 @@ impl Viewer {
             self.fly_and_edit(dt);
         }
         let t = Instant::now();
-        let n = self.renderer.sync(&mut self.world.grid);
+        let n = self.renderer.sync(&mut self.game.replica.world.grid);
         if n > 0 {
             self.sync_ms = t.elapsed().as_secs_f64() * 1000.0;
             self.synced = n;
@@ -1378,23 +1400,24 @@ impl Viewer {
 
     /// What the sim cannot tell the viewer afterwards: which worms touched down
     /// this tick, and how fast. Dust for every worm, a camera dip for the player
-    /// only (the camera follows worm 0).
+    /// only (the camera follows our own worm).
     fn landings(&mut self) {
-        for i in 0..self.before.len().min(self.world.worms.len()) {
+        for i in 0..self.before.len().min(self.game.replica.world.worms.len()) {
             let (was_grounded, fall) = self.before[i];
-            let w = &self.world.worms[i];
+            let w = &self.game.replica.world.worms[i];
             let Some(impact) = landing_impact(was_grounded, w.on_ground, fall) else {
                 continue;
             };
             self.effects.dust(w.pos + Vec3::Y * 0.1, impact);
-            if i == 0 {
+            if i == self.me() {
                 self.feel.land(impact);
             }
         }
     }
 
     /// The M1 mode: fly the camera and edit the terrain with the brush. The
-    /// brush edits the grid directly, bypassing the sim: a developer tool.
+    /// brush bypasses the rules (a developer tool) but not the pipeline: the
+    /// edit goes to the host, and comes back in the next snapshot.
     fn fly_and_edit(&mut self, dt: f32) {
         // Fly.
         let held = |k| self.keys.contains(&k);
@@ -1427,15 +1450,16 @@ impl Viewer {
         // Edit. A button held down repeats at 20 Hz, so digging is a motion and
         // not a series of clicks.
         self.edit_cooldown -= dt;
-        let aim = aim_point(&self.world.grid, &self.camera);
+        let aim = aim_point(&self.game.replica.world.grid, &self.camera);
         if self.grabbed && (self.lmb || self.rmb) && self.edit_cooldown <= 0.0 {
             if let Some(p) = aim {
                 let t = Instant::now();
-                if self.lmb {
-                    carve(&mut self.world.grid, p, self.brush_radius);
+                let (shape, op) = if self.lmb {
+                    carve_edit(p, self.brush_radius)
                 } else {
-                    build(&mut self.world.grid, p, self.brush_radius);
-                }
+                    build_edit(&self.game.replica.world.grid, p, self.brush_radius)
+                };
+                self.game.debug_edit(shape, op);
                 self.edit_ms = t.elapsed().as_secs_f64() * 1000.0;
                 self.edit_cooldown = 0.05;
             }
@@ -1447,10 +1471,10 @@ impl Viewer {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.update(dt);
-        if self.anims.len() != self.world.worms.len() {
-            self.anims.resize(self.world.worms.len(), worms::Anim::default());
+        if self.anims.len() != self.game.replica.world.worms.len() {
+            self.anims.resize(self.game.replica.world.worms.len(), worms::Anim::default());
         }
-        for (anim, worm) in self.anims.iter_mut().zip(&self.world.worms) {
+        for (anim, worm) in self.anims.iter_mut().zip(&self.game.replica.world.worms) {
             anim.update(worm, dt);
         }
 
@@ -1459,19 +1483,19 @@ impl Viewer {
         // show two ticks of movement and some none, and the worm would judder.
         let alpha = (self.acc / DT).clamp(0.0, 1.0);
         let draw_pos: Vec<Vec3> =
-            self.world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
+            self.game.replica.world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
         // Speed widens the view: the world streams past faster at the edges,
         // which is a cheap way to make fast movement FEEL fast. Horizontal
         // speed only: a straight-up jump must not read as a speed boost (the
         // sim's jump rule is the same, see `movement.rs`).
         const CALM_SPEED: f32 = 6.0; // no widening up to this speed
-        let speed = if self.fly { 0.0 } else { Vec2::new(self.world.worms[0].vel.x, self.world.worms[0].vel.z).length() };
+        let speed = if self.fly { 0.0 } else { Vec2::new(self.game.replica.world.worms[self.me()].vel.x, self.game.replica.world.worms[self.me()].vel.z).length() };
         let widen = ((speed - CALM_SPEED) / 12.0).clamp(0.0, 1.0);
         let target_fov = (70.0 + 14.0 * widen).to_radians();
         self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
         // A wind-up narrows the view, so the release has something to open out
         // from. Only the drawn copy changes; the clean fov is the aim's.
-        let charge = if self.fly { 0.0 } else { self.world.worms[0].charge_fraction() };
+        let charge = if self.fly { 0.0 } else { self.game.replica.world.worms[self.me()].charge_fraction() };
         self.feel.set_charge(charge);
         self.audio.set_charge(charge);
         // The camera follows a smoothed point and adds its cosmetic offsets to
@@ -1479,18 +1503,18 @@ impl Viewer {
         let render_camera = if self.fly {
             self.camera
         } else {
-            self.feel.update(dt, &mut self.camera, camera_target(draw_pos[0]), FOLLOW_DIST, &self.world.grid);
+            self.feel.update(dt, &mut self.camera, camera_target(draw_pos[0]), FOLLOW_DIST, &self.game.replica.world.grid);
             self.feel.render(self.camera)
         };
 
         // Footsteps: a puff every couple of metres, so running reads as
         // contact with the ground even though the worm has no legs.
-        if self.step_dist.len() != self.world.worms.len() {
-            self.step_dist.resize(self.world.worms.len(), 0.0);
+        if self.step_dist.len() != self.game.replica.world.worms.len() {
+            self.step_dist.resize(self.game.replica.world.worms.len(), 0.0);
         }
         if !self.fly {
-            for i in 0..self.world.worms.len() {
-                let w = &self.world.worms[i];
+            for i in 0..self.game.replica.world.worms.len() {
+                let w = &self.game.replica.world.worms[i];
                 let speed = Vec3::new(w.vel.x, 0.0, w.vel.z).length();
                 if !w.alive || !w.on_ground || w.digging || speed < 4.0 {
                     self.step_dist[i] = 0.0;
@@ -1506,35 +1530,35 @@ impl Viewer {
             }
         }
 
-        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.world.worms, &draw_pos, &mut self.anims, dt);
+        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.game.replica.world.worms, &draw_pos, &mut self.anims, dt);
         // A charge is state, not an event: draw it for every worm, so a Nova
         // spin-up is a warning you can see coming.
-        for worm in &self.world.worms {
+        for worm in &self.game.replica.world.worms {
             capsules.extend(effects::charging(worm));
         }
         // The aim aid comes before the effects so a busy fight trims smoke and
         // sparks, not the marker the player is looking at.
         if !self.fly {
-            if let Some(path) = self.world.aim_path(0) {
-                capsules.extend(effects::trajectory(&path, &self.world.grid));
+            if let Some(path) = self.game.replica.world.aim_path(0) {
+                capsules.extend(effects::trajectory(&path, &self.game.replica.world.grid));
             }
         }
-        capsules.extend(effects::projectiles(&self.world.projectiles, alpha));
+        capsules.extend(effects::projectiles(&self.game.replica.world.projectiles, alpha));
         capsules.extend(self.effects.core_capsules());
         // Soft effects, surface marks and blood: billboards and decals, sorted
         // so alpha smoke draws back-to-front. Blood never touches the capsule
         // pool, so spray cannot trim a worm, the aim aid or a rocket.
         let mut sprites = self.effects.sprites();
-        let (lava_glow, lava_body) = effects::lava_sprites(&self.world.lava, alpha);
+        let (lava_glow, lava_body) = effects::lava_sprites(&self.game.replica.world.lava, alpha);
         sprites.glow.extend(lava_glow);
         sprites.smoke.extend(lava_body);
         sprites.glow.extend(whip_glow);
         sprites.sort_smoke(render_camera.pos);
         // Show where a dig would land (or, flying, where the brush would).
         let brush = if self.fly {
-            aim_point(&self.world.grid, &self.camera).map(|p| (p, self.brush_radius))
+            aim_point(&self.game.replica.world.grid, &self.camera).map(|p| (p, self.brush_radius))
         } else {
-            dig_target(&self.world.grid, &self.world.worms[0]).map(|p| (p, DIG_RADIUS))
+            dig_target(&self.game.replica.world.grid, &self.game.replica.world.worms[self.me()]).map(|p| (p, DIG_RADIUS))
         };
 
         let (frame, suboptimal) = match self.surface.get_current_texture() {
@@ -1576,7 +1600,7 @@ impl Viewer {
         // The free camera is a debug view, not a worm's: no worm HUD there.
         if !self.fly {
             let screen = (self.surface_cfg.width, self.surface_cfg.height);
-            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.world.worms[0]);
+            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.game.replica.world.worms[self.me()]);
         }
         self.gpu.queue.submit([encoder.finish()]);
         self.renderer.end_frame();
@@ -1597,7 +1621,7 @@ impl Viewer {
         if elapsed >= 0.5 {
             let on = |b| if b { "on" } else { "off" };
             // No text rendering yet (the HUD is M6): the title bar carries it.
-            let me = &self.world.worms[0];
+            let me = &self.game.replica.world.worms[self.me()];
             let gun = &me.weapons[me.current];
             let def = &WEAPONS[gun.id as usize];
             let ammo = if !me.alive {

@@ -122,14 +122,15 @@ impl Hud {
         Hud { pipeline, buffer, verts: Vec::new(), size: (1.0, 1.0), scale: 1.0, marker: Marker::default() }
     }
 
-    /// Feed it the sim's events. Only the player's own hits matter here.
-    pub fn event(&mut self, e: &Event) {
+    /// Feed it the sim's events. Only the player's own hits matter here; `me`
+    /// is the player's worm.
+    pub fn event(&mut self, e: &Event, me: u8) {
         match *e {
-            Event::Hit { victim, damage, .. } if victim != 0 => {
+            Event::Hit { victim, damage, .. } if victim != me => {
                 self.marker = Marker { seconds: 0.3, damage, kill: false };
             }
             // `Died` follows the final `Hit` in the same tick: upgrade the marker.
-            Event::Died { victim, killer: 0, .. } if victim != 0 => {
+            Event::Died { victim, killer, .. } if killer == me && victim != me => {
                 self.marker.seconds = 0.5;
                 self.marker.kill = true;
             }

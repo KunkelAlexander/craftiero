@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 sim = { path = "../sim" }
 protocol = { path = "../protocol" }
+sdf = { path = "../sdf" }
+
+[dev-dependencies]
+glam = "0.27"

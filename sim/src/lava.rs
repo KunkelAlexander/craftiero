@@ -23,10 +23,11 @@ use crate::combat::point_segment_distance;
 use crate::world::{Event, World, BODY_SPHERES, DT, WORM_RADIUS};
 use glam::Vec3;
 use sdf::{Op, Shape};
+use serde::{Deserialize, Serialize};
 
 /// One blob of lava. `life` is how long it stays molten (a little different
 /// for each bit, so a puddle freezes in a ripple and not all at once).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct LavaBit {
     pub pos: Vec3,
     pub vel: Vec3,
@@ -70,11 +71,13 @@ const MAX_SPEED: f32 = 50.0;
 /// Bits alive at once, in the whole world. A shot that would exceed it is thinner.
 pub const LAVA_MAX: usize = 300;
 /// The frozen blob: slightly larger than the bit, and joined to its neighbours
-/// and the rock with a generous smooth min, so a puddle freezes into one lumpy
-/// surface instead of a pile of balls.
-pub const STAMP_RADIUS: f32 = 0.6;
-const STAMP_SMOOTH: f32 = 1.4;
-const STAMP_SINK: f32 = 0.25;
+/// and the rock with a small smooth min, so a puddle freezes into one surface
+/// instead of a pile of balls. Keep the join small: every stamp lowers the
+/// field again where the earlier ones overlap, so a wide join compounds and a
+/// pool swells to several times the lava it was (a 0.4 join froze 1.7x, 1.4 froze 5x).
+pub const STAMP_RADIUS: f32 = 0.5;
+const STAMP_SMOOTH: f32 = 0.45;
+const STAMP_SINK: f32 = 0.2;
 /// Bits that may freeze in one tick. Each is a terrain edit to upload.
 const FREEZE_PER_TICK: usize = 3;
 /// A molten bit this long past its time and still in the air is dropped.

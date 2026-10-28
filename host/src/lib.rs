@@ -6,7 +6,7 @@
 //
 //   * offline / loopback: inside the game process, wired straight to the local
 //     client (today);
-//   * one player's browser, with friends connected through a relay (step 3);
+//   * one player's computer, with friends connected through a relay (M5);
 //   * a dedicated server binary that links this crate (maybe, one day).
 //
 // To make that possible it knows nothing about windows, sockets or clocks. Its
@@ -28,20 +28,18 @@ pub mod throttle;
 
 pub use throttle::Throttle;
 
-use protocol::{ClientMsg, PlayerId, Rules, Snapshot, Welcome};
-use sim::bots::Bot;
-use sim::tilemap::{Tilemap, MAPS};
-use sim::weapons::{valid_loadout, DEFAULT_LOADOUT};
+use protocol::{ClientMsg, PlayerId, Snapshot, Welcome};
+use sdf::{Grid, Op, Shape};
 use sim::{Event, Input, World};
 
-/// Who drives a player slot.
+/// Who drives a worm slot.
 ///
-/// Pattern: State. A slot is either a bot or a connected human, and what
+/// Pattern: State. A slot is either empty or a connected human, and what
 /// `tick` does depends on which, without scattering `if is_human` flags.
 enum Controller {
-    /// Host-side AI. Bots live here (not in the clients) because they need the
-    /// authoritative world, and so every client sees the same bots.
-    Bot(Bot),
+    /// Nobody: the worm stands there as a target dummy. (The 2D game put a bot
+    /// here; they come back with M6, and become a second kind of controller.)
+    Idle,
     /// A connected human: their most recent input.
     Human(Input),
 }
@@ -49,46 +47,34 @@ enum Controller {
 pub struct Host {
     world: World,
     controllers: Vec<Controller>,
-    seed: u32,
-    /// The match's rules, repeated in every `Welcome`.
-    rules: Rules,
-    /// Which humans have already chosen their weapons (see `handle`).
-    chose: Vec<bool>,
+    /// Every terrain edit since the match began, in order: what a late joiner
+    /// replays on top of the untouched map (see `Welcome::edits`).
+    edits: Vec<(Shape, Op)>,
 }
 
 impl Host {
-    /// A new match with `slots` players, all bots until humans join, played
-    /// by the given rules.
-    pub fn new(slots: usize, rules: Rules, seed: u32) -> Host {
-        let mut host = Host::on_map(MAPS[rules.map as usize].art, slots, seed, &DEFAULT_LOADOUT);
-        host.world.score_limit = rules.score_limit;
-        host.rules = rules;
-        host
+    /// A new match on `map` with a worm for each spawn column, all idle until
+    /// humans join.
+    pub fn new(map: Grid, spawns: &[(f32, f32)], seed: u32) -> Host {
+        let world = World::new(map, spawns, seed);
+        let controllers = spawns.iter().map(|_| Controller::Idle).collect();
+        Host { world, controllers, edits: Vec::new() }
     }
 
-    /// The same, on another map and with another starting set of weapons for
-    /// everyone (the menu's hub is a map too, and hands out every weapon).
-    pub fn on_map(map: &str, slots: usize, seed: u32, loadout: &[u8]) -> Host {
-        let world = World::new(Tilemap::from_ascii(map), slots, loadout, seed);
-        let controllers = (0..slots).map(|i| Controller::Bot(bot_for(seed, i))).collect();
-        Host { world, controllers, seed, rules: Rules::default(), chose: vec![false; slots] }
-    }
-
-    /// A human arrives: give them the first slot a bot is holding.
+    /// A human arrives: give them the first slot nobody holds.
     /// `None` means the match is full.
     pub fn join(&mut self) -> Option<Welcome> {
-        let slot = self.controllers.iter().position(|c| matches!(c, Controller::Bot(_)))?;
+        let slot = self.controllers.iter().position(|c| matches!(c, Controller::Idle))?;
         self.controllers[slot] = Controller::Human(Input::default());
-        self.chose[slot] = false;
-        // No events: the tiles above are already up to date, and replaying
+        // No events: the edit log is already up to date, and replaying
         // explosions from before the newcomer arrived would be wrong.
-        Some(Welcome { you: slot as PlayerId, rules: self.rules, tiles: self.world.map.tiles().to_vec(), snapshot: self.snapshot(Vec::new()) })
+        Some(Welcome { you: slot as PlayerId, edits: self.edits.clone(), snapshot: self.snapshot(Vec::new()) })
     }
 
-    /// A human goes away: a bot takes the slot back, so the match carries on.
+    /// A human goes away: the worm stays as a dummy, so the match carries on.
     pub fn leave(&mut self, id: PlayerId) {
         if let Some(c) = self.controllers.get_mut(id as usize) {
-            *c = Controller::Bot(bot_for(self.seed, id as usize));
+            *c = Controller::Idle;
         }
     }
 
@@ -107,41 +93,40 @@ impl Host {
                     *latest = input;
                 }
             }
-            // The weapons a human picked. Never trust the client: the choice must
-            // be valid, and only the first one counts, because choosing refills
-            // the magazines (a client could otherwise "reload" by choosing again).
-            // Bots keep the default set.
-            ClientMsg::Loadout(ids) => {
-                let human = matches!(self.controllers.get(id as usize), Some(Controller::Human(_)));
-                if human && !self.chose[id as usize] && valid_loadout(&ids) {
-                    self.world.set_loadout(id as usize, &ids);
-                    self.chose[id as usize] = true;
-                }
-            }
             // A ping tests the connection, not the game, so whoever owns the
             // connection answers it (the host session), not this struct.
             ClientMsg::Ping { .. } => {}
         }
     }
 
+    /// Edit the terrain on behalf of a developer tool (the viewer's fly-mode
+    /// brush). It is NOT a client message: a real client can never edit the
+    /// world, only ask for things the rules allow. The edit goes out with the
+    /// next snapshot like any other.
+    pub fn debug_edit(&mut self, shape: Shape, op: Op) {
+        self.world.edit(shape, op);
+    }
+
     /// Advance the match by one tick. Returns the world as it is now, plus the
     /// events of this tick. Sending it (or not) is up to the caller.
     pub fn tick(&mut self) -> Snapshot {
-        // Pattern: Command. Bots and humans both turn into the same `Input`.
+        // Pattern: Command. Every controller turns into the same `Input`.
         // A human whose packet is late simply repeats their last input.
-        let world = &self.world;
         let inputs: Vec<Input> = self
             .controllers
-            .iter_mut()
-            .enumerate()
-            .map(|(i, c)| match c {
-                Controller::Bot(bot) => bot.think(world, i),
+            .iter()
+            .map(|c| match c {
+                Controller::Idle => Input::default(),
                 Controller::Human(input) => *input,
             })
             .collect();
 
         self.world.step(&inputs);
         let events = self.world.drain_events();
+        self.edits.extend(events.iter().filter_map(|e| match *e {
+            Event::Edit { shape, op } => Some((shape, op)),
+            _ => None,
+        }));
         self.snapshot(events)
     }
 
@@ -153,24 +138,38 @@ impl Host {
     fn snapshot(&self, events: Vec<Event>) -> Snapshot {
         Snapshot {
             tick: self.world.tick,
-            players: self.world.players.clone(),
+            worms: self.world.worms.clone(),
             projectiles: self.world.projectiles.clone(),
-            winner: self.world.winner,
+            zones: self.world.zones.clone(),
+            lava: self.world.lava.clone(),
             events,
         }
     }
 }
 
-fn bot_for(seed: u32, slot: usize) -> Bot {
-    Bot::new(seed.wrapping_add(slot as u32 * 7919))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::{IVec3, Vec2, Vec3};
     use protocol::replica::Replica;
-    use protocol::{decode_host, encode_client, decode_client, encode_host, HostMsg};
-    use sim::vec2;
+    use protocol::{decode_client, decode_host, encode_client, encode_host, HostMsg};
+    use sim::weapons::ROCKET;
+    use std::f32::consts::FRAC_PI_2;
+
+    /// Flat ground at y = 4 m, 32 x 16 x 32 m of world.
+    fn ground() -> Grid {
+        Grid::from_fn(IVec3::new(8, 4, 8), |p| p.y - 4.0)
+    }
+
+    /// Two worms on the ground (the spawn drop finds rock at once, so put them
+    /// on the surface by hand, like the sim's own tests do).
+    fn host() -> Host {
+        let mut host = Host::new(ground(), &[(8.0, 16.0), (24.0, 16.0)], 7);
+        for w in &mut host.world.worms {
+            w.pos.y = 4.05;
+        }
+        host
+    }
 
     /// Send a host message through the byte encoding, like a real wire would.
     fn over_the_wire(msg: &HostMsg) -> HostMsg {
@@ -180,105 +179,102 @@ mod tests {
     fn join_as_client(host: &mut Host) -> Replica {
         let welcome = host.join().expect("a free slot");
         match over_the_wire(&HostMsg::Welcome(welcome)) {
-            HostMsg::Welcome(w) => Replica::new(w, 0),
+            HostMsg::Welcome(w) => Replica::new(w, ground(), 0),
             _ => unreachable!(),
         }
     }
 
+    /// One tick of the whole pipeline: input out as bytes, snapshot back as bytes.
+    fn tick(host: &mut Host, replica: &mut Replica, input: Input) {
+        let sent = decode_client(&encode_client(&ClientMsg::Input(input))).unwrap();
+        host.handle(replica.me, sent);
+        replica.apply(over_the_wire(&HostMsg::Snapshot(host.tick())));
+        replica.advance(0.0); // what the frame loop does before drawing
+    }
+
     #[test]
     fn replica_follows_the_host_through_bytes() {
-        let mut host = Host::new(4, Rules::default(), 7);
+        let mut host = host();
         let mut replica = join_as_client(&mut host);
         assert_eq!(replica.me, 0);
 
-        // Walk right for a second, sending the input as bytes too.
-        let input = Input { move_dir: vec2(1.0, 0.0), ..Input::default() };
-        let start_x = replica.world.players[0].pos.x;
+        // Walk +x for a second.
+        let walk = Input { move_dir: Vec2::new(0.0, 1.0), yaw: FRAC_PI_2, ..Input::default() };
+        let start_x = replica.world.worms[0].pos.x;
         for _ in 0..60 {
-            let sent = decode_client(&encode_client(&ClientMsg::Input(input))).unwrap();
-            host.handle(replica.me, sent);
-            replica.apply(over_the_wire(&HostMsg::Snapshot(host.tick())));
-            replica.advance(0.0); // what the frame loop does before drawing
+            tick(&mut host, &mut replica, walk);
         }
 
-        assert!(replica.world.players[0].pos.x > start_x + 50.0, "player 0 should have walked right");
+        assert!(replica.world.worms[0].pos.x > start_x + 3.0, "worm 0 should have walked");
         // With a snapshot every tick, the copy is exactly the original.
-        for (a, b) in replica.world.players.iter().zip(&host.world().players) {
+        for (a, b) in replica.world.worms.iter().zip(&host.world().worms) {
             assert_eq!(a.pos, b.pos);
             assert_eq!(a.hp, b.hp);
+            assert_eq!(a.action, b.action);
         }
         assert_eq!(replica.world.tick, host.world().tick);
     }
 
     #[test]
-    fn tile_changes_reach_the_replica() {
-        let mut host = Host::new(4, Rules::default(), 7);
+    fn craters_reach_the_replica() {
+        let mut host = host();
         let mut replica = join_as_client(&mut host);
-        // Tile (2,5) is a brick in the Grid map. Announce its destruction
-        // without touching the host's own map, so that only the *event* can be
-        // what changes the replica.
-        assert_eq!(replica.world.map.get(2, 5), sim::Tile::Brick(3));
-        let mut snapshot = host.tick();
-        snapshot.events.push(Event::TileChanged { x: 2, y: 5, tile: sim::Tile::Empty });
-        replica.apply(over_the_wire(&HostMsg::Snapshot(snapshot)));
-        replica.advance(0.0);
-        assert_eq!(replica.world.map.get(2, 5), sim::Tile::Empty);
+        let untouched = replica.world.grid.checksum();
+
+        // Shoot the ground at our feet until the rocket has landed.
+        let shoot = Input { fire: true, pitch: -1.3, weapon: ROCKET, ..Input::default() };
+        for _ in 0..120 {
+            tick(&mut host, &mut replica, shoot);
+        }
+
+        assert_ne!(host.world().grid.checksum(), untouched, "the rocket dug a hole");
+        // Only the *events* can have changed the replica's grid.
+        assert_eq!(replica.world.grid.checksum(), host.world().grid.checksum());
     }
 
     #[test]
-    fn a_late_joiner_gets_the_current_map() {
-        let mut host = Host::new(4, Rules::default(), 7);
-        host.world.map.set(2, 5, sim::Tile::Empty);
+    fn a_late_joiner_gets_the_current_terrain() {
+        let mut host = host();
+        host.join(); // slot 0 plays a while
+        let shape = Shape::Sphere { center: Vec3::new(16.0, 4.0, 16.0), radius: 3.0 };
+        host.debug_edit(shape, Op::Carve);
+        host.tick();
         let replica = join_as_client(&mut host);
-        assert_eq!(replica.world.map.tiles(), host.world().map.tiles());
+        assert_eq!(replica.me, 1);
+        assert_eq!(replica.world.grid.checksum(), host.world().grid.checksum());
     }
 
     #[test]
     fn join_leave_and_full_match() {
-        let mut host = Host::new(2, Rules::default(), 1);
+        let mut host = host();
         assert_eq!(host.join().unwrap().you, 0);
         assert_eq!(host.join().unwrap().you, 1);
         assert!(host.join().is_none(), "no free slot left");
         host.leave(0);
-        assert_eq!(host.join().unwrap().you, 0, "a bot gave the slot back");
+        assert_eq!(host.join().unwrap().you, 0, "the slot was given back");
     }
 
     #[test]
-    fn a_player_gets_the_weapons_they_chose_once() {
-        use sim::weapons::{BOMB, NOVA, SWARM, TELEPORT, CLUSTER};
-        let ids = |host: &Host, slot: usize| host.world().players[slot].weapons.iter().map(|w| w.id).collect::<Vec<_>>();
-        let mut host = Host::new(3, Rules::default(), 1);
-        host.join(); // slot 0
-        host.handle(0, ClientMsg::Loadout(vec![NOVA, BOMB, SWARM, TELEPORT, CLUSTER]));
-        assert_eq!(ids(&host, 0), [NOVA, BOMB, SWARM, TELEPORT, CLUSTER]);
-
-        // A second choice (a refill trick) and nonsense are both ignored.
-        host.handle(0, ClientMsg::Loadout(DEFAULT_LOADOUT.to_vec()));
-        assert_eq!(ids(&host, 0), [NOVA, BOMB, SWARM, TELEPORT, CLUSTER]);
-        host.join(); // slot 1
-        host.handle(1, ClientMsg::Loadout(vec![NOVA; 5]));
-        host.handle(1, ClientMsg::Loadout(vec![0, 1, 2]));
-        assert_eq!(ids(&host, 1), DEFAULT_LOADOUT, "invalid choices change nothing");
-
-        // Slot 2 is a bot: messages claiming to come from it are not obeyed.
-        host.handle(2, ClientMsg::Loadout(vec![NOVA, BOMB, SWARM, TELEPORT, CLUSTER]));
-        assert_eq!(ids(&host, 2), DEFAULT_LOADOUT);
-    }
-
-    #[test]
-    fn inputs_for_bot_slots_are_ignored() {
-        let mut host = Host::new(2, Rules::default(), 1);
-        // Nobody joined, so slot 1 is a bot. A forged input must not move it.
-        let forged = Input { fire: true, ..Input::default() };
+    fn inputs_for_empty_slots_are_ignored() {
+        let mut host = host();
+        // Nobody joined, so slot 1 is a dummy. A forged input must not move it.
+        let forged = Input { move_dir: Vec2::new(0.0, 1.0), ..Input::default() };
         host.handle(1, ClientMsg::Input(forged));
-        assert!(matches!(host.controllers[1], Controller::Bot(_)));
+        let start = host.world().worms[1].pos;
+        for _ in 0..30 {
+            host.tick();
+        }
+        // (It settles onto the ground, so only the horizontal position counts.)
+        let end = host.world().worms[1].pos;
+        assert_eq!((end.x, end.z), (start.x, start.z));
     }
 
     /// A bandwidth budget as a test: if someone adds a fat field to
-    /// `Snapshot`, this fails and the cost shows up before the players feel it.
+    /// `Snapshot` or `Worm`, this fails and the cost shows up before the
+    /// players feel it.
     #[test]
     fn one_second_of_snapshots_fits_the_budget() {
-        let mut host = Host::new(4, Rules::default(), 7);
+        let mut host = host();
         let mut every_tick = 0;
         let mut every_second_tick = 0;
         let mut throttle = Throttle::new(2);
@@ -289,12 +285,11 @@ mod tests {
                 every_second_tick += encode_host(&HostMsg::Snapshot(s)).len();
             }
         }
-        println!("60 snapshots/s: {every_tick} B/s,  30 snapshots/s: {every_second_tick} B/s");
-        // Raised from 30_000 when the Scatter arrived: its 8 pellets per shot are
-        // 8 projectiles in every snapshot. Friends get 30 snapshots/s anyway, so
-        // about half of this. If it grows again, shrink `Projectile` on the wire
-        // (e.g. positions as 16-bit integers) before raising the limit.
-        assert!(every_tick < 40_000, "snapshots grew to {every_tick} B/s");
+        println!("2 worms, 60 snapshots/s: {every_tick} B/s,  30 snapshots/s: {every_second_tick} B/s");
+        // A worm is ~450 bytes on the wire, most of it the 15 weapon magazines.
+        // Fine for the free loopback; M5 must shrink it before four players
+        // share a home upload (send the weapon table only when it changes).
+        assert!(every_tick < 70_000, "snapshots grew to {every_tick} B/s");
         // Events ride along, so halving the rate saves a bit less than half.
         assert!(every_second_tick * 10 < every_tick * 6);
     }

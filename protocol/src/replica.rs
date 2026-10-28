@@ -15,12 +15,19 @@
 //
 // Pattern: Double Buffer. The world on screen (`world`) is never half-updated:
 // it is rewritten as a whole from the two snapshots in `queue` once per frame.
+//
+// The terrain is the one part that is not rewritten: it is far too big for a
+// snapshot. The replica starts from the untouched map and re-applies every
+// `Edit` event the host reports, in order. Edits are deterministic (the same
+// shape and operation on the same grid give the same voxels), so both copies
+// stay identical; `Grid::checksum` is how a test, and later the network, can
+// check that.
 
 use std::collections::VecDeque;
 use std::f32::consts::{PI, TAU};
 
-use sim::tilemap::MAPS;
-use sim::{Event, Tilemap, World, DT, TILE};
+use sdf::Grid;
+use sim::{Event, World, DT};
 
 use crate::{HostMsg, PlayerId, Snapshot, Welcome};
 
@@ -30,14 +37,15 @@ const CATCH_UP: f32 = 0.1;
 /// If we are this many ticks off (the tab was hidden, a lag spike), do not
 /// glide back: jump.
 const MAX_ERROR: f32 = 30.0;
-/// A player that moved further than this between two snapshots teleported
-/// (respawn); sliding them across the map would look wrong.
-const TELEPORT: f32 = TILE * 3.0;
+/// A worm that moved further than this (metres) between two snapshots
+/// teleported or respawned; sliding it across the map would look wrong. Running
+/// is 12 m/s, so a snapshot gap of even 10 ticks stays well inside.
+const TELEPORT: f32 = 5.0;
 
 pub struct Replica {
     /// What to draw.
     pub world: World,
-    /// Which player this client controls.
+    /// Which worm this client controls.
     pub me: PlayerId,
     /// Events whose moment has come but that nobody has shown yet.
     events: Vec<Event>,
@@ -56,15 +64,17 @@ pub struct Replica {
 }
 
 impl Replica {
-    pub fn new(welcome: Welcome, delay: u32) -> Replica {
-        // Start from the map the host named, then lay the real tiles over it
-        // (the match may be minutes old and full of craters). The number comes
-        // from another machine, so an unknown one falls back to the first map
-        // rather than crashing.
-        let def = MAPS.get(welcome.rules.map as usize).unwrap_or(&MAPS[0]);
-        let mut world = World::new(Tilemap::from_ascii(def.art), welcome.snapshot.players.len(), &[], 0);
-        world.map.load_tiles(&welcome.tiles);
-        world.score_limit = welcome.rules.score_limit;
+    /// `map` is the untouched terrain the match started from, built by the
+    /// client's own copy of the generator (the `Welcome` does not carry it).
+    pub fn new(welcome: Welcome, mut map: Grid, delay: u32) -> Replica {
+        // The match may be minutes old and full of craters: lay its edits over
+        // the fresh map.
+        for (shape, op) in &welcome.edits {
+            map.apply(*shape, *op);
+        }
+        // No spawn columns: the worms come from the snapshot, and a replica
+        // never respawns anybody.
+        let world = World::new(map, &[], 0);
         let playhead = welcome.snapshot.tick as f32;
         let mut replica = Replica {
             world,
@@ -82,8 +92,9 @@ impl Replica {
     /// Feed in one message from the host.
     pub fn apply(&mut self, msg: HostMsg) {
         match msg {
-            // A second Welcome means the host restarted the match.
-            HostMsg::Welcome(w) => *self = Replica::new(w, self.delay),
+            // A second Welcome means the host restarted the match; the caller
+            // (who owns the map generator) builds a new `Replica` for it.
+            HostMsg::Welcome(_) => {}
             // Only queued: nothing is drawn from it until `advance` gets there.
             HostMsg::Snapshot(s) => {
                 self.queue.push_back(s);
@@ -134,15 +145,15 @@ impl Replica {
     /// Fill `world` with the match as it looks at the playhead.
     fn present(&mut self) {
         // Everything the playhead has passed has now "happened" for this
-        // client: release its events, and patch its tile changes into the map
-        // (Pattern: Dirty Flag) at the same moment, so a brick breaks exactly
-        // when its explosion is shown.
+        // client: release its events, and patch its terrain edits into the grid
+        // (Pattern: Dirty Flag, the renderer re-uploads what changed) at the
+        // same moment, so a crater opens exactly when its explosion is shown.
         while self.queue.len() >= 2 && self.queue[1].tick as f32 <= self.playhead {
             self.queue.pop_front();
             let passed = &mut self.queue[0];
             for event in &passed.events {
-                if let Event::TileChanged { x, y, tile } = *event {
-                    self.world.map.set(x, y, tile);
+                if let Event::Edit { shape, op } = *event {
+                    self.world.grid.apply(shape, op);
                 }
             }
             self.events.append(&mut passed.events);
@@ -151,29 +162,35 @@ impl Replica {
         let from = &self.queue[0];
         self.playhead = self.playhead.max(from.tick as f32);
         self.world.tick = from.tick;
-        self.world.winner = from.winner;
         // Overwrite, don't merge: the host is the authority, so its word is
         // final. (Over a lossy network like UDP we would also drop a snapshot
         // older than the one we already have. WebSocket is ordered, so we
         // don't need to.)
-        self.world.players = from.players.clone();
+        self.world.worms = from.worms.clone();
         self.world.projectiles = from.projectiles.clone();
+        self.world.zones = from.zones.clone();
+        self.world.lava = from.lava.clone();
 
-        // Projectiles fly in straight lines, so instead of matching them up
-        // between two snapshots (they have no id) we just move each one on
-        // from where the older snapshot saw it.
+        // Projectiles fly in (nearly) straight lines, so instead of matching
+        // them up between two snapshots (they have no id) we just move each one
+        // on from where the older snapshot saw it. Lava is the same.
         let since_from = (self.playhead - from.tick as f32) * DT;
         for p in &mut self.world.projectiles {
             p.pos += p.vel * since_from;
         }
+        for bit in &mut self.world.lava {
+            bit.pos += bit.vel * since_from;
+        }
 
-        // Players: slide from where they were towards where they will be.
+        // Worms: slide from where they were towards where they will be.
         if let Some(to) = self.queue.get(1) {
             let t = (self.playhead - from.tick as f32) / (to.tick - from.tick) as f32;
-            for (p, next) in self.world.players.iter_mut().zip(&to.players) {
-                if p.alive && next.alive && p.pos.distance(next.pos) < TELEPORT {
-                    p.pos = p.pos.lerp(next.pos, t);
-                    p.aim = lerp_angle(p.aim, next.aim, t);
+            for (w, next) in self.world.worms.iter_mut().zip(&to.worms) {
+                if w.alive && next.alive && w.pos.distance(next.pos) < TELEPORT {
+                    w.pos = w.pos.lerp(next.pos, t);
+                    w.yaw = lerp_angle(w.yaw, next.yaw, t);
+                    w.pitch += (next.pitch - w.pitch) * t;
+                    w.face_yaw = lerp_angle(w.face_yaw, next.face_yaw, t);
                 }
             }
         }
@@ -194,26 +211,38 @@ fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sim::vec2;
+    use glam::IVec3;
+    use sdf::{Op, Shape};
+    use sim::{vec3, Vec3};
 
-    fn world() -> World {
-        World::new(Tilemap::from_ascii(MAPS[0].art), 2, &[], 0)
+    /// A small solid block of world: enough for worms to exist in, and for
+    /// terrain edits to have something to change.
+    fn map() -> Grid {
+        Grid::new(IVec3::new(4, 4, 4))
     }
 
-    /// Player 0 stands at x = `tick * 10`, so a position tells the tick.
+    fn world() -> World {
+        World::new(map(), &[(8.0, 8.0), (12.0, 8.0)], 0)
+    }
+
+    /// Worm 0 stands at x = `tick` metres, so a position tells the tick (and
+    /// stays under the teleport distance between snapshots).
     fn snapshot(tick: u32, events: Vec<Event>) -> Snapshot {
-        let mut players = world().players;
-        players[0].pos = vec2(tick as f32 * 10.0, 100.0);
-        Snapshot { tick, players, projectiles: Vec::new(), winner: None, events }
+        let mut worms = world().worms;
+        worms[0].pos = vec3(tick as f32, 0.0, 0.0);
+        Snapshot { tick, worms, projectiles: Vec::new(), zones: Vec::new(), lava: Vec::new(), events }
     }
 
     fn replica(delay: u32) -> Replica {
-        let w = world();
-        Replica::new(Welcome { you: 0, rules: crate::Rules::default(), tiles: w.map.tiles().to_vec(), snapshot: snapshot(0, Vec::new()) }, delay)
+        Replica::new(Welcome { you: 0, edits: Vec::new(), snapshot: snapshot(0, Vec::new()) }, map(), delay)
     }
 
     fn arrive(r: &mut Replica, tick: u32, events: Vec<Event>) {
         r.apply(HostMsg::Snapshot(snapshot(tick, events)));
+    }
+
+    fn crater() -> (Shape, Op) {
+        (Shape::Sphere { center: vec3(8.0, 8.0, 8.0), radius: 2.0 }, Op::Carve)
     }
 
     #[test]
@@ -222,13 +251,13 @@ mod tests {
         arrive(&mut r, 2, Vec::new());
         r.playhead = 1.0; // halfway between tick 0 and tick 2
         r.present();
-        assert_eq!(r.world.players[0].pos.x, 10.0);
+        assert_eq!(r.world.worms[0].pos.x, 1.0);
     }
 
     #[test]
     fn events_wait_for_the_playhead() {
         let mut r = replica(6);
-        let boom = Event::Explosion { pos: vec2(0.0, 0.0), radius: 1.0 };
+        let boom = Event::Explosion { weapon: 0, pos: Vec3::ZERO, normal: Vec3::Y, radius: 1.0 };
         arrive(&mut r, 2, vec![boom]);
         r.playhead = 1.0;
         r.present();
@@ -245,7 +274,7 @@ mod tests {
         arrive(&mut r, 2, Vec::new());
         r.advance(0.0);
         assert_eq!(r.world.tick, 2);
-        assert_eq!(r.world.players[0].pos.x, 20.0);
+        assert_eq!(r.world.worms[0].pos.x, 2.0);
     }
 
     #[test]
@@ -277,5 +306,28 @@ mod tests {
     fn angles_blend_the_short_way() {
         let a = lerp_angle(PI - 0.1, -PI + 0.1, 0.5);
         assert!((a.abs() - PI).abs() < 1e-4, "got {a}");
+    }
+
+    #[test]
+    fn a_terrain_edit_waits_for_the_playhead_like_any_event() {
+        let mut r = replica(6);
+        let before = r.world.grid.checksum();
+        let (shape, op) = crater();
+        arrive(&mut r, 2, vec![Event::Edit { shape, op }]);
+        r.playhead = 1.0;
+        r.present();
+        assert_eq!(r.world.grid.checksum(), before, "the crater is still in our future");
+        r.playhead = 2.0;
+        r.present();
+        assert_ne!(r.world.grid.checksum(), before, "and opens when the playhead gets there");
+    }
+
+    #[test]
+    fn a_newcomer_replays_the_edit_log() {
+        let (shape, op) = crater();
+        let mut host_map = map();
+        host_map.apply(shape, op);
+        let r = Replica::new(Welcome { you: 0, edits: vec![(shape, op)], snapshot: snapshot(0, Vec::new()) }, map(), 0);
+        assert_eq!(r.world.grid.checksum(), host_map.checksum());
     }
 }

@@ -55,6 +55,18 @@ This settles the M0 follow-up: the faster `Grid::apply` that M3 was expected to 
 
 How to look at it without a window: `-- --shot out.png --worm 64,38,0 --cam 56,24,24,32,-14 --fire 1,50` fires weapon 1 (the rocket) and takes the picture 50 ticks later (`--fire id[,ticks]`).
 
+### M4: host, loopback, replica (built)
+What exists: the viewer no longer owns a `World`. It owns a `LocalGame` (`viewer/src/local.rs`): a `host::Host` that runs the real `World`, an in-memory `Loopback` wire, and a `protocol::replica::Replica` whose `world` is what the renderer, effects, audio and HUD read. Every fixed tick: `Input` -> bytes -> `Host::handle` -> `Host::tick` (steps the sim) -> `Snapshot` -> bytes -> `Replica::apply`. Going online later means swapping the wire and moving the `Host`.
+- `protocol` (back in the workspace): `ClientMsg { Input, Ping }`, `HostMsg { Welcome, Snapshot, Pong, Full }`. A `Snapshot` is the tick, worms, projectiles, zones, lava and the tick's events. The terrain never travels in snapshots: every terrain change already was an `Event::Edit { shape, op }`, so the `Replica` starts from the untouched map and re-applies each edit when its playhead reaches it. A `Welcome` carries the edit log since the match began (the map is rebuilt from the generator on the client).
+- `host` (back in the workspace): `Host::{new, join, leave, handle, tick}` plus `debug_edit` for the fly brush (not a client message). Empty slots hold an idle dummy (the 2D bots return at M6). The second worm is therefore still a dummy.
+- `Replica` keeps the 2D design (snapshot queue, playhead `delay` ticks behind, events released and edits applied as the playhead passes them) and interpolates worm position and angles; the local game uses delay 0.
+- Changes elsewhere: `sim` and `sdf` types got serde derives (the sim's private per-tick bookkeeping on `Worm` and `Swing` is `serde(skip)`, so it is not on the wire); `sdf::Grid` is `Clone` (both ends start from one copy of the generated map offline); `World::edit` applies and reports a terrain edit; `Hud::event` takes the player's worm index instead of assuming 0; the viewer uses `replica.me` instead of "worm 0".
+- Tests: host + replica through real bytes (walking, a rocket crater leaves both grids with the same `Grid::checksum`, a late joiner replays the edit log), snapshot bandwidth budget, edits released only when the playhead gets there.
+
+Measured: a snapshot with 2 worms is about 790 bytes (47 KB/s at 60 snapshots/s, 24 KB/s at 30). A worm is ~450 bytes, mostly its 15 weapon magazines; with 4 players that is too much for a home upload, so M5 should send the weapon table only when it changes.
+
+Known limits: a `Welcome` has to fit `MAX_MESSAGE_BYTES` (64 KB, about a thousand edits at ~50 bytes), which is fine for a fresh match or a rematch but not a late join into a long one (M5 sends chunks instead). `ClientMsg::Loadout` and `Rules` (map id, score limit) from the 2D protocol were dropped: all 11 weapons are carried, and there is one map. They return with the match rules and menus. The headless `--shot` paths still step a bare `World` directly (a test rig, not the game). The fly-mode brush edits the host's terrain through `Host::debug_edit`, so it reaches the replica like any other edit. Not verified by hand: the interactive game was launched (runs 12 s without a panic) but nobody played it; the pipeline is covered by the host tests.
+
 ### Run it
 ```
 cargo run -p viewer --release
@@ -149,7 +161,7 @@ Intel UHD (laptop iGPU), DX12, 1280 x 720, render scale 100%, GPU ms from timest
 4. **Commit** (and whether to keep `screenshots/` in the repo).
 5. **Review M2.** Play it: walk, jump, dig a tunnel, swing from the ceiling of the cavern. Tell me what feels wrong (speeds, camera distance and height, dig size and rate, rope length and reel speed); they are single constants. Also: is the worm's look (capsule, eyes, gun) the direction you want?
 6. **Review M3.** Play it: pick weapons with 1 to 0 and `-`, shoot the dummy worm and watch it respawn, rocket-jump (aim a rocket at your feet), hide behind rock from a Nova, build a bridge with the tractor, dig with Left Shift. Tell me what feels wrong; every number is a row in `sim/src/weapons.rs`. Answered: a match gets a score limit and a winner, and all 11 weapons stay (see the decisions below). Still open: should a dead worm's camera do something (spectate, slow zoom)?
-7. **Next milestone, M4 (host, loopback, replica):** offline play through the same pipeline as online.
+7. **Review M4.** Play it: nothing should feel different from M3 (same speeds, same latency). If anything does, the pipeline is at fault. Then M5 (online).
 
 ### Owner decisions after reviewing M3 (to implement another time)
 - **A match has a score limit and a winner.** Port the 2D rule: first to N kills wins (the 2D default was 15, `SCORE_LIMIT`), `World::winner`, an `Event::MatchWon`, and the world freezes once someone has won (`step` returns early). Killing yourself costs a point, as in 2D (already implemented: `kills` goes down). The limit is a rule of the match, set by whoever creates the world. Not started: `combat.rs` has the kills and deaths but no winner yet.
@@ -228,7 +240,7 @@ Tractor beam / "forming": a moving SDF shape applied each tick as add (smooth-mi
 - **M1 Viewer: DONE (committed).** wgpu window, fly camera, click-to-carve/build, raymarched toon shading, ink outlines, automatic resolution. Gate: art style approved.
 - **M2 Worm in sim: DONE (committed).** Capsule-vs-SDF movement, jump, dig, rope, `Input` with aim, headless tests (including determinism), third-person viewer mode.
 - **M3 Weapons: BUILT, awaiting review.** `WeaponDef` table (11 weapons), projectiles through the distance field, explosions = carve, build = add, tractor = a rapid stream of small adds, damage, cover, respawn, effects in the viewer.
-- **M4 Host + loopback + Replica (Vec3):** offline play via the same pipeline as the 2D game.
+- **M4 Host + loopback + Replica (Vec3): BUILT, awaiting review.** Offline play now runs through the same pipeline as online (see "M4" in Status). No gameplay change.
 - **M5 Online:** relay (reused), late join, edit events, checksums.
 - **M6 Polish:** bots, procedural maps (SDF primitives + noise caves), HUD, audio polish (the first pass shipped with M3).
 
@@ -262,4 +274,4 @@ Recommendations, ordered by value. Crate versions and APIs are from memory/searc
 | Bots | hand-written steering | keep; later navigation in SDF space is custom anyway | Keep |
 
 ## Next step
-Owner review of M3 (Status, "Next decisions"): play it, then either a tuning round (weapon numbers, camera, aiming) or M4. Stop and report before M4.
+Owner review of M4 (Status, "M4"): play it and check it feels exactly like M3 (it should), then M5 (online) or a tuning round. Stop and report before M5.

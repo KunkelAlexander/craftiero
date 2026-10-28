@@ -261,10 +261,10 @@ pub fn lava_sprites(list: &[LavaBit], alpha: f32) -> (Vec<Sprite>, Vec<Sprite>) 
         // A slow shimmer, different for every bit, so the surface seethes.
         let shimmer = 1.0 + 0.10 * (b.age * 7.0 + k as f32 * 1.9).sin();
         let seed = k as f32 * 1.37;
-        // As big as the rock it becomes: the stamp's radius plus the bulge its
-        // smooth join adds. Drawn smaller, the lava shrank into a scatter of
+        // As big as the rock it becomes: the stamp's radius plus the small
+        // bulge its smooth join adds. Drawn smaller, the lava shrank into a scatter of
         // dots and then froze into a lump twice its size.
-        let size = (STAMP_RADIUS + 0.3) * shimmer;
+        let size = (STAMP_RADIUS + 0.05) * shimmer;
         body.push(Sprite::ball(at + Vec3::Y * 0.3, size, colour, 0.97, seed, 0.15));
         let heat = (1.0 - c / 0.8).max(0.0);
         if heat > 0.0 {

@@ -14,6 +14,7 @@
 // seconds to cross it is no weapon.
 
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 
 /// The weapon id is its index in `WEAPONS`, and also its slot in a worm's
 /// inventory (every worm carries the whole arsenal), so `Input::weapon` is
@@ -138,7 +139,7 @@ pub struct WeaponDef {
 }
 
 /// One weapon in a worm's hands: the table row's id and the changing numbers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WeaponState {
     /// Index into `WEAPONS`.
     pub id: u8,

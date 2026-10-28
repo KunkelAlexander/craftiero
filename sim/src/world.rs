@@ -18,6 +18,7 @@ use crate::rng::Rng;
 use crate::weapons::{WeaponState, ARSENAL, WEAPONS};
 use glam::{Vec2, Vec3};
 use sdf::{Grid, Op, Shape};
+use serde::{Deserialize, Serialize};
 
 /// The sim runs at a fixed 60 Hz, whatever the frame rate of whoever draws it.
 /// A fixed step makes physics repeatable: variable steps change how high you
@@ -107,7 +108,7 @@ const DIG_ADVANCE: f32 = 2.5;
 // The speed constants and the anchor rule live in `movement.rs`; the rope's
 // shape is shared state, so its struct stays next to the worm.
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Rope {
     pub anchor: Vec3,
     /// Maximum distance from the hand to the anchor. The worm can swing at any
@@ -118,7 +119,7 @@ pub struct Rope {
 /// What the worm's body is doing. The movement rules are a state machine:
 /// each action owns a few numbers (speed, timer) and decides when to hand over
 /// to another. This is the pattern the book calls a State.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Idle,
     Walk,
@@ -152,7 +153,10 @@ impl Action {
     }
 }
 
-#[derive(Clone, Debug)]
+// Serialize: a snapshot carries whole worms. The `pub(crate)` fields are the
+// sim's private bookkeeping (button edges, timers); only `World::step` reads
+// them and a replica never steps, so they stay off the wire (`skip`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Worm {
     /// The point between the feet. The capsule stands on it.
     pub pos: Vec3,
@@ -182,21 +186,30 @@ pub struct Worm {
     pub digging: bool,
     pub rope: Option<Rope>,
     /// Was the rope button down last tick? (To react to the press, not the hold.)
+    #[serde(skip)]
     pub(crate) rope_was_down: bool,
+    #[serde(skip)]
     pub(crate) jump_was_down: bool,
     /// Mid-air jumps left before landing. One, until the double jump is used.
+    #[serde(skip)]
     pub(crate) air_jumps: u8,
     /// Ticks since the worm last stood on the ground (for coyote jumps).
+    #[serde(skip)]
     pub(crate) coyote: u8,
     /// Ticks left on a jump press that could not be used yet (jump buffering).
+    #[serde(skip)]
     pub(crate) jump_buffer: u8,
     /// The wall most recently touched, and how long a wall kick is still legal.
+    #[serde(skip)]
     pub(crate) wall_normal: Vec3,
+    #[serde(skip)]
     pub(crate) wall_timer: u8,
     /// Ticks before another wall can be grabbed (set after a kick, so a kick
     /// does not instantly re-stick to the same wall).
+    #[serde(skip)]
     pub(crate) climb_cooldown: u8,
     /// Ticks of no steering left after an explosion.
+    #[serde(skip)]
     pub(crate) tumble_timer: u8,
     // --- fighting (see `combat.rs`) ---
     pub hp: f32,
@@ -216,6 +229,7 @@ pub struct Worm {
     pub swing: Option<Swing>,
     /// The overhead smash was used in this airtime. It is a stomp: one per
     /// double jump, so holding the trigger does not chain them. Cleared on landing.
+    #[serde(skip)]
     pub(crate) smashed: bool,
     pub kills: i32,
     pub deaths: i32,
@@ -364,7 +378,7 @@ pub(crate) fn body_fits(grid: &Grid, feet: Vec3) -> bool {
 
 /// Something that happened this tick, for the renderer, the audio and (later)
 /// the network. Consumers read them with `World::drain_events`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Event {
     /// The terrain was edited. This (a shape and an operation, a few bytes) is
     /// also what the host will send to clients instead of the changed voxels.
@@ -406,7 +420,7 @@ pub enum Event {
 }
 
 /// What a `Zone` does to whoever is inside it.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ZoneKind {
     /// Gravity is multiplied by this (0.3 = moon, 2.5 = heavy).
     Gravity(f32),
@@ -415,7 +429,7 @@ pub enum ZoneKind {
 /// A timed region of the world with an effect: a sphere that lives for `left`
 /// seconds. Plain data (no behaviour, no pointers), so a snapshot can carry the
 /// list to clients and they draw the same zones the host simulates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Zone {
     pub kind: ZoneKind,
     pub centre: Vec3,
@@ -474,6 +488,13 @@ impl World {
             blasts: Vec::new(),
             rng: Rng::new(seed),
         }
+    }
+
+    /// Edit the terrain from outside the rules (the viewer's fly-mode brush) and
+    /// report it like any other edit, so every copy of the world gets it.
+    pub fn edit(&mut self, shape: Shape, op: Op) {
+        self.grid.apply(shape, op);
+        self.events.push(Event::Edit { shape, op });
     }
 
     pub fn drain_events(&mut self) -> Vec<Event> {

@@ -67,6 +67,7 @@ impl Material {
 /// of rock. Distances and materials are separate arrays: the material is only
 /// read when the distance says "rock", and keeping it out of `i8` leaves the
 /// distance encoding alone.
+#[derive(Clone)]
 struct ChunkData {
     dist: Box<[i8; CHUNK_VOL]>,
     /// `None` means every voxel here is ordinary `Rock`. Only chunks that hold
@@ -77,6 +78,7 @@ struct ChunkData {
 /// Pattern: Flyweight. A chunk that is all air or all rock stores nothing, and
 /// all of them share the one meaning. Most of a cave map is exactly that, and
 /// they cost no memory and no meshing time.
+#[derive(Clone)]
 enum Chunk {
     Air,
     Rock,
@@ -84,6 +86,9 @@ enum Chunk {
     Data(Box<ChunkData>),
 }
 
+/// `Clone` so a client that already holds the pristine map can start from a
+/// copy instead of generating it again.
+#[derive(Clone)]
 pub struct Grid {
     /// World size in chunks.
     size: IVec3,

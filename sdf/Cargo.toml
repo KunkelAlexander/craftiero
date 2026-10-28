@@ -7,3 +7,5 @@ edition = "2021"
 glam = { version = "0.27", features = ["scalar-math", "serde"] }
 # Surface Nets mesher for chunked signed-distance samples (see mesh.rs).
 fast-surface-nets = "0.2"
+# Edits (`Shape`, `Op`) are the network format for terrain changes (see shape.rs).
+serde = { version = "1", features = ["derive"] }

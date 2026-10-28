@@ -11,6 +11,7 @@ use crate::weapons::{Kind, Special, WeaponDef, WeaponState, ARSENAL, LAVA, WEAPO
 use crate::world::{body_axis, body_fits, Action, Event, World, Zone, ZoneKind, DT, WORM_HEIGHT, WORM_RADIUS};
 use glam::{Quat, Vec3};
 use sdf::{Op, Shape};
+use serde::{Deserialize, Serialize};
 
 pub const MAX_HP: f32 = 100.0;
 pub const RESPAWN_TIME: f32 = 3.0;
@@ -145,7 +146,7 @@ const WHIP_CUT_BRIDGE: f32 = 3.0;
 
 /// The two ways the plasma whip can be swung. The sim picks one from what the
 /// worm is doing; the viewer rebuilds the same motion from the event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WhipStyle {
     /// A flat lash across the front, alternating direction with each swing.
     Sweep,
@@ -158,7 +159,7 @@ pub enum WhipStyle {
 /// sim, so a worm is hit (and the rock is cut) at the moment the lash passes it.
 /// Everything the viewer needs to draw the same swing is in `Event::Whip`; it
 /// does not read this.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Swing {
     pub style: WhipStyle,
     /// Which way the arc runs: a held trigger alternates it.
@@ -172,13 +173,15 @@ pub struct Swing {
     pub lean: f32,
     /// Worms this swing has already hurt, one bit per worm: a lash hits each
     /// target once, however many ticks it spends passing through it.
+    #[serde(skip)]
     pub(crate) hit: u32,
     /// Where the lash last met rock, and the way it was travelling, so the next
     /// contact can be joined to it into one slit.
+    #[serde(skip)]
     pub(crate) cut: Option<(Vec3, Vec3)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Projectile {
     pub pos: Vec3,
     pub vel: Vec3,
@@ -1576,6 +1579,33 @@ mod tests {
         assert!(w.lava.iter().all(|b| w.grid.sample(b.pos) > crate::lava::LAVA_BIT_RADIUS * 0.5), "none sinks in");
         let reach = w.lava.iter().map(|b| b.pos.z).fold(0.0, f32::max);
         assert!(reach > 4.0 + 8.0, "a fire hose: it carries past 8 m even level: {reach}");
+    }
+
+    #[test]
+    fn frozen_lava_takes_up_about_the_room_the_liquid_did() {
+        // Rock standing above the flat floor (top at y = 4), counted on a 0.1 m lattice.
+        fn rock_volume(w: &World) -> f32 {
+            let mut cells = 0;
+            for ix in 60..260 {
+                for iy in 1..60 {
+                    for iz in 60..280 {
+                        let p = Vec3::new(ix as f32 * 0.1, 4.0 + iy as f32 * 0.1, iz as f32 * 0.1);
+                        if w.grid.sample(p) < 0.0 {
+                            cells += 1;
+                        }
+                    }
+                }
+            }
+            cells as f32 * 0.001
+        }
+        let mut w = lava_arena();
+        let before = rock_volume(&w);
+        let mut events = hose(&mut w, 60);
+        events.extend(run(&mut w, 600));
+        let bits = events.iter().filter(|e| matches!(e, Event::LavaFroze { .. })).count() as f32;
+        let ball = 4.0 / 3.0 * std::f32::consts::PI * crate::lava::LAVA_BIT_RADIUS.powi(3);
+        let per_bit = (rock_volume(&w) - before) / bits / ball;
+        assert!(per_bit < 1.6, "{bits} bits froze into {} m3: {per_bit} balls of lava each", rock_volume(&w) - before);
     }
 
     #[test]

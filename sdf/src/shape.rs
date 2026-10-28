@@ -2,8 +2,9 @@
 // so the host can apply it, log it, and send it to clients (~20 bytes).
 
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Shape {
     Sphere { center: Vec3, radius: f32 },
     /// A swept sphere: the beam of a tractor beam, or a tunnel.
@@ -124,7 +125,7 @@ impl Shape {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Op {
     /// Dig: terrain minus shape.
     Carve,

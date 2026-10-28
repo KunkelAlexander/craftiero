@@ -8,7 +8,6 @@
 // The conversation, in full:
 //
 //   client                                  host
-//     │ ── ClientMsg::Loadout ──────────────> │   once: "these are my five weapons"
 //     │ ── ClientMsg::Input ────────────────> │   "here is what my player wants"
 //     │                                       │   (host steps the sim)
 //     │ <──────────── HostMsg::Welcome ────── │   once, when you join
@@ -27,7 +26,8 @@ pub mod replica;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 pub use relay::{FromRelay, Reject, ToRelay};
-use sim::{Event, Input, Player, Projectile, Tile};
+use sdf::{Op, Shape};
+use sim::{Event, Input, LavaBit, Projectile, Worm, Zone};
 
 /// Which player slot a connection controls. The host decides it, never the
 /// client (otherwise a client could claim to be someone else).
@@ -39,10 +39,6 @@ pub enum ClientMsg {
     /// The player's wishes for now. Sent once per rendered frame; the host
     /// keeps only the newest one per player.
     Input(Input),
-    /// The weapons this player picked before the match (ids into `WEAPONS`).
-    /// Sent once, right after the `Welcome`. The host checks it and accepts only
-    /// the first one: a second would be a free refill of every magazine.
-    Loadout(Vec<u8>),
     /// "Are you there? How long does a round trip take?" The token is echoed
     /// back unchanged in `HostMsg::Pong`.
     Ping { token: u32 },
@@ -59,35 +55,22 @@ pub enum HostMsg {
     Full,
 }
 
-/// The rules of a match, chosen by the host on the setup screen. Only the host
-/// chooses (it runs the match); a joiner learns them from the `Welcome`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-pub struct Rules {
-    /// Index into `sim::tilemap::MAPS`.
-    pub map: u8,
-    /// Kills to win.
-    pub score_limit: i32,
-}
-
-impl Default for Rules {
-    fn default() -> Rules {
-        Rules { map: 0, score_limit: sim::world::SCORE_LIMIT }
-    }
-}
-
 /// Sent once to a new arrival: everything needed to start from scratch.
 /// This is the "late joiner" message.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Welcome {
     /// The slot this client controls.
     pub you: PlayerId,
-    /// Which map, and how many kills win. The map is named by its number: the
-    /// art is in both programs already, and only the tiles that changed since
-    /// the start need to travel (`tiles`, below).
-    pub rules: Rules,
-    /// The whole terrain right now. Snapshots only carry *changes* to it
-    /// (`Event::TileChanged`), so a newcomer needs the full grid exactly once.
-    pub tiles: Vec<Tile>,
+    /// Every terrain edit since the match began. The map itself is not sent:
+    /// the generator is in both programs, so a client builds the untouched map
+    /// and replays these on top. Snapshots only carry *new* edits
+    /// (`Event::Edit`), so a newcomer needs the whole log exactly once.
+    ///
+    /// Size: ~50 bytes an edit, and `MAX_MESSAGE_BYTES` is 64 KB, so a match
+    /// that has dug more than about a thousand times no longer fits. Fine while
+    /// everyone joins at the start (offline, a rematch); a late join in a long
+    /// match needs the grid's chunks instead (M5, see PLAN.md).
+    pub edits: Vec<(Shape, Op)>,
     /// The world right now, so there is something valid to draw immediately.
     pub snapshot: Snapshot,
 }
@@ -100,11 +83,12 @@ pub struct Welcome {
 pub struct Snapshot {
     /// The sim tick this snapshot was taken after.
     pub tick: u32,
-    pub players: Vec<Player>,
+    pub worms: Vec<Worm>,
     pub projectiles: Vec<Projectile>,
-    pub winner: Option<u8>,
+    pub zones: Vec<Zone>,
+    pub lava: Vec<LavaBit>,
     /// Events since the last snapshot. Clients turn them into explosions and
-    /// sounds, and apply `TileChanged` to their copy of the map.
+    /// sounds, and apply `Edit` to their copy of the terrain.
     pub events: Vec<Event>,
 }
 
