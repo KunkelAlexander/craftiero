@@ -11,7 +11,7 @@ use glam::Vec3;
 use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WEAPONS, WHIP,
 };
-use sim::{whip_arc, whip_dir, whip_reach, Action, WhipStyle, Worm, MAX_HP, WHIP_REST, WHIP_SWING_TIME, WORM_HEIGHT};
+use sim::{whip_arc, whip_dir, whip_reach, Action, WhipStyle, Worm, WHIP_REST, WHIP_SWING_TIME, WORM_HEIGHT};
 use std::f32::consts::TAU;
 
 /// How tall the preview sculpt is, in its own units. The game worm is 1.8 m;
@@ -83,14 +83,6 @@ pub struct Anim {
 /// as an impact, not as a status effect.
 const HURT_FLASH: f32 = 0.10;
 const HURT_FLINCH: f32 = 0.40;
-/// A health bar only appears over a worm that has actually lost health. It is
-/// vertical so it stays readable from every camera angle: the third-person view
-/// is rarely square to the body's right.
-const BAR_STEP: f32 = 0.105;
-const BAR_WIDTH: f32 = 0.30;
-const BAR_LOW: Vec3 = Vec3::new(0.95, 0.14, 0.11);
-const BAR_MID: Vec3 = Vec3::new(1.0, 0.72, 0.14);
-const BAR_GOOD: Vec3 = Vec3::new(0.42, 0.94, 0.32);
 
 impl Default for Anim {
     fn default() -> Anim {
@@ -1203,47 +1195,6 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
             *c = c.proxy();
         }
 
-        // Health bar: a chunky vertical bar over a wounded worm. It is vertical
-        // so every camera angle sees its full length, and it only appears once
-        // there is damage to report. A fresh hit makes it jump under the flash,
-        // which is the "indicator" the eye catches before it reads the length.
-        if worm.hp < MAX_HP - 0.01 {
-            let frac = (worm.hp / MAX_HP).clamp(0.0, 1.0);
-            let colour = if frac > 0.55 {
-                BAR_GOOD
-            } else if frac > 0.25 {
-                BAR_MID
-            } else {
-                BAR_LOW
-            };
-            let punch = (1.0 - anim.hurt / 0.18).clamp(0.0, 1.0);
-            let base = pos + Vec3::Y * (2.12 + lift);
-            // Five stacked dashes, not one bar. A horizontal dash keeps its
-            // full width from any camera angle, and the empty sockets stay
-            // visible, so the row reads as a gauge instead of a laser sight
-            // taped to the worm's head.
-            let lit = (frac * 5.0).ceil().max(1.0) as usize;
-            let half = right * (BAR_WIDTH * 0.5);
-            for k in 0..5 {
-                let y = base + Vec3::Y * (k as f32 * BAR_STEP);
-                if k < lit {
-                    out.push(
-                        caps(
-                            y - half,
-                            y + half,
-                            0.026 * rs * (1.0 + 0.55 * punch),
-                            colour.lerp(Vec3::ONE, 0.20 * punch),
-                            false,
-                        )
-                        .glowing()
-                        .inkless(),
-                    );
-                } else {
-                    out.push(caps(y - half, y + half, 0.020 * rs, Vec3::new(0.13, 0.09, 0.10), false).inkless());
-                }
-            }
-        }
-
         // Arms. The right one holds the gun; the left one swings with the gait.
         // In the air both flail out; on a wall or a rope both reach up; digging
         // puts both hands forward.
@@ -1724,29 +1675,11 @@ mod tests {
     }
 
     #[test]
-    fn a_hit_flashes_the_body_and_raises_a_health_bar() {
+    fn a_hit_flashes_the_body() {
         let w = worm(Action::Idle, true);
         let pos = w.pos;
         let anim = Anim::default();
         let full = capsules(std::slice::from_ref(&w), &[pos], &[anim]);
-
-        // A wounded worm gets five extra primitives: the pip row.
-        let mut wounded = w.clone();
-        wounded.hp = MAX_HP * 0.2;
-        let hurt_anims = [anim];
-        let caps = capsules(std::slice::from_ref(&wounded), &[pos], &hurt_anims);
-        assert_eq!(caps.len(), full.len() + 5, "the health bar");
-        let bar = caps
-            .iter()
-            .find_map(|c| match c {
-                DrawPrim::Capsule { a, b, colour, .. } if *colour == BAR_LOW => Some((*a, *b)),
-                _ => None,
-            })
-            .expect("low health is drawn in red");
-        assert!(
-            bar.0.y > pos.y + 1.8 && (bar.1 - bar.0).length() > 0.1,
-            "the bar floats above the head: {bar:?}"
-        );
 
         // A fresh hit whitens the body and knocks it off its axis.
         let mut flinching = Anim::default();

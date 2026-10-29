@@ -61,6 +61,19 @@ struct Marker {
     seconds: f32,
     damage: f32,
     kill: bool,
+    /// Damage summed over a run of hits: each hit within `COMBO_WINDOW` of the
+    /// last adds to it, so a shotgun blast or a burst reads as one number.
+    total: f32,
+    total_seconds: f32,
+}
+
+const COMBO_WINDOW: f32 = 1.0;
+
+/// Damage the player took, summed the same way and shown as "-35" under the reticle.
+#[derive(Default)]
+struct Taken {
+    total: f32,
+    seconds: f32,
 }
 
 pub struct Hud {
@@ -71,6 +84,7 @@ pub struct Hud {
     size: (f32, f32),
     scale: f32,
     marker: Marker,
+    taken: Taken,
 }
 
 impl Hud {
@@ -119,20 +133,26 @@ impl Hud {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Hud { pipeline, buffer, verts: Vec::new(), size: (1.0, 1.0), scale: 1.0, marker: Marker::default() }
+        Hud { pipeline, buffer, verts: Vec::new(), size: (1.0, 1.0), scale: 1.0, marker: Marker::default(), taken: Taken::default() }
     }
 
-    /// Feed it the sim's events. Only the player's own hits matter here; `me`
-    /// is the player's worm.
+    /// Feed it the sim's events. Only hits dealt or taken by the player matter
+    /// here; `me` is the player's worm.
     pub fn event(&mut self, e: &Event, me: u8) {
         match *e {
+            Event::Hit { victim, damage, .. } if victim == me => {
+                let before = if self.taken.seconds > 0.0 { self.taken.total } else { 0.0 };
+                self.taken = Taken { total: before + damage, seconds: COMBO_WINDOW };
+            }
             Event::Hit { victim, damage, .. } if victim != me => {
-                self.marker = Marker { seconds: 0.3, damage, kill: false };
+                let total = if self.marker.total_seconds > 0.0 { self.marker.total + damage } else { damage };
+                self.marker = Marker { seconds: 0.3, damage, kill: false, total, total_seconds: COMBO_WINDOW };
             }
             // `Died` follows the final `Hit` in the same tick: upgrade the marker.
             Event::Died { victim, killer, .. } if killer == me && victim != me => {
                 self.marker.seconds = 0.5;
                 self.marker.kill = true;
+                self.marker.total_seconds = COMBO_WINDOW;
             }
             _ => {}
         }
@@ -140,6 +160,8 @@ impl Hud {
 
     pub fn tick(&mut self, dt: f32) {
         self.marker.seconds = (self.marker.seconds - dt).max(0.0);
+        self.marker.total_seconds = (self.marker.total_seconds - dt).max(0.0);
+        self.taken.seconds = (self.taken.seconds - dt).max(0.0);
     }
 
     /// Paint the HUD for `worm` over `target` (the finished frame).
@@ -301,9 +323,19 @@ impl Hud {
                 self.line(a, b, 6.0, [0.04, 0.035, 0.02, 0.8]);
                 self.line(a, b, 3.0, rgb(colour));
             }
-            let damage = format!("{:.0}", self.marker.damage);
+        }
+        // The number outlives the cross so a quick series of hits stays readable.
+        if self.marker.total_seconds > 0.0 {
+            let damage = format!("{:.0}", self.marker.total);
             self.text(&damage, cx + 31.0, cy - 35.0, 3.0, 0x0b0905);
             self.text(&damage, cx + 29.0, cy - 37.0, 3.0, if self.marker.kill { 0xff9a7a } else { 0xffffff });
+        }
+        // Incoming damage mirrors it on the other side, below the crosshair.
+        if self.taken.seconds > 0.0 {
+            let lost = format!("-{:.0}", self.taken.total);
+            let x = cx - 31.0 - text_width(&lost, 3.0);
+            self.text(&lost, x + 2.0, cy + 37.0, 3.0, 0x0b0905);
+            self.text(&lost, x, cy + 35.0, 3.0, DANGER);
         }
     }
 
