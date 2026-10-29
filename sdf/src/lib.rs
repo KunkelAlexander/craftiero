@@ -247,6 +247,41 @@ impl Grid {
         self.material_voxel((p / VOX).floor().as_ivec3())
     }
 
+    /// For the renderer: one byte per 2 x 2 x 2 voxels, how much of the block
+    /// is indestructible rock (0 = none, 255 = all of it). Coverage and not a
+    /// yes/no, so the GPU's linear filter draws a smooth edge instead of 0.5 m
+    /// steps. Solid never changes after generation, so this is read once. Half
+    /// resolution is plenty for a paint colour and is 1/8 of the distance field.
+    pub fn solid_blocks(&self) -> (IVec3, Vec<u8>) {
+        let dims = self.voxel_dims() / 2;
+        let mut out = vec![0u8; (dims.x * dims.y * dims.z) as usize];
+        for cz in 0..self.size.z {
+            for cy in 0..self.size.y {
+                for cx in 0..self.size.x {
+                    let c = IVec3::new(cx, cy, cz);
+                    if !self.solid[self.chunk_index(c)] {
+                        continue;
+                    }
+                    for lz in 0..CHUNK {
+                        for ly in 0..CHUNK {
+                            for lx in 0..CHUNK {
+                                let v = c * CHUNK + IVec3::new(lx, ly, lz);
+                                if self.voxel(v) < 0 && self.material_voxel(v).is_solid() {
+                                    let b = v / 2;
+                                    out[((b.z * dims.y + b.y) * dims.x + b.x) as usize] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for count in &mut out {
+            *count = (*count as u32 * 255 / 8) as u8; // 8 voxels per block
+        }
+        (dims, out)
+    }
+
     fn set_voxel(&mut self, v: IVec3, value: i8) {
         let c = IVec3::new(v.x >> SHIFT, v.y >> SHIFT, v.z >> SHIFT);
         let idx = self.chunk_index(c);

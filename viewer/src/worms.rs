@@ -992,6 +992,8 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
             Action::Climb => 0.45,
             Action::Rope => -0.08,
             Action::DoubleJump | Action::Tumble => 0.0,
+            // Low and long, shoulders first, so the start reads as a lunge.
+            Action::Dash => 0.55,
             _ => 0.03 + 0.14 * run,
         };
         if dig {
@@ -1022,6 +1024,12 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
             pose.stretch = 1.0 + 0.18 * s;
             pose.wide = 1.0 - 0.05 * s;
             pose.deep = 1.0 - 0.05 * s;
+        }
+        // Squashed low and long, the opposite of the rising stretch.
+        if action == Action::Dash {
+            pose.stretch = 0.94;
+            pose.wide = 0.94;
+            pose.deep = 1.14;
         }
         // The double jump is one clean forward flip; a tumble is faster and
         // uncontrolled. Both are driven by the action's age, not a global clock.
@@ -1665,6 +1673,7 @@ mod tests {
             Action::Climb,
             Action::Tumble,
             Action::Rope,
+            Action::Dash,
         ];
         for action in actions {
             let mut w = worm(action, matches!(action, Action::Idle | Action::Walk));

@@ -517,6 +517,9 @@ const CHUNKS: vec3<i32> = vec3<i32>($CHUNKS);
 // One byte per chunk: how many chunks away (chessboard distance) the nearest
 // chunk that holds a surface is. 0 = holds one. See `coarse_map` in renderer.rs.
 @group(0) @binding(3) var coarse_tex: texture_3d<u32>;
+// How much of each 2 x 2 x 2 voxel block (0.5 m) is indestructible rock, 0..1.
+// Read with the same linear sampler as the terrain.
+@group(0) @binding(4) var solid_tex: texture_3d<f32>;
 
 // Distance to the terrain in metres (negative inside rock). A voxel's value
 // sits at its integer coordinate, a texel's centre at +0.5, hence the shift.
@@ -797,6 +800,21 @@ fn albedo(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return mix(rock, grass, up);
 }
 
+// Indestructible rock is cool grey, like the bedrock in Liero: no strata, no
+// grass, so it reads as "this will not dig" at a glance.
+fn is_solid(p: vec3<f32>, n: vec3<f32>) -> bool {
+    // Look inside the rock, a block (0.5 m) deep: on the surface itself the
+    // filtered value is half air and flickers around the threshold. The
+    // thinnest bedrock (the sky bridge, 1.6 m) is still deeper than that.
+    let uvw = (p - n * 0.4) / WORLD_M;
+    return textureSampleLevel(solid_tex, sdf_smp, uvw, 0.0).r > 0.5;
+}
+
+fn albedo_solid(p: vec3<f32>) -> vec3<f32> {
+    let speck = vnoise3(p * 2.5);
+    return mix(srgb(vec3<f32>(0.40, 0.41, 0.44)), srgb(vec3<f32>(0.55, 0.56, 0.60)), speck);
+}
+
 // How much soot covers this point, 0..1. Summed from the recent blasts so two
 // overlapping craters are darker than one.
 fn soot_at(p: vec3<f32>) -> f32 {
@@ -924,6 +942,7 @@ fn fs(@builtin(position) frag: vec4<f32>) -> Out {
         if (kind == 1) {
             n = normal_at(p);
             base = albedo(p, n);
+            if (is_solid(p, n)) { base = albedo_solid(p); }
         } else if (kind == 3) {
             n = prim_normal(p, ci);
             base = srgb(u.caps[ci].col.rgb);

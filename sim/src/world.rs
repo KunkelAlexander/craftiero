@@ -135,6 +135,10 @@ pub enum Action {
     /// Hit by an explosion: no steering until the timer runs out.
     Tumble,
     Rope,
+    /// The burst a worm makes when it starts running from a standstill (see
+    /// `movement::step_dash`). It has no button: pushing the stick at rest is
+    /// the trigger.
+    Dash,
 }
 
 impl Action {
@@ -149,6 +153,7 @@ impl Action {
             Action::Climb => "climb",
             Action::Tumble => "tumble",
             Action::Rope => "rope",
+            Action::Dash => "dash",
         }
     }
 }
@@ -211,6 +216,15 @@ pub struct Worm {
     /// Ticks of no steering left after an explosion.
     #[serde(skip)]
     pub(crate) tumble_timer: u8,
+    /// Dash bookkeeping: was the stick pushed last tick (so a dash needs a
+    /// fresh push, not a held stick), ticks of the burst left, and ticks until
+    /// the next dash is allowed.
+    #[serde(skip)]
+    pub(crate) stick_was_down: bool,
+    #[serde(skip)]
+    pub(crate) dash_timer: u8,
+    #[serde(skip)]
+    pub(crate) dash_cooldown: u8,
     // --- fighting (see `combat.rs`) ---
     pub hp: f32,
     pub alive: bool,
@@ -260,6 +274,9 @@ impl Worm {
             wall_timer: 0,
             climb_cooldown: 0,
             tumble_timer: 0,
+            stick_was_down: false,
+            dash_timer: 0,
+            dash_cooldown: 0,
             hp: MAX_HP,
             alive: true,
             respawn_timer: 0.0,
@@ -945,10 +962,11 @@ mod tests {
         let start = w.worms[0].pos;
         run(&mut w, 30, walk(0.0)); // yaw 0 looks along +z
         let moved = w.worms[0].pos - start;
-        // Half a second from a standstill: nearly full speed and ~3.5 m
-        // covered. (A 1.3 s ramp would cover less than half of that and make
-        // the worm feel like it was wading.)
-        assert!(moved.z > 3.0 && moved.z < 4.3, "half a second from rest: {moved:?}");
+        // Half a second from a standstill: full speed and ~7.6 m covered, the
+        // 4 m start dash plus running. (Without the dash it was ~3.5 m, and a
+        // 1.3 s ramp would cover less than half of that and make the worm feel
+        // like it was wading.)
+        assert!(moved.z > 6.5 && moved.z < 8.5, "half a second from rest: {moved:?}");
         assert!(moved.x.abs() < 0.01);
         assert!(w.worms[0].forward_vel > 10.5, "{}", w.worms[0].forward_vel);
     }
@@ -1118,6 +1136,72 @@ mod tests {
         w.step(&[Input { jump: true, ..Input::default() }]);
         assert_eq!(w.worms[0].action, Action::DoubleJump, "no second air jump");
         assert_eq!(w.worms[0].air_jumps, 0);
+    }
+
+    #[test]
+    fn pushing_the_stick_from_rest_starts_with_a_four_metre_dash() {
+        // Camera yaw 0 looks along +Z; the stick points right (-X in this
+        // convention is "right"), so move_dir.x = -1 sends the worm along +X.
+        let mut w = big_flat();
+        let x0 = w.worms[0].pos;
+        let right = Input { move_dir: Vec2::new(-1.0, 0.0), ..Input::default() };
+        w.step(&[right]);
+        assert_eq!(w.worms[0].action, Action::Dash);
+        assert!((w.worms[0].face_yaw - FRAC_PI_2).abs() < 1.0e-3, "the body snaps to the dash, no turn delay");
+        run(&mut w, 11, right);
+        let d = w.worms[0].pos - x0;
+        assert!(d.x > 3.5 && d.x < 4.6, "dash distance {}", d.x);
+        assert!(d.z.abs() < 0.3, "straight along the stick: {}", d.z);
+        assert_ne!(w.worms[0].action, Action::Dash, "the burst is over");
+        assert!(w.worms[0].forward_vel <= 12.0, "back to running speed: {}", w.worms[0].forward_vel);
+    }
+
+    #[test]
+    fn there_is_no_dash_when_already_running_or_digging() {
+        let mut w = big_flat();
+        let fwd = Input { move_dir: Vec2::new(0.0, 1.0), yaw: FRAC_PI_2, ..Input::default() };
+        run(&mut w, 40, fwd); // dash, then run on at full speed
+        w.step(&[Input { yaw: FRAC_PI_2, ..Input::default() }]); // let go for a tick
+        w.step(&[fwd]);
+        assert_ne!(w.worms[0].action, Action::Dash, "still moving: not a start from rest");
+
+        let mut w = big_flat();
+        w.step(&[Input { dig: true, ..fwd }]);
+        assert_ne!(w.worms[0].action, Action::Dash, "digging creeps, it does not burst");
+    }
+
+    #[test]
+    fn a_held_stick_dashes_once_and_a_tap_has_a_cooldown() {
+        let mut w = big_flat();
+        let go = Input { move_dir: Vec2::new(0.0, 1.0), yaw: FRAC_PI_2, ..Input::default() };
+        let stop = Input { yaw: FRAC_PI_2, ..Input::default() };
+        w.step(&[go]);
+        assert_eq!(w.worms[0].action, Action::Dash);
+        run(&mut w, 60, go);
+        assert_ne!(w.worms[0].action, Action::Dash, "holding the stick is not pushing it again");
+        // Stop, and tap again 20 ticks after the first dash: still cooling down.
+        run(&mut w, 20, stop);
+        assert!(w.worms[0].forward_vel.abs() < 1.0, "at rest again");
+        let mut w2 = big_flat();
+        w2.step(&[go]);
+        run(&mut w2, 25, stop);
+        w2.step(&[go]);
+        assert_ne!(w2.worms[0].action, Action::Dash, "tapping must not out-run running");
+        run(&mut w2, 10, stop);
+        w2.step(&[go]);
+        assert_eq!(w2.worms[0].action, Action::Dash, "ready again after the cooldown");
+    }
+
+    #[test]
+    fn jumping_out_of_a_dash_is_not_a_speed_boost() {
+        let mut w = big_flat();
+        w.step(&[Input { move_dir: Vec2::new(0.0, 1.0), ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::Dash);
+        run(&mut w, 3, Input::default());
+        w.step(&[Input { jump: true, ..Input::default() }]);
+        assert_eq!(w.worms[0].action, Action::Jump);
+        let speed = Vec2::new(w.worms[0].vel.x, w.worms[0].vel.z).length();
+        assert!(speed <= 12.0, "a dash-jump leaves at running speed: {speed}");
     }
 
     #[test]
@@ -1295,7 +1379,9 @@ mod tests {
     #[test]
     fn jumping_at_a_climbed_wall_kicks_away_and_up() {
         let mut w = settled(walled, (16.0, 16.0));
-        run(&mut w, 150, walk(FRAC_PI_2));
+        // 110 ticks, not more: the start dash reaches the wall sooner, and a
+        // climb near the world's ceiling would clamp the kick's height.
+        run(&mut w, 110, walk(FRAC_PI_2));
         assert_eq!(w.worms[0].action, Action::Climb);
         let y = w.worms[0].pos.y;
         w.step(&[Input { jump: true, ..walk(FRAC_PI_2) }]);

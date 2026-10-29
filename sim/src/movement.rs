@@ -19,7 +19,10 @@
 //!   * small ledges are mantled (up to 0.9 m), steep crater walls are walked up
 //!     to about 70 degrees, and a jump that reaches a higher lip grabs it and
 //!     pulls the worm over, so blast holes do not trap the worm;
-//!   * walls are climbed by holding into them, and kicked off with jump.
+//!   * walls are climbed by holding into them, and kicked off with jump;
+//!   * pushing the stick from a standstill starts with a dash: a fixed-length
+//!     burst in the stick direction (the body snaps to it, so a start in any
+//!     direction skips the turn). It has no button of its own.
 //!
 //! The ramp, brake and turn rates are tuned for a 1.8 m character close to the
 //! camera, not a slow, heavy one: the worm reacts on the same tick as the
@@ -108,6 +111,18 @@ const LEDGE_UP: f32 = 1.2;
 const WALL_WINDOW: u8 = 8;
 /// After a kick, do not grab the same wall again immediately.
 const CLIMB_REGRAB: u8 = 15;
+
+// --- dash ------------------------------------------------------------------
+/// Dash speed: 60 units/frame (20 m/s), about 1.7x the running speed. It is
+/// constant for the whole burst, so the distance is predictable: 12 ticks
+/// (0.2 s) cover about 4 m.
+const DASH_SPEED_U: f32 = 60.0;
+const DASH_TICKS: u8 = 12;
+/// "At rest" for a dash: slower than this (3 units/frame, about 1 m/s).
+const DASH_REST_U: f32 = 3.0;
+/// Ticks from one dash start to the next allowed one (0.5 s). Without it,
+/// tapping the stick (dash, brake, dash...) would out-run plain running.
+const DASH_COOLDOWN: u8 = 30;
 
 // --- climbing --------------------------------------------------------------
 /// Free climbing is this game's own move, not a ledge grab. These are tuned,
@@ -200,6 +215,8 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input, gravity: f32) {
     worm.climb_cooldown = worm.climb_cooldown.saturating_sub(1);
     worm.tumble_timer = worm.tumble_timer.saturating_sub(1);
 
+    worm.dash_cooldown = worm.dash_cooldown.saturating_sub(1);
+
     // Rope button: a press shoots it, or lets go if it is out.
     let rope_pressed = input.rope && !worm.rope_was_down;
     worm.rope_was_down = input.rope;
@@ -248,9 +265,29 @@ pub(crate) fn step(grid: &Grid, worm: &mut Worm, input: &Input, gravity: f32) {
     } else {
         worm.face_yaw
     };
+    // A dash needs a fresh push of the stick, not a held one (Pattern: edge
+    // detection, the same trick as the jump and rope buttons).
+    let stick_pressed = mag > 0.01 && !worm.stick_was_down;
+    worm.stick_was_down = mag > 0.01;
 
     if worm.action == Action::Climb {
         step_climb(grid, worm, input, jump_pressed);
+        return;
+    }
+
+    // A dash in progress owns the body until it ends. Jump cancels it (at run
+    // speed, so a dash-jump is not a speed boost) and falls through to the
+    // normal jump rules below.
+    if worm.action == Action::Dash {
+        if jump_pressed {
+            end_dash(worm);
+        } else {
+            step_dash(grid, worm);
+            return;
+        }
+    } else if stick_pressed && can_dash(worm, input) {
+        begin_dash(worm, intended_yaw);
+        step_dash(grid, worm);
         return;
     }
 
@@ -589,6 +626,83 @@ fn double_jump(worm: &mut Worm) {
     worm.wall_timer = 0;
     worm.coyote = 0;
     worm.jump_buffer = 0;
+}
+
+// ---------------------------------------------------------------- dash ----
+
+/// A dash starts from a standstill on the ground. Digging is excluded for the
+/// same reason it is for climbing: the worm has to creep into the hole it is
+/// making, not burst past it.
+fn can_dash(worm: &Worm, input: &Input) -> bool {
+    worm.on_ground
+        && worm.dash_cooldown == 0
+        && matches!(worm.action, Action::Idle | Action::Walk)
+        && worm.forward_vel.abs() < DASH_REST_U * V
+        && !input.dig
+}
+
+/// The body snaps to the dash direction at once, so starting in any direction
+/// skips the 0.24 s turn.
+fn begin_dash(worm: &mut Worm, yaw: f32) {
+    worm.face_yaw = yaw;
+    worm.action = Action::Dash;
+    worm.dash_timer = DASH_TICKS;
+    worm.dash_cooldown = DASH_COOLDOWN;
+    worm.wall_timer = 0;
+}
+
+/// One tick of the burst: a fixed velocity along the dash direction, no
+/// steering. It walks like `step_ground` (along the ground plane, up small
+/// steps), but it ends if the worm leaves the ground or meets a wall.
+fn step_dash(grid: &Grid, worm: &mut Worm) {
+    worm.dash_timer = worm.dash_timer.saturating_sub(1);
+    let f = facing(worm.face_yaw);
+    let speed = DASH_SPEED_U * V;
+    worm.forward_vel = speed;
+    // Along the ground plane, like walking, so a bump does not eat speed.
+    let n = worm.ground_normal;
+    let dir = f - n * f.dot(n);
+    worm.vel = (if dir.length_squared() < 1.0e-6 { f } else { dir.normalize() }) * speed;
+
+    let start = worm.pos;
+    let disp = worm.vel * DT;
+    let mut hit = slide(grid, worm, disp);
+    let stepped = try_step_up(grid, worm, start, flat(disp).length(), f * (speed * DT));
+    hit.ground |= stepped.ground;
+    if stepped.wall.is_some() {
+        hit.wall = stepped.wall;
+    }
+    let settled = settle_on_ground(grid, worm, true);
+    worm.on_ground = hit.ground || settled;
+    if !worm.on_ground {
+        worm.ground_normal = Vec3::Y;
+        worm.vel.y = 0.0;
+    }
+
+    // A wall stops the burst (pushing on would only scrape), and so does the
+    // edge of a ledge: the dash is a start, not a jump.
+    let blocked = hit.wall.is_some_and(|n| f.dot(-n) > 0.5);
+    if blocked || !worm.on_ground || worm.dash_timer == 0 {
+        end_dash(worm);
+    }
+    clamp_speed(worm);
+}
+
+/// Back to normal movement at running speed: the dash is a burst, not a
+/// lasting speed-up (the same fairness rule as the jumps).
+fn end_dash(worm: &mut Worm) {
+    worm.dash_timer = 0;
+    worm.forward_vel = worm.forward_vel.min(WALK_MAX_U * V);
+    let f = facing(worm.face_yaw);
+    worm.vel.x = f.x * worm.forward_vel;
+    worm.vel.z = f.z * worm.forward_vel;
+    worm.action = if !worm.on_ground {
+        Action::Freefall
+    } else if worm.forward_vel.abs() > 0.2 {
+        Action::Walk
+    } else {
+        Action::Idle
+    };
 }
 
 fn wall_kick(worm: &mut Worm) {

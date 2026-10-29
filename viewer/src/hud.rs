@@ -32,22 +32,20 @@ fn rgb(hex: u32) -> Colour {
 const MARGIN: f32 = 28.0;
 const SLOT_KEYS: &str = "1234567890-=[]\\";
 
-// The comic look: every panel is a bright sticker with a fat black outline, a
-// hard drop shadow and a slight tilt; numbers are white (or hot) with their own
-// outline. The same ink colour outlines the damage numbers in `cartoon`.
-const INK: u32 = 0x0b0905;
-const TEXT: u32 = 0xffffff;
-const TRACK: u32 = 0x4a3a2e;
-const GOLD: u32 = 0xffe14a;
-const WARN: u32 = 0xff9a2a;
-const DANGER: u32 = 0xff6a4a;
-const PANEL_BLUE: u32 = 0x3f8fe0;
-const PANEL_GREEN: u32 = 0x4fbf3a;
-const PANEL_RED: u32 = 0xe5432f;
-const PANEL_GREY: u32 = 0x8a8a8a;
-const PANEL_ORANGE: u32 = 0xf0a030;
-const READY: u32 = 0xd8ffb0;
-const RELOAD: u32 = 0xcfe8ff;
+// Cel shading, like the world: every shape is one flat colour with a single
+// hard shadow band along its bottom (`shade`) and a soft dark-brown ink line,
+// in an earthy palette that sits next to the terrain instead of shouting over it.
+const INK: u32 = 0x1e1a14;
+const TEXT: u32 = 0xf4ecd8;
+const TRACK: u32 = 0x4a3f33;
+const GOLD: u32 = 0xe6c75a;
+const WARN: u32 = 0xd98a3a;
+const DANGER: u32 = 0xd9684c;
+const PANEL_RED: u32 = 0xb5543f;
+const PANEL_GREY: u32 = 0x8a877c;
+const PANEL_ORANGE: u32 = 0xc58a3e;
+const READY: u32 = 0xdcecc0;
+const RELOAD: u32 = 0xd2e2ee;
 
 const MAX_VERTS: usize = 3 * 10_000;
 
@@ -88,8 +86,6 @@ pub struct Hud {
     scale: f32,
     marker: Marker,
     taken: Taken,
-    /// While set, every triangle is rotated about a point: one panel's tilt.
-    tilt: Option<((f32, f32), (f32, f32))>,
     /// The HP number bounces whenever the value changes (hit, heal, respawn).
     hp_seen: f32,
     hp_age: f32,
@@ -143,7 +139,6 @@ impl Hud {
         });
         Hud { pipeline, buffer, verts: Vec::new(), size: (1.0, 1.0), scale: 1.0, marker: Marker::default(),
             taken: Taken::default(),
-            tilt: None,
             hp_seen: MAX_HP,
             hp_age: 10.0,
         }
@@ -218,14 +213,12 @@ impl Hud {
     /// Top left: `KILLS 4 | DEATHS 2`.
     fn kills_and_deaths(&mut self, worm: &Worm) {
         let (x, y) = (MARGIN, MARGIN);
-        self.tilted(x, y, 270.0, 44.0, -0.035);
-        self.plate(x, y, 270.0, 44.0, PANEL_BLUE);
+        self.plate(x, y, 270.0, 44.0, PANEL_ORANGE);
         let end = self.label("KILLS", x + 16.0, y + 15.0, TEXT);
-        let end = self.fat(&worm.kills.to_string(), end + 8.0, y + 12.0, 3.0, TEXT);
+        let end = self.fat(&worm.kills.to_string(), end + 10.0, y + 12.0, 3.0, TEXT);
         self.rect(end + 14.0, y + 10.0, 3.0, 24.0, INK);
-        let end = self.label("DEATHS", end + 30.0, y + 15.0, TEXT);
-        self.fat(&worm.deaths.to_string(), end + 8.0, y + 12.0, 3.0, TEXT);
-        self.tilt = None;
+        let end = self.label("DEATHS", end + 32.0, y + 15.0, TEXT);
+        self.fat(&worm.deaths.to_string(), end + 10.0, y + 12.0, 3.0, TEXT);
     }
 
     /// Bottom left: `HP 78` and ten segments of 10 HP each.
@@ -233,10 +226,7 @@ impl Hud {
         let (x, y) = (MARGIN, 720.0 - MARGIN - 84.0);
         let fraction = (worm.hp / MAX_HP).clamp(0.0, 1.0);
         let low = worm.alive && fraction <= 0.25;
-        // A low-health panel also shivers: the tilt wobbles with the bounce clock.
-        let shiver = if low { (self.hp_age * 40.0).sin() * 0.012 } else { 0.0 };
-        self.tilted(x, y, 280.0, 84.0, 0.03 + shiver);
-        let fill = if !worm.alive { PANEL_GREY } else if low { PANEL_RED } else { PANEL_GREEN };
+        let fill = if !worm.alive { PANEL_GREY } else if low { PANEL_RED } else { PANEL_ORANGE };
         self.plate(x, y, 280.0, 84.0, fill);
         self.label("HP", x + 16.0, y + 38.0, TEXT);
         // Pattern: Tween. The number overshoots and settles each time it changes.
@@ -256,7 +246,6 @@ impl Hud {
         }
         let bar = if fraction > 0.5 { GOLD } else if fraction > 0.25 { WARN } else { TEXT };
         self.segments(x + 16.0, y + 60.0, 248.0, 14.0, 10, fraction, bar);
-        self.tilt = None;
     }
 
     /// Bottom right: the slot rail above a plate with the name, the ammo and
@@ -267,7 +256,6 @@ impl Hud {
         // The rail: one slot per weapon, keyed like the keyboard. A blue mark
         // under a slot means it is reloading, a red one that it is empty.
         // Right-aligned with the plate: fourteen slots are wider than it.
-        self.tilted(x, y, 332.0, 142.0, -0.025);
         let rail = x + 332.0 - worm.weapons.len() as f32 * 28.0 + 4.0;
         for (i, gun) in worm.weapons.iter().enumerate() {
             let def = &WEAPONS[gun.id as usize];
@@ -334,7 +322,6 @@ impl Hud {
         if let Some(progress) = progress {
             self.segments(x + 16.0, y + 126.0, 300.0, 6.0, 1, progress, colour);
         }
-        self.tilt = None;
     }
 
     /// The four chevrons around the crosshair, plus the hit marker if one is live.
@@ -365,35 +352,34 @@ impl Hud {
         // The number outlives the cross so a quick series of hits stays readable.
         if self.marker.total_seconds > 0.0 {
             let damage = format!("{:.0}", self.marker.total);
-            let fill = if self.marker.kill { 0xff6a4a } else { 0xffe14a };
+            let fill = if self.marker.kill { DANGER } else { GOLD };
             let pixel = 3.5 + (self.marker.total / 120.0).clamp(0.0, 1.0) * 2.5;
             let left = self.marker.total_seconds;
-            self.cartoon(&damage, (cx + 62.0, cy - 52.0), pixel, 0.12, COMBO_WINDOW - left, left, fill);
+            self.cartoon(&damage, (cx + 62.0, cy - 52.0), pixel, COMBO_WINDOW - left, left, fill);
         }
         // Incoming damage mirrors it on the other side, below the crosshair.
         if self.taken.seconds > 0.0 {
             let lost = format!("-{:.0}", self.taken.total);
             let pixel = 3.5 + (self.taken.total / 120.0).clamp(0.0, 1.0) * 2.5;
             let left = self.taken.seconds;
-            self.cartoon(&lost, (cx - 62.0, cy + 52.0), pixel, -0.12, COMBO_WINDOW - left, left, DANGER);
+            self.cartoon(&lost, (cx - 62.0, cy + 52.0), pixel, COMBO_WINDOW - left, left, DANGER);
         }
     }
 
-    /// A damage number as a cartoon sticker: fat black outline, a light top
-    /// edge, tilted, and it pops in big, settles, floats up and shrinks away.
+    /// A damage number as a cartoon sticker: ink outline, two flat cel
+    /// tones, and it pops in big, settles, floats up and shrinks away.
     /// `age` is seconds since the last hit, `left` seconds until it is gone.
     /// Each font pixel is a free (unsnapped) quad so it can rotate and scale.
-    fn cartoon(&mut self, s: &str, centre: (f32, f32), pixel: f32, tilt: f32, age: f32, left: f32, fill: u32) {
+    fn cartoon(&mut self, s: &str, centre: (f32, f32), pixel: f32, age: f32, left: f32, fill: u32) {
         let pop = pop(age);
         let fade = (left / 0.25).clamp(0.0, 1.0);
         let size = pixel * pop * (0.4 + 0.6 * fade);
         let centre = (centre.0, centre.1 - age * 14.0);
-        let (sin, cos) = tilt.sin_cos();
         let (w, h) = (s.chars().count() as f32 * 6.0 - 1.0, 7.0);
         // Font-pixel units (origin at the text's middle) to virtual units.
         let place = |u: f32, v: f32| {
             let (u, v) = ((u - w / 2.0) * size, (v - h / 2.0) * size);
-            (centre.0 + u * cos - v * sin, centre.1 + u * sin + v * cos)
+            (centre.0 + u, centre.1 + v)
         };
         let quad = |hud: &mut Hud, u0: f32, v0: f32, u1: f32, v1: f32, colour: Colour| {
             let (a, b, c, d) = (place(u0, v0), place(u1, v0), place(u1, v1), place(u0, v1));
@@ -403,23 +389,20 @@ impl Hud {
         let lit = |ch: char, col: i32, row: i32| {
             (0..5).contains(&col) && (0..7).contains(&row) && glyph(ch)[row as usize] >> (4 - col) & 1 == 1
         };
-        let mut ink = rgb(0x0b0905);
+        let mut ink = rgb(INK);
         ink[3] = fade;
         let mut face = rgb(fill);
         face[3] = fade;
-        let mut top = rgb(fill);
-        for c in &mut top[..3] {
-            *c = *c * 0.45 + 0.55;
-        }
-        top[3] = fade;
+        let mut dark = rgb(shade(fill));
+        dark[3] = fade;
         let glyphs: Vec<(usize, char)> = s.chars().enumerate().collect();
-        // Outline first (every lit pixel grown by 1.1 font pixels), then the faces.
+        // Outline first (every lit pixel grown by 0.7 font pixels), then the faces.
         for &(i, ch) in &glyphs {
             for row in 0..7 {
                 for col in 0..5 {
                     if lit(ch, col, row) {
                         let (u, v) = ((i * 6) as f32 + col as f32, row as f32);
-                        quad(self, u - 1.1, v - 1.1, u + 2.1, v + 2.1, ink);
+                        quad(self, u - 0.7, v - 0.7, u + 1.7, v + 1.7, ink);
                     }
                 }
             }
@@ -430,7 +413,7 @@ impl Hud {
                     if lit(ch, col, row) {
                         let (u, v) = ((i * 6) as f32 + col as f32, row as f32);
                         // A hair of overlap hides seams between rotated quads.
-                        let colour = if lit(ch, col, row - 1) { face } else { top };
+                        let colour = if row < 4 { face } else { dark };
                         quad(self, u - 0.02, v - 0.02, u + 1.02, v + 1.02, colour);
                     }
                 }
@@ -451,24 +434,23 @@ impl Hud {
             let lit = (fraction * segs as f32 - i as f32).clamp(0.0, 1.0);
             self.rect(cx, y, cell, h, TRACK);
             self.rect(cx, y, cell * lit, h, colour);
+            self.rect(cx, y + h * 0.6, cell * lit, h * 0.4, shade(colour));
         }
     }
 
-    /// A comic panel: a hard drop shadow, a fat black outline, a bright fill and
-    /// a pale gloss strip along the top.
+    /// A cel-shaded panel: an ink outline, the lit colour on top and one hard
+    /// band of shade along the bottom, the same two tones the world uses.
     fn plate(&mut self, x: f32, y: f32, w: f32, h: f32, fill: u32) {
-        let mut shadow = rgb(INK);
-        shadow[3] = 0.4;
-        self.octagon_c(x, y + 1.0, w + 10.0, h + 10.0, 15.0, shadow);
-        self.octagon(x - 5.0, y - 5.0, w + 10.0, h + 10.0, 15.0, INK);
-        self.octagon(x, y, w, h, 11.0, fill);
-        self.rect(x + 14.0, y + 4.0, w - 28.0, 3.0, mix_white(fill, 0.5));
-    }
-
-    /// Rotate everything drawn until `self.tilt` is cleared, about the middle of
-    /// the given box. Panels use it so the whole sticker leans, text included.
-    fn tilted(&mut self, x: f32, y: f32, w: f32, h: f32, angle: f32) {
-        self.tilt = Some(((x + w / 2.0, y + h / 2.0), angle.sin_cos()));
+        self.octagon(x - 3.0, y - 3.0, w + 6.0, h + 6.0, 14.0, INK);
+        self.octagon(x, y, w, h, 11.0, shade(fill));
+        // The lit part: the same octagon cut flat at 62% of the height.
+        let (c, k) = (11.0, h * 0.62);
+        let p = [(x + c, y), (x + w - c, y), (x + w, y + c), (x + w, y + k), (x, y + k), (x, y + c)];
+        let mid = (x + w / 2.0, y + k / 2.0);
+        let colour = rgb(fill);
+        for i in 0..6 {
+            self.triangle([mid, p[i], p[(i + 1) % 6]], colour);
+        }
     }
 
     /// Small text with a hard 2-unit drop shadow, so it stays readable on any panel.
@@ -477,8 +459,8 @@ impl Hud {
         self.text(s, x, y, 2.0, colour)
     }
 
-    /// Big text as a sticker: every lit font pixel is grown by one pixel in ink
-    /// first (the outline), then the letters go on top with a paler top edge.
+    /// Big text, cel shaded: every lit font pixel is grown by 0.6 pixel in ink
+    /// first (the outline), then the letters go on top in two flat tones.
     fn fat(&mut self, s: &str, x: f32, y: f32, pixel: f32, colour: u32) -> f32 {
         let lit = |ch: char, col: i32, row: i32| {
             (0..5).contains(&col) && (0..7).contains(&row) && glyph(ch)[row as usize] >> (4 - col) & 1 == 1
@@ -492,10 +474,10 @@ impl Hud {
                         }
                         let (px, py) = (x + ((i * 6) as i32 + col) as f32 * pixel, y + row as f32 * pixel);
                         if pass == 0 {
-                            self.rect(px - pixel, py - pixel, pixel * 3.0, pixel * 3.0, INK);
+                            self.rect(px - pixel * 0.6, py - pixel * 0.6, pixel * 2.2, pixel * 2.2, INK);
                         } else {
-                            let face = if lit(ch, col, row - 1) { colour } else { mix_white(colour, 0.5) };
-                            self.rect(px, py, pixel, pixel, face);
+                            // Lit on the upper four rows, shaded below: one hard band.
+                            self.rect(px, py, pixel, pixel, if row < 4 { colour } else { shade(colour) });
                         }
                     }
                 }
@@ -544,10 +526,6 @@ impl Hud {
             return;
         }
         for (x, y) in points {
-            let (x, y) = match self.tilt {
-                Some(((px, py), (sin, cos))) => (px + (x - px) * cos - (y - py) * sin, py + (x - px) * sin + (y - py) * cos),
-                None => (x, y),
-            };
             let pos = [x * self.scale / self.size.0 * 2.0 - 1.0, 1.0 - y * self.scale / self.size.1 * 2.0];
             self.verts.push(Vertex { pos, colour });
         }
@@ -581,13 +559,10 @@ fn pop(age: f32) -> f32 {
     }
 }
 
-/// `hex` blended towards white by `t`.
-fn mix_white(hex: u32, t: f32) -> u32 {
-    let c = |shift: u32| {
-        let v = ((hex >> shift) & 0xff) as f32;
-        ((v + (255.0 - v) * t).round() as u32) << shift
-    };
-    c(16) | c(8) | c(0)
+/// The shadow tone of a colour: darker and a touch warmer, like the world's cel bands.
+fn shade(hex: u32) -> u32 {
+    let c = |shift: u32, warm: f32| ((((hex >> shift) & 0xff) as f32 * (0.72 + warm)).min(255.0) as u32) << shift;
+    c(16, 0.02) | c(8, 0.0) | c(0, -0.06)
 }
 
 /// Width of `s` in virtual units: five font pixels per letter plus one of space.

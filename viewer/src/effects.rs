@@ -36,6 +36,9 @@ const MAX_BLOOD: usize = 512;
 const MAX_SPLATS: usize = 8192;
 
 const HINT: Vec3 = Vec3::new(1.0, 0.86, 0.35);
+/// Dash speed lines: near white with a cool tint, so they read against both
+/// grass and rock.
+const STREAK: Vec3 = Vec3::new(0.92, 0.97, 1.0);
 
 // Ammunition colours that are not part of the impact signature.
 const OLIVE: Vec3 = Vec3::new(0.31, 0.37, 0.20);
@@ -1350,6 +1353,33 @@ impl Effects {
         ));
     }
 
+    /// Speed lines for a dash: two thin bright streaks left behind the worm,
+    /// parallel to its travel, plus a puff of dust. `feet` is the worm's
+    /// position and `dir` its horizontal direction of travel. The caller spaces
+    /// the calls by distance run, so the density does not depend on the frame
+    /// rate. The streaks stay where they are spawned and thin out, so the worm
+    /// visibly outruns them: that is what reads as speed.
+    pub fn dash_streaks(&mut self, feet: Vec3, dir: Vec3) {
+        let side = dir.cross(Vec3::Y).normalize_or_zero();
+        // Deterministic jitter (no RNG, like every effect here), so the lines
+        // do not sit at the same height and length every time.
+        let seed = feet.x * 1.9 + feet.z * 1.3;
+        for k in 0..2 {
+            let s = seed + k as f32 * 2.4;
+            // One each side, outside the body, at different heights.
+            let lateral = if k == 0 { -1.0 } else { 1.0 } * (0.55 + 0.25 * s.sin().abs());
+            let height = 0.40 + 0.95 * (s * 1.7).sin().abs();
+            let from = feet + side * lateral + Vec3::Y * height - dir * 0.3;
+            let len = 1.3 + 0.9 * (s * 2.3).cos().abs();
+            let mut line = Effect::burst(Shape::Line { from, to: from - dir * len }, STREAK, 0.25)
+                .glow()
+                .inkless();
+            line.width = 0.022;
+            self.push_burst(line);
+        }
+        self.footstep(feet, dir);
+    }
+
     /// Leave an air trace behind the projectiles that should have one. Call
     /// this once per sim tick, not per frame: the trail is a record of where
     /// the shot has been, so it must not depend on the frame rate.
@@ -1839,6 +1869,15 @@ mod tests {
         assert_eq!(glow.len(), 1, "only the molten one glows");
         let brightness = |s: &Sprite| s.b[0] + s.b[1] + s.b[2];
         assert!(brightness(&body[0]) > brightness(&body[1]) * 2.0);
+    }
+
+    #[test]
+    fn a_dash_leaves_speed_lines_that_fade_away() {
+        let mut e = Effects::default();
+        e.dash_streaks(Vec3::new(5.0, 1.0, 5.0), Vec3::X);
+        assert_eq!(e.capsules().len(), 2, "two streaks per call");
+        e.update(1.0);
+        assert!(e.capsules().is_empty(), "they are gone after a moment");
     }
 
     #[test]

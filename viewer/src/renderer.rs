@@ -688,10 +688,50 @@ impl Renderer {
                 entry(1, tex3d(wgpu::TextureSampleType::Float { filterable: true })),
                 entry(2, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
                 entry(3, tex3d(wgpu::TextureSampleType::Uint)),
+                entry(4, tex3d(wgpu::TextureSampleType::Float { filterable: true })),
             ],
         });
         let sdf_view = sdf_tex.create_view(&Default::default());
-        let coarse_view = coarse_tex.create_view(&Default::default());        let march_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let coarse_view = coarse_tex.create_view(&Default::default());
+
+        // Which rock is indestructible, so the shader can paint it grey. It
+        // never changes, so it is uploaded once and not tracked as dirty.
+        let (solid_dims, solid_bytes) = grid.solid_blocks();
+        let solid_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("solid rock"),
+            size: wgpu::Extent3d {
+                width: solid_dims.x as u32,
+                height: solid_dims.y as u32,
+                depth_or_array_layers: solid_dims.z as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &solid_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &solid_bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(solid_dims.x as u32),
+                rows_per_image: Some(solid_dims.y as u32),
+            },
+            wgpu::Extent3d {
+                width: solid_dims.x as u32,
+                height: solid_dims.y as u32,
+                depth_or_array_layers: solid_dims.z as u32,
+            },
+        );
+        let solid_view = solid_tex.create_view(&Default::default());
+        let march_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("march bind group"),
             layout: &march_layout,
             entries: &[
@@ -699,6 +739,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sdf_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&coarse_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&solid_view) },
             ],
         });
         let march_pipeline = fullscreen_pipeline(

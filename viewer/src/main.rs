@@ -33,7 +33,7 @@ use local::LocalGame;
 use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
 use sim::weapons::{Kind, WHIP};
-use sim::{dig_target, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
+use sim::{dig_target, Action, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1525,6 +1525,16 @@ impl Viewer {
             for i in 0..self.game.replica.world.worms.len() {
                 let w = &self.game.replica.world.worms[i];
                 let speed = Vec3::new(w.vel.x, 0.0, w.vel.z).length();
+                // A dash leaves speed lines instead of footsteps, spaced by the
+                // distance run like the steps are.
+                if w.alive && w.action == Action::Dash && speed > 1.0 {
+                    self.step_dist[i] += speed * dt;
+                    if self.step_dist[i] >= 0.8 {
+                        self.step_dist[i] = 0.0;
+                        self.effects.dash_streaks(w.pos, Vec3::new(w.vel.x, 0.0, w.vel.z) / speed);
+                    }
+                    continue;
+                }
                 if !w.alive || !w.on_ground || w.digging || speed < 4.0 {
                     self.step_dist[i] = 0.0;
                     continue;

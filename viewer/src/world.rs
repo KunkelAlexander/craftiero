@@ -1,5 +1,6 @@
-// The demo map: rolling hills, a big cavern with pillars, tunnels up to the
-// surface and a few floating rocks. Everything is built from signed distances
+// The demo map: rolling hills, a big cavern with pillars, tunnels to far
+// chambers and up to the surface, floating rocks to grapple, and some grey
+// bedrock that nothing can dig. Everything is built from signed distances
 // (negative = rock) combined with min (add rock) and max(-x) (carve), the same
 // two moves the player makes with the brush.
 //
@@ -151,6 +152,94 @@ fn capsule(p: Vec3, a: Vec3, b: Vec3, r: f32) -> f32 {
     (p - (a + ab * t)).length() - r
 }
 
+/// Exact distance to a box with rounded edges (sharp corners would come out as
+/// sawteeth on 0.25 m voxels). `half` is the half-size including the rounding.
+fn slab(p: Vec3, c: Vec3, half: Vec3, round: f32) -> f32 {
+    let q = (p - c).abs() - (half - Vec3::splat(round));
+    q.max(Vec3::ZERO).length() + q.max_element().min(0.0) - round
+}
+
+/// Pillars that hold up the cavern roof: (x, z) of each column.
+const PILLARS: [(f32, f32); 4] = [(52.0, 52.0), (78.0, 56.0), (60.0, 78.0), (82.0, 78.0)];
+
+/// Round tunnels from the cavern out to chambers under the foothills:
+/// (from, to, radius). Each starts inside the cavern ellipsoid.
+const TUNNELS: [(Vec3, Vec3, f32); 5] = [
+    (Vec3::new(80.0, 9.0, 50.0), Vec3::new(106.0, 10.0, 24.0), 2.5),
+    (Vec3::new(84.0, 9.0, 76.0), Vec3::new(106.0, 11.0, 100.0), 2.5),
+    (Vec3::new(48.0, 9.0, 78.0), Vec3::new(22.0, 10.0, 102.0), 2.5),
+    // The southern corridor links the two far chambers without the cavern.
+    (Vec3::new(22.0, 10.0, 102.0), Vec3::new(64.0, 7.0, 114.0), 2.2),
+    (Vec3::new(64.0, 7.0, 114.0), Vec3::new(106.0, 11.0, 100.0), 2.2),
+];
+
+/// Chambers at the tunnels' far ends: (centre, radii).
+const CHAMBERS: [(Vec3, Vec3); 3] = [
+    (Vec3::new(106.0, 10.0, 24.0), Vec3::new(7.0, 6.0, 7.0)),
+    (Vec3::new(106.0, 11.0, 100.0), Vec3::new(8.0, 6.0, 8.0)),
+    (Vec3::new(22.0, 10.0, 102.0), Vec3::new(7.0, 6.0, 7.0)),
+];
+
+/// Shafts from each chamber up to the surface: (from, to, radius).
+const SHAFTS: [(Vec3, Vec3, f32); 3] = [
+    (Vec3::new(106.0, 10.0, 24.0), Vec3::new(92.0, 44.0, 38.0), 2.5),
+    (Vec3::new(106.0, 11.0, 100.0), Vec3::new(100.0, 44.0, 70.0), 2.5),
+    (Vec3::new(22.0, 10.0, 102.0), Vec3::new(34.0, 44.0, 92.0), 2.5),
+];
+
+/// Indestructible chokepoints: (index into TUNNELS, position along it 0..1).
+/// A grey disc of bedrock around the tunnel, so the passage through it cannot
+/// be widened and the rock around it is thick enough that going round is work.
+const GATES: [(usize, f32); 3] = [(0, 0.55), (1, 0.5), (2, 0.5)];
+const GATE_RADIUS: f32 = 7.5;
+const GATE_HALF_THICKNESS: f32 = 1.0;
+
+/// Free-floating rock spheres, grapple hook anchors: (centre, radius). Spaced
+/// so every one has another within the rope's 30 m, which lets a player swing
+/// across the valley from one to the next.
+const FLOATERS: [(Vec3, f32); 11] = [
+    (Vec3::new(30.0, 48.0, 80.0), 6.0),
+    (Vec3::new(64.0, 44.0, 18.0), 4.0),
+    (Vec3::new(44.0, 41.0, 30.0), 3.0),
+    (Vec3::new(80.0, 42.0, 52.0), 3.5),
+    (Vec3::new(50.0, 47.0, 58.0), 2.5),
+    (Vec3::new(28.0, 44.0, 56.0), 3.0),
+    (Vec3::new(96.0, 45.0, 68.0), 3.0),
+    (Vec3::new(78.0, 50.0, 92.0), 3.5),
+    (Vec3::new(58.0, 46.0, 90.0), 3.0),
+    (Vec3::new(104.0, 46.0, 60.0), 3.0),
+    (Vec3::new(14.0, 40.0, 40.0), 3.0),
+];
+
+/// Everything indestructible except the frame: pillars, a bridge across the
+/// cavern, a sky platform and a tall spire. The same function builds the
+/// shape and decides the material, so they cannot drift apart.
+fn bedrock(p: Vec3) -> f32 {
+    let mut d = f32::MAX;
+    for (x, z) in PILLARS {
+        d = d.min(capsule(p, Vec3::new(x, 0.0, z), Vec3::new(x, 18.0, z), 2.2));
+    }
+    // Walkway between two of the pillars, with a gap above it to the roof.
+    d = d.min(slab(p, Vec3::new(65.0, 11.0, 54.0), Vec3::new(13.0, 0.8, 1.8), 0.6));
+    // A bridge in the sky over the arena's middle, out of reach of the ground.
+    d = d.min(slab(p, Vec3::new(64.0, 42.0, 64.0), Vec3::new(10.0, 1.2, 4.0), 0.8));
+    // A landmark spire in the south-west, rising out of the frame's floor.
+    d = d.min(slab(p, Vec3::new(46.0, 25.0, 100.0), Vec3::new(2.5, 26.0, 2.5), 0.8));
+    d
+}
+
+/// True inside one of the gates' discs (the tunnel's own air is carved
+/// separately, so only the rock around it turns grey).
+fn in_gate(p: Vec3) -> bool {
+    GATES.iter().any(|&(i, t)| {
+        let (a, b, _) = TUNNELS[i];
+        let dir = (b - a).normalize();
+        let q = p - (a + (b - a) * t);
+        let along = q.dot(dir);
+        along.abs() < GATE_HALF_THICKNESS && (q - dir * along).length() < GATE_RADIUS
+    })
+}
+
 /// Signed distance to the indestructible frame: four walls and the floor,
 /// stopped `SKY_MARGIN` below the world's top face so the frame's own top face
 /// closes inside the grid. Negative inside the solid rock. The pieces are half-spaces, so
@@ -164,11 +253,12 @@ fn frame(p: Vec3) -> f32 {
     wall.min(floor).max(p.y - SKY_CEILING)
 }
 
-/// The material of the rock at `p`: the frame is `Solid` and everything else is
-/// ordinary, destructible `Rock`. Air gets whatever falls out of this; the
-/// grid only stores it where there is rock.
+/// The material of the rock at `p`: the frame, the bedrock shapes and the
+/// tunnel gates are `Solid` and everything else is ordinary, destructible
+/// `Rock`. Air gets whatever falls out of this; the grid only stores it where
+/// there is rock.
 fn material(p: Vec3) -> Material {
-    if frame(p) < 0.0 {
+    if frame(p) < 0.0 || bedrock(p) < 0.0 || in_gate(p) {
         Material::Solid
     } else {
         Material::Rock
@@ -191,18 +281,25 @@ pub fn terrain(p: Vec3) -> f32 {
     }
     // A long side tunnel, so there is something to fly through.
     cave = smin(cave, capsule(p, Vec3::new(40.0, 9.0, 64.0), Vec3::new(8.0, 16.0, 20.0), 3.0), 3.0);
+    // The far chambers with their tunnels and the shafts up to the surface.
+    for (c, radii) in CHAMBERS {
+        cave = smin(cave, ellipsoid(p, c, radii), 3.0);
+    }
+    for (a, b, r) in TUNNELS.into_iter().chain(SHAFTS) {
+        cave = smin(cave, capsule(p, a, b, r), 3.0);
+    }
     d = smax(d, -cave, 1.5);
 
-    // Pillars hold up the cavern roof.
-    for (x, z) in [(52.0, 52.0), (78.0, 56.0), (60.0, 78.0), (82.0, 78.0)] {
-        d = smin(d, capsule(p, Vec3::new(x, 0.0, z), Vec3::new(x, 18.0, z), 2.2), 1.5);
-    }
+    // Bedrock goes in after the carving, so no tunnel cuts through it. The
+    // soft min blends its feet into the surrounding rock.
+    d = smin(d, bedrock(p), 1.0);
 
-    // Floating rocks above the hills. The second one used to poke through the
-    // sky ceiling; it is lower now so its whole surface closes inside the grid.
-    d = d.min(sphere(p, Vec3::new(30.0, 48.0, 80.0), 6.0) * 0.8);
+    // Floating rocks above the hills. Every one stays below the sky ceiling so
+    // its whole surface closes inside the grid.
     d = d.min(ellipsoid(p, Vec3::new(98.0, 50.0, 34.0), Vec3::new(9.0, 3.5, 7.0)) * 0.8);
-    d = d.min(sphere(p, Vec3::new(64.0, 44.0, 18.0), 4.0) * 0.8);
+    for (c, r) in FLOATERS {
+        d = d.min(sphere(p, c, r));
+    }
 
     // The frame goes last: no cavern or tunnel carves it, and it reaches the
     // world edge so a worm can never leave the arena.
@@ -246,12 +343,45 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_and_gates_are_solid_and_the_tunnels_are_open() {
+        // The pillar, the cavern walkway, the sky bridge and the spire.
+        assert_eq!(material(Vec3::new(52.0, 9.0, 52.0)), Material::Solid, "pillar");
+        assert!(terrain(Vec3::new(52.0, 9.0, 52.0)) < 0.0);
+        assert_eq!(material(Vec3::new(65.0, 11.0, 54.0)), Material::Solid, "walkway");
+        assert!(terrain(Vec3::new(65.0, 11.0, 54.0)) < 0.0);
+        assert_eq!(material(Vec3::new(64.0, 42.0, 64.0)), Material::Solid, "sky bridge");
+        assert!(terrain(Vec3::new(64.0, 42.0, 64.0)) < 0.0);
+        assert_eq!(material(Vec3::new(46.0, 40.0, 100.0)), Material::Solid, "spire");
+        assert!(terrain(Vec3::new(46.0, 40.0, 100.0)) < 0.0);
+        // A gate's rim is solid; its axis is open air; rock beyond it is not.
+        let (a, b, _) = TUNNELS[0];
+        let (_, t) = GATES[0];
+        let centre = a + (b - a) * t;
+        assert!(terrain(centre) > 0.0, "the tunnel passes through the gate");
+        assert!(in_gate(centre + Vec3::Y * 5.0));
+        assert!(!in_gate(centre + Vec3::Y * 9.0), "the gate is a disc, not the whole mountain");
+        assert!(!in_gate(centre + (b - a).normalize() * 4.0));
+        // Every tunnel starts in the cavern and every chamber is open air.
+        for (a, _, _) in TUNNELS.iter().take(3) {
+            assert!(terrain(*a) > 0.0);
+        }
+        for (c, _) in CHAMBERS {
+            assert!(terrain(c) > 0.0, "chamber {c} is open");
+        }
+        // Floaters are rock and below the ceiling.
+        for (c, r) in FLOATERS {
+            assert!(terrain(c) < 0.0, "floater at {c} is rock");
+            assert!(c.y + r < SKY_CEILING, "floater at {c} closes inside the grid");
+        }
+    }
+
+    #[test]
     fn distance_is_never_overestimated() {
         // Grid::from_fn's shortcut relies on this: the field may not change
         // faster than one metre per metre walked. Check lines at several
         // heights through hills, rim, cavern, pillars and tunnels.
         let step = 0.1;
-        for (y, z) in [(9.0, 52.0), (30.0, 20.0), (6.0, 100.0), (48.0, 64.0), (20.0, 4.0)] {
+        for (y, z) in [(9.0, 52.0), (30.0, 20.0), (6.0, 100.0), (48.0, 64.0), (20.0, 4.0), (10.0, 102.0), (10.0, 24.0), (42.0, 100.0), (11.0, 54.0)] {
             let mut prev = terrain(Vec3::new(1.0, y, z));
             let mut x = 1.0 + step;
             while x < 127.0 {
