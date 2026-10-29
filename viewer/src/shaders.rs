@@ -547,10 +547,17 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, t_start: f32, t_end: f32, max_steps: i32,
         if (t >= t_end) { return -1.0; }
         let p = ro + rd * t;
         let c = clamp(vec3<i32>(floor(p / CHUNK_M)), vec3<i32>(0), CHUNKS - vec3<i32>(1));
-        let k = textureLoad(coarse_tex, c, 0).r;
-        if (k >= 2u) {
-            t += (f32(k) - 1.0) * CHUNK_M - VOX;
-            continue;
+        // Optimisation: the coarse fetch can only say "skip" in open air. If the
+        // last step measured under 0.9 m to the surface, this point is at most
+        // ~2.5 m from it (step <= 1.4 d), well inside the 4 m a skip needs, so
+        // the fetch is a wasted dependent read. Most steps run in that shell.
+        // `d` is 1.0 on entry and stays large across a skip, so open air still checks.
+        if (d >= 0.9) {
+            let k = textureLoad(coarse_tex, c, 0).r;
+            if (k >= 2u) {
+                t += (f32(k) - 1.0) * CHUNK_M - VOX;
+                continue;
+            }
         }
         d = map(p);
         let tol = eps + t * slope;
