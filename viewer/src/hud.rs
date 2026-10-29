@@ -17,6 +17,7 @@
 //! the same size relative to the window at any resolution.
 
 use crate::renderer::Gpu;
+use crate::touch::{self, Button, TouchControls};
 use sim::weapons::Kind;
 use sim::world::Worm;
 use sim::{Event, MAX_HP, WEAPONS};
@@ -29,7 +30,7 @@ fn rgb(hex: u32) -> Colour {
     [c(16), c(8), c(0), 1.0]
 }
 
-const MARGIN: f32 = 28.0;
+pub const MARGIN: f32 = 28.0;
 const SLOT_KEYS: &str = "1234567890-=[]\\";
 
 // Cel shading, like the world: every shape is one flat colour with a single
@@ -173,8 +174,10 @@ impl Hud {
         self.hp_age = (self.hp_age + dt).min(10.0);
     }
 
-    /// Paint the HUD for `worm` over `target` (the finished frame).
-    pub fn draw(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), worm: &Worm) {
+    /// Paint the HUD for `worm` over `target` (the finished frame). With
+    /// `touch` the weapon plate moves out from under the thumbs and the touch
+    /// controls are drawn on top.
+    pub fn draw(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), worm: &Worm, touch: Option<&TouchControls>) {
         self.size = (screen.0 as f32, screen.1 as f32);
         self.scale = self.size.1 / 720.0;
         let width = self.size.0 / self.scale;
@@ -186,8 +189,11 @@ impl Hud {
         }
         self.kills_and_deaths(worm);
         self.vitals(worm);
-        self.weapon(worm, width);
+        self.weapon(worm, width, if touch.is_some() { touch::WEAPON_PLATE_Y } else { 720.0 - MARGIN - 142.0 });
         self.reticle(width / 2.0);
+        if let Some(touch) = touch {
+            self.touch_controls(touch);
+        }
 
         gpu.queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.verts));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -250,8 +256,8 @@ impl Hud {
 
     /// Bottom right: the slot rail above a plate with the name, the ammo and
     /// one status line (ready, reloading, charging or melee).
-    fn weapon(&mut self, worm: &Worm, width: f32) {
-        let (x, y) = (width - MARGIN - 332.0, 720.0 - MARGIN - 142.0);
+    fn weapon(&mut self, worm: &Worm, width: f32, y: f32) {
+        let x = width - MARGIN - 332.0;
 
         // The rail: one slot per weapon, keyed like the keyboard. A blue mark
         // under a slot means it is reloading, a red one that it is empty.
@@ -321,6 +327,43 @@ impl Hud {
         self.label(&right, x + 316.0 - text_width(&right, 2.0), y + 106.0, colour);
         if let Some(progress) = progress {
             self.segments(x + 16.0, y + 126.0, 300.0, 6.0, 1, progress, colour);
+        }
+    }
+
+    /// The stick and the round buttons. Kept light (flat discs, one ink ring,
+    /// translucent while idle) so they do not hide the view; a pressed button
+    /// turns solid. Where each one is comes from `touch::buttons`, the same
+    /// function that hit-tests, so the picture cannot drift from the controls.
+    fn touch_controls(&mut self, touch: &TouchControls) {
+        let disc = |this: &mut Hud, x: f32, y: f32, r: f32, fill: u32, alpha: f32| {
+            let mut ring = rgb(INK);
+            ring[3] = alpha;
+            this.octagon_c(x - r - 3.0, y - r - 3.0, 2.0 * r + 6.0, 2.0 * r + 6.0, r * 0.45, ring);
+            let mut face = rgb(fill);
+            face[3] = alpha;
+            this.octagon_c(x - r, y - r, 2.0 * r, 2.0 * r, r * 0.4, face);
+        };
+        for b in touch::buttons(touch.width) {
+            let held = touch.held(b.button);
+            let (name, fill) = match b.button {
+                Button::Fire => ("FIRE", PANEL_RED),
+                Button::Dig => ("DIG", PANEL_ORANGE),
+                Button::Jump => ("JUMP", PANEL_GREY),
+                _ => ("ROPE", PANEL_GREY),
+            };
+            disc(self, b.x, b.y, b.r, fill, if held { 0.95 } else { 0.45 });
+            let pixel = if b.r > 80.0 { 4.0 } else { 3.0 };
+            self.fat(name, b.x - text_width(name, pixel) / 2.0, b.y - 3.5 * pixel, pixel, TEXT);
+        }
+        // The stick only exists while a thumb is on it.
+        if let Some(((sx, sy), (kx, ky))) = touch.stick() {
+            let reach = TouchControls::stick_radius();
+            disc(self, sx, sy, reach, PANEL_GREY, 0.22);
+            // The knob follows the thumb but stays on the ring.
+            let (dx, dy) = (kx - sx, ky - sy);
+            let len = dx.hypot(dy).max(1.0);
+            let k = len.min(reach) / len;
+            disc(self, sx + dx * k, sy + dy * k, 38.0, TEXT, 0.6);
         }
     }
 

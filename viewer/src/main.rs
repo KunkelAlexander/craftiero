@@ -22,6 +22,7 @@ mod hud;
 mod local;
 mod renderer;
 mod shaders;
+mod touch;
 mod world;
 mod worm_preview;
 mod worms;
@@ -43,7 +44,7 @@ use web_time::Instant;
 use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -572,7 +573,7 @@ fn run_shot(cfg: &Config, path: &str) {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     renderer.render(&mut encoder, &target.view, &params);
     if cfg.hud {
-        Hud::new(&gpu.device, Offscreen::FORMAT).draw(&gpu, &mut encoder, &target.view, cfg.size, &world.worms[0]);
+        Hud::new(&gpu.device, Offscreen::FORMAT).draw(&gpu, &mut encoder, &target.view, cfg.size, &world.worms[0], None);
     }
     gpu.queue.submit([encoder.finish()]);
     renderer.end_frame();
@@ -971,6 +972,8 @@ struct Viewer {
     fly: bool,
     camera: Camera,
     keys: HashSet<KeyCode>,
+    /// Phone controls; `active` once the first finger touches the screen.
+    touch: touch::TouchControls,
     /// How much of the cheat code has been typed so far (see `cheat_progress`).
     cheat: usize,
     lmb: bool,
@@ -1128,6 +1131,7 @@ impl Viewer {
             fly,
             camera,
             keys: HashSet::new(),
+            touch: touch::TouchControls::default(),
             cheat: 0,
             lmb: false,
             rmb: false,
@@ -1173,6 +1177,33 @@ impl Viewer {
         if !self.audio_started {
             self.audio_started = true;
             self.audio = Audio::new();
+        }
+    }
+
+    /// The next (`dir` = 1) or previous (-1) weapon in the arsenal: the mouse
+    /// wheel and the touch weapon plate.
+    fn cycle_weapon(&mut self, dir: i32) {
+        let n = ARSENAL.len() as i32;
+        let at = ARSENAL.iter().position(|&id| id == self.weapon).unwrap_or(0) as i32;
+        self.weapon = ARSENAL[(at + dir).rem_euclid(n) as usize];
+    }
+
+    /// One finger event from the touch screen (see `touch.rs`).
+    fn touch_event(&mut self, id: u64, phase: touch::Phase, pos: (f32, f32)) {
+        let first = !self.touch.active;
+        let screen = (self.surface_cfg.width, self.surface_cfg.height);
+        let reaction = self.touch.event(id, phase, pos, screen);
+        if first {
+            // A phone is far slower than a desktop GPU: start the (automatic)
+            // resolution low instead of letting it find its way down from 0.6.
+            self.renderer.set_scale(self.renderer.scale().min(0.5));
+        }
+        if self.fly {
+            return;
+        }
+        self.camera.look(reaction.look.0, reaction.look.1);
+        if reaction.next_weapon {
+            self.cycle_weapon(1);
         }
     }
 
@@ -1392,19 +1423,29 @@ impl Viewer {
         // the player is actually looking through. Re-posing it at the worm's
         // current position would put the shot where the reticle is not.
         let aim_cam = self.camera;
+        // Touch has no pointer lock, so its buttons skip the `grabbed` check the
+        // mouse needs. The keyboard and the touch controls are OR-ed together so
+        // a laptop with a touch screen keeps working either way.
+        let live = self.grabbed;
+        let touch = &self.touch;
+        let tap = |b| touch.active && touch.held(b);
+        let mut move_dir = Vec2::new(axis(KeyCode::KeyD, KeyCode::KeyA), axis(KeyCode::KeyW, KeyCode::KeyS));
+        if touch.active && move_dir == Vec2::ZERO {
+            move_dir = touch.move_dir();
+        }
         Input {
             seq: 0, // set per tick in `update`
-            move_dir: Vec2::new(axis(KeyCode::KeyD, KeyCode::KeyA), axis(KeyCode::KeyW, KeyCode::KeyS)),
+            move_dir,
             yaw: self.camera.yaw,
             pitch: self.camera.pitch,
             // The camera is off the look ray, so tell the sim where the
             // crosshair actually is (see `crosshair_aim`).
             aim: crosshair_aim(&self.game.replica.world.grid, &aim_cam, worm.eye()),
-            jump: held(KeyCode::Space),
-            dig: self.grabbed && held(KeyCode::ShiftLeft),
-            rope: self.grabbed && self.rmb,
+            jump: held(KeyCode::Space) || tap(touch::Button::Jump),
+            dig: (live && held(KeyCode::ShiftLeft)) || tap(touch::Button::Dig),
+            rope: (live && self.rmb) || tap(touch::Button::Rope),
             reel: axis(KeyCode::KeyE, KeyCode::KeyQ),
-            fire: self.grabbed && self.lmb,
+            fire: (live && self.lmb) || tap(touch::Button::Fire),
             weapon: self.weapon,
         }
     }
@@ -1790,7 +1831,8 @@ impl Viewer {
         // The free camera is a debug view, not a worm's: no worm HUD there.
         if !self.fly {
             let screen = (self.surface_cfg.width, self.surface_cfg.height);
-            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.game.replica.world.worms[self.me()]);
+            let touch = self.touch.active.then_some(&self.touch);
+            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.game.replica.world.worms[self.me()], touch);
         }
         self.gpu.queue.submit([encoder.finish()]);
         self.renderer.end_frame();
@@ -1991,10 +2033,20 @@ impl ApplicationHandler<Viewer> for App {
                     v.brush_radius = (v.brush_radius * 1.12f32.powf(lines)).clamp(0.5, 8.0);
                 } else if lines != 0.0 {
                     // Scrolling up is the next weapon.
-                    let n = ARSENAL.len() as i32;
-                    let at = ARSENAL.iter().position(|&id| id == v.weapon).unwrap_or(0) as i32;
-                    v.weapon = ARSENAL[(at + if lines > 0.0 { 1 } else { -1 }).rem_euclid(n) as usize];
+                    v.cycle_weapon(if lines > 0.0 { 1 } else { -1 });
                 }
+            }
+            WindowEvent::Touch(t) => {
+                // The browser only lets sound start from a user gesture.
+                if t.phase == TouchPhase::Started {
+                    v.start_audio();
+                }
+                let phase = match t.phase {
+                    TouchPhase::Started => touch::Phase::Down,
+                    TouchPhase::Moved => touch::Phase::Move,
+                    TouchPhase::Ended | TouchPhase::Cancelled => touch::Phase::Up,
+                };
+                v.touch_event(t.id, phase, (t.location.x as f32, t.location.y as f32));
             }
             WindowEvent::RedrawRequested => v.frame(event_loop),
             _ => {}

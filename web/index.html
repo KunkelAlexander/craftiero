@@ -2,14 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <title>craftiero</title>
 <meta name="description" content="craftiero: a 3D worm shooter with fully destructible terrain, running in your browser.">
 <link rel="icon" type="image/svg+xml" href="logo.svg">
 <style>
-  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
-  /* winit sizes its drawing buffer from this box (times devicePixelRatio). */
-  #game { display: block; width: 100vw; height: 100vh; outline: none; }
+  /* overscroll-behavior stops pull-to-refresh from firing during a look drag. */
+  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; overscroll-behavior: none; }
+  /* winit sizes its drawing buffer from this box (times devicePixelRatio).
+     touch-action: none hands every finger to the game: no scroll, no pinch zoom. */
+  #game {
+    display: block; width: 100vw; height: 100vh; outline: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
   #msg {
     position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
     justify-content: center; gap: 6px; padding: 16px; text-align: center; color: #cfd6e4;
@@ -27,6 +32,17 @@
     text-shadow: 0 5px 0 #6b2f0c;
   }
   #status { max-width: 34em; margin-top: 12px; color: #9fa9bd; font-size: 15px; }
+  /* The touch layout is built for two thumbs in landscape. A page cannot force
+     the orientation (the lock API needs fullscreen and iOS has none), so on a
+     portrait phone this covers the game and asks for a turn. */
+  #rotate {
+    display: none; position: fixed; inset: 0; z-index: 10; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px; text-align: center;
+    background: #0b0d12; color: #cfd6e4; font: 18px/1.5 system-ui, sans-serif;
+  }
+  #rotate svg { width: 72px; height: 72px; animation: turn 2.4s ease-in-out infinite; }
+  @keyframes turn { 0%, 30% { transform: rotate(0); } 70%, 100% { transform: rotate(-90deg); } }
+  @media (orientation: portrait) and (pointer: coarse) { #rotate { display: flex; } }
   #hint {
     position: fixed; left: 0; right: 0; bottom: 12px; text-align: center; color: #cfd6e4aa;
     font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
@@ -40,11 +56,25 @@
   <h1 id="name">craftiero</h1>
   <div id="status">Loading...</div>
 </div>
-<div id="hint">Click to play &middot; WASD move &middot; mouse aim &middot; LMB fire &middot; Space jump &middot; Esc release mouse &middot; M mute</div>
+<div id="rotate">
+  <svg viewBox="0 0 24 24" fill="none" stroke="#ffb347" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
+    <rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 18.5h2" stroke-linecap="round"/>
+  </svg>
+  <div>Turn your phone sideways to play</div>
+</div>
+<div id="hint">Click to play &middot; WASD move &middot; mouse aim &middot; LMB fire &middot; RMB rope &middot; Shift dig &middot; Space jump &middot; Esc release mouse &middot; M mute</div>
 <script type="module">
   const msg = document.getElementById("msg");
   const status = document.getElementById("status");
   const say = (text) => { status.textContent = text; msg.classList.remove("hidden"); };
+
+  // On a phone the keyboard hint is useless: say what the thumbs do instead, and
+  // hide it after the first touch (the controls are drawn by the game itself).
+  const hint = document.getElementById("hint");
+  if (matchMedia("(pointer: coarse)").matches) {
+    hint.textContent = "Left thumb: move · right thumb: look · hold FIRE or DIG and drag to aim at the same time · tap the weapon to switch";
+    addEventListener("touchstart", () => hint.remove(), { once: true, passive: true });
+  }
 
   // The renderer ray-marches a 3D texture and reads storage buffers in fragment
   // shaders, which WebGL2 cannot do, so WebGPU is a hard requirement.

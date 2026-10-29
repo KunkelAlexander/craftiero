@@ -339,6 +339,41 @@ remaining cost to watch is fill rate: every visible mark is a quad, so a camera
 pressed into a floor covered in hundreds of overlapping stains will pay for that
 overdraw.
 
+### 12. Explosions hitched the sim: `Grid::apply` evaluated voxels that cannot change
+
+*Symptom.* A throwaway headless run of the sim (four worms moving and firing
+every weapon in turn, 1800 ticks, no renderer) had a median tick of 0.03-0.1 ms
+but a 99th percentile of 8-19 ms and a worst tick of 15-50 ms. The slow ticks
+were the ones with an explosion. A 60 Hz frame has 16.7 ms, and the local game
+applies every edit twice (host, then the replica), so one Nova is two of them.
+
+*Why.* `apply` evaluated the shape's distance (a square root) for all 4096
+voxels of every chunk near the shape, and about 80% of them are nowhere near the
+surface: too far away to change, or deep inside the hole.
+
+**Optimisation 12: look at the shape once per 4-voxel segment.** A distance
+field changes by at most as much as you move, so one evaluation at a segment's
+middle proves the segment is out of reach (skip it) or, for a carve away from
+solid rock, deep inside the hole (write air without evaluating). Only segments
+in the shell take the old per-voxel path. `Cylinder` always takes the old path,
+because its distance is not 1-Lipschitz. The result is byte-identical:
+`apply_matches_the_per_voxel_reference` runs every shape and op against the old
+loop, and the world checksum after the 1800-tick run is the same before and
+after (`500df666d5dd3fbe`).
+
+Alternating runs of the old and new binary (same machine state), `sdf` bench:
+
+| Edit | before | after |
+|---|---|---|
+| carve r = 3 m (a rocket) | 1.9-2.2 ms | 1.4-1.5 ms (-25%) |
+| carve r = 8 m (a Nova) | 17.5-18.7 ms | 10.4-10.9 ms (-40%) |
+| sim tick, 99th percentile (profile run) | 8.0-8.4 ms | 5.7-6.5 ms (-30%) |
+
+The absolute numbers are about 4x the ones in section 10 because this run was
+made while a background python process held a core (see section 9); the ratios
+are what to read. Not fixed: a Nova is still about 10 ms here, spent in the
+shell voxels that really must be evaluated.
+
 ## What did not help (so nobody repeats it)
 
 
@@ -349,6 +384,9 @@ overdraw.
 | Shadow rays capped at 48 steps | thin light slivers in long shadows; saving unmeasurable. 128 kept. |
 | A per-capsule bounding-sphere early-out inside the per-pixel loop | 9.8 -> 8.0 ms worm cost: the loop itself was the cost (section 8). Kept, it is cheap, but the tile masks are what fixed it. |
 | Rewrite `Grid::apply` to own each chunk once instead of a lookup per voxel (M3) | 4.2 -> 4.0 ms for r = 8 m, 0.46 -> 0.43 ms for r = 3 m. Reverted: the per-voxel maths is the cost (section 10). |
+| `dequantize` as a 256-entry compile-time table instead of a division (section 12) | no change in `Grid::apply` or `sample` within noise. Reverted. |
+| `quantize` with `floor(x + 0.5)` instead of `round()` (timing experiment only, not bit-identical) | no change in `Grid::apply`. Not kept. |
+| Skip the three bloom passes when nothing is emissive | not done: every weapon model has glowing parts (`worms.rs`), so something emissive is nearly always in the frame. |
 | Treat the benchmark's single averages as precise | the machine's clock varied 2x between identical runs, so the bench now reports the best of three batches. |
 
 ## Where the time still goes, and what is next
@@ -402,6 +440,11 @@ What differs from native, and why:
   the dev laptop does expose timestamps, so the GPU-time path ran there.
 - **Audio** opens on the first click or key (browsers keep an `AudioContext`
   suspended before that).
+- **Touch** (`viewer/src/touch.rs`): the first finger on the canvas turns on the
+  phone controls (floating stick, look drag, FIRE/DIG hold buttons that also
+  steer, JUMP, ROPE, tap the weapon plate to switch) and drops the starting
+  resolution to 0.5; auto-res then adjusts as usual. Untested on a real phone so
+  far: look gain (`LOOK_GAIN`), button sizes and frame rate need tuning there.
 
 Measured (Chrome, Intel UHD gen-9, 1554x753 canvas, auto-res settled at 40%):
 17-55 fps, varying a lot between runs and within one (the iGPU drifts, see "How

@@ -36,6 +36,11 @@ const SCALE: f32 = 127.0 / BAND_VOX;
 /// Metres beyond which a shape cannot change any stored value.
 pub const BAND: f32 = BAND_VOX * VOX;
 
+/// Voxels per segment in `Grid::apply`'s skip test, and how far (metres) a
+/// voxel of a segment can be from the segment's middle: 1.5 voxels, rounded up.
+const SEGMENT: i32 = 4;
+const SEGMENT_SLACK: f32 = 0.4;
+
 fn quantize(metres: f32) -> i8 {
     (metres / VOX * SCALE).round().clamp(-127.0, 127.0) as i8
 }
@@ -398,6 +403,12 @@ impl Grid {
     /// +, -, *, min, max, sqrt on f32, so the host and a client applying the
     /// same edit get the same bytes (checked by a test).
     pub fn apply(&mut self, shape: Shape, op: Op) {
+        self.apply_with(shape, op, true);
+    }
+
+    /// `apply`, with the segment shortcuts switchable so a test can compare
+    /// them against the plain per-voxel loop.
+    fn apply_with(&mut self, shape: Shape, op: Op, shortcuts: bool) {
         let reach = BAND + op.extra_reach();
         let (min, max) = shape.bounds();
         let lo = ((min - Vec3::splat(reach)) / VOX).floor().as_ivec3().max(IVec3::ZERO);
@@ -429,51 +440,94 @@ impl Grid {
                         })
                     });
                     let clamp_solid = near_solid && matches!(op, Op::Carve);
+                    // Optimisation: most voxels of a touched chunk are nowhere
+                    // near the shape. Evaluating the shape's distance (a square
+                    // root each) for all 4096 was the cost of an explosion. So
+                    // look at the shape once per segment of `SEGMENT` voxels, at
+                    // its middle. A distance field changes by at most as much as
+                    // you move, so the whole segment is then known to be out of
+                    // reach (nothing changes) or, for a carve, deep inside the
+                    // hole (all air) without touching its voxels one by one.
+                    // Only the segments crossing the shell pay the full price.
+                    // The results are identical to the per-voxel loop: a test
+                    // (`apply_matches_the_per_voxel_reference`) checks it.
+                    // `Cylinder`'s distance is not 1-Lipschitz (see shape.rs),
+                    // so it always takes the exact path.
+                    let can_skip = shortcuts && !matches!(shape, Shape::Cylinder { .. });
+                    // Deep inside, a carve writes air whatever was there. The
+                    // solid-rock rules below need the per-voxel path, so this is
+                    // only for chunks with no solid rock in or next to them.
+                    let can_flood = can_skip && matches!(op, Op::Carve) && !near_solid;
                     let mut changed_lo = IVec3::splat(i32::MAX);
                     let mut changed_hi = IVec3::splat(i32::MIN);
                     for z in v_lo.z..=v_hi.z {
                         for y in v_lo.y..=v_hi.y {
-                            for x in v_lo.x..=v_hi.x {
-                                let v = IVec3::new(x, y, z);
-                                let old = self.voxel(v);
-                                let d_shape = shape.distance(v.as_vec3() * VOX);
-                                let mut new = quantize(op.combine(dequantize(old), d_shape));
-                                if new == old {
-                                    continue;
+                            let mut seg = v_lo.x;
+                            while seg <= v_hi.x {
+                                let seg_end = (seg + SEGMENT - 1).min(v_hi.x);
+                                if can_skip {
+                                    let mid = Vec3::new((seg + seg_end) as f32 * 0.5, y as f32, z as f32) * VOX;
+                                    let d_mid = shape.distance(mid);
+                                    if d_mid - SEGMENT_SLACK >= reach {
+                                        seg = seg_end + 1;
+                                        continue;
+                                    }
+                                    if can_flood && d_mid + SEGMENT_SLACK <= -BAND {
+                                        for x in seg..=seg_end {
+                                            let v = IVec3::new(x, y, z);
+                                            if self.voxel(v) != 127 {
+                                                self.set_voxel(v, 127);
+                                                changed_lo = changed_lo.min(v);
+                                                changed_hi = changed_hi.max(v);
+                                            }
+                                        }
+                                        seg = seg_end + 1;
+                                        continue;
+                                    }
                                 }
-                                // Solid terrain is the arena's frame: the shaped
-                                // hole stops at its face instead of cutting
-                                // through. Checked after `new == old` so chunks
-                                // of solid rock that the shape does not reach
-                                // cost only the distance test.
-                                if self.material_voxel(v).is_solid() {
-                                    continue;
-                                }
-                                // Carving air raises the stored distance to the
-                                // shape's own boundary. A solid voxel closer than
-                                // that boundary is still there, so keep the
-                                // smaller distance (see `solid_distance`).
-                                if clamp_solid && new > old {
-                                    let want = dequantize(new);
-                                    if want > 0.0 {
-                                        if let Some(d) = self.solid_distance(v, want) {
-                                            if d < want {
-                                                new = quantize(d);
-                                                if new == old {
-                                                    continue;
+                                for x in seg..=seg_end {
+                                    let v = IVec3::new(x, y, z);
+                                    let old = self.voxel(v);
+                                    let d_shape = shape.distance(v.as_vec3() * VOX);
+                                    let mut new = quantize(op.combine(dequantize(old), d_shape));
+                                    if new == old {
+                                        continue;
+                                    }
+                                    // Solid terrain is the arena's frame: the shaped
+                                    // hole stops at its face instead of cutting
+                                    // through. Checked after `new == old` so chunks
+                                    // of solid rock that the shape does not reach
+                                    // cost only the distance test.
+                                    if self.material_voxel(v).is_solid() {
+                                        continue;
+                                    }
+                                    // Carving air raises the stored distance to the
+                                    // shape's own boundary. A solid voxel closer than
+                                    // that boundary is still there, so keep the
+                                    // smaller distance (see `solid_distance`).
+                                    if clamp_solid && new > old {
+                                        let want = dequantize(new);
+                                        if want > 0.0 {
+                                            if let Some(d) = self.solid_distance(v, want) {
+                                                if d < want {
+                                                    new = quantize(d);
+                                                    if new == old {
+                                                        continue;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                    self.set_voxel(v, new);
+                                    // Every change counts, even far from the surface:
+                                    // the raymarcher steps by the stored distance, so a
+                                    // stale value deep in air would make rays overshoot.
+                                    // (The Surface Nets mesh alone only needs voxels within
+                                    // ~2 of the surface.)
+                                    changed_lo = changed_lo.min(v);
+                                    changed_hi = changed_hi.max(v);
                                 }
-                                self.set_voxel(v, new);
-                                // Every change counts, even far from the surface:
-                                // the raymarcher steps by the stored distance, so a
-                                // stale value deep in air would make rays overshoot.
-                                // (The Surface Nets mesh alone only needs voxels within
-                                // ~2 of the surface.)
-                                changed_lo = changed_lo.min(v);
-                                changed_hi = changed_hi.max(v);
+                                seg = seg_end + 1;
                             }
                         }
                     }
@@ -840,6 +894,47 @@ mod tests {
         let after = g.sample(probe);
         assert!(after < before + 0.15, "the floor is still the nearest surface: {before} -> {after}");
         assert!(g.sample(Vec3::new(8.0, 3.9, 8.0)) < 0.0, "the floor is still there");
+    }
+
+    // The segment shortcuts in `apply` must be a pure speed-up: every shape and
+    // op, near solid rock and near the world's edge, gives the same bytes and
+    // dirties the same chunks as the per-voxel loop.
+    #[test]
+    fn apply_matches_the_per_voxel_reference() {
+        let make = || {
+            Grid::from_fn_material(
+                IVec3::new(8, 4, 8),
+                |p| p.y - (12.0 + 3.0 * (p.x * 0.3).sin()) * 0.5,
+                |p| if p.y < 3.0 || p.x < 3.0 { Material::Solid } else { Material::Rock },
+            )
+        };
+        let (mut fast, mut slow) = (make(), make());
+        let dir = Vec3::new(0.3, -0.8, 0.5).normalize();
+        let mut edits = Vec::new();
+        for i in 0..40 {
+            let f = i as f32;
+            let c = Vec3::new(4.0 + (f * 7.3) % 28.0, 2.0 + (f * 3.1) % 10.0, 1.0 + (f * 5.9) % 30.0);
+            let shape = match i % 6 {
+                0 => Shape::Sphere { center: c, radius: 1.0 + (f * 0.37) % 7.0 },
+                1 => Shape::Capsule { a: c, b: c + Vec3::new(3.0, 0.5, 2.0), radius: 1.5 },
+                2 => Shape::Box { centre: c, half: Vec3::new(2.0, 1.5, 0.4), yaw: f * 0.7 },
+                3 => Shape::Blade { a: c, b: c + Vec3::X * 2.0, dir, depth: 1.5, half_thickness: 0.25 },
+                4 => Shape::Cylinder { a: c, b: c + Vec3::X * 2.0, axis: Vec3::Y, radius: 1.2, half_height: 0.4 },
+                _ => Shape::Sphere { center: c, radius: 8.0 },
+            };
+            let op = match i % 5 {
+                0 | 1 | 2 => Op::Carve,
+                3 => Op::Add,
+                _ => Op::Smooth(0.5),
+            };
+            edits.push((shape, op));
+        }
+        for (shape, op) in edits {
+            fast.apply_with(shape, op, true);
+            slow.apply_with(shape, op, false);
+            assert_eq!(fast.take_dirty(), slow.take_dirty(), "dirty chunks for {shape:?}");
+            assert_eq!(fast.checksum(), slow.checksum(), "bytes after {shape:?} {op:?}");
+        }
     }
 
     #[test]
