@@ -12,7 +12,7 @@ use sim::weapons::{
     BLASTER, BOMB, BOUNCER, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, SWARM, TELEPORT, TRACTOR, WEAPONS, WHIP,
 };
 use sim::{whip_arc, whip_dir, whip_reach, Action, WhipStyle, Worm, WHIP_REST, WHIP_SWING_TIME, WORM_HEIGHT};
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
 /// How tall the preview sculpt is, in its own units. The game worm is 1.8 m;
 /// the SDF is scaled by `WORM_HEIGHT / SDF_MODEL` so it fills the same box.
@@ -76,7 +76,19 @@ pub struct Anim {
     /// flinch are drawn from this; the sim already moved the body.
     hurt: f32,
     hurt_damage: f32,
+    /// How far the torso is currently turned from the feet towards the aim,
+    /// radians (positive is the same way as `face_yaw` grows). It chases the
+    /// aim instead of copying it, so a flick of the mouse does not snap the body.
+    aim_twist: f32,
 }
+
+/// The most the torso turns away from the feet to follow the aim (about 70
+/// degrees); past it the shoulders stop and only the arm and eyes keep going.
+/// A worm folded further back would clip its own gun.
+const AIM_TWIST_MAX: f32 = 1.2;
+/// How quickly the torso catches up, per second. Higher is snappier; 14 closes
+/// most of a gap in about a tenth of a second.
+const AIM_TWIST_RATE: f32 = 14.0;
 
 /// How long a hit flashes white, and how long the body keeps flinching. The
 /// flash is deliberately shorter than a sim tick's worth of reaction: it reads
@@ -103,6 +115,7 @@ impl Default for Anim {
             rope: Rope::default(),
             hurt: 10.0,
             hurt_damage: 0.0,
+            aim_twist: 0.0,
         }
     }
 }
@@ -919,11 +932,30 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
             DrawPrim::capsule(a, b, radius, colour, shadow)
         };
 
-        let (face, right) = basis(worm.face_yaw);
         let aim = worm.aim_dir();
-        // The aim expressed in the body's own frame, so the eyes and gun turn
-        // with the body while still following the mouse.
-        let look = Vec3::new(aim.dot(right), aim.dot(Vec3::Y), aim.dot(face)).normalize_or_zero();
+        // The torso turns towards the aim while the feet keep the movement
+        // direction. The target is the aim's yaw relative to the body, wrapped
+        // to -pi..pi so aiming just behind the left shoulder does not spin the
+        // long way round. Aiming almost straight up or down has no meaningful
+        // yaw, so the target fades out there. Flips and tumbles keep the body
+        // rigid. Pattern: Easing, a chase instead of a copy.
+        let spinning = matches!(worm.action, Action::DoubleJump | Action::Tumble);
+        let target = if spinning {
+            0.0
+        } else {
+            let off = (aim.x.atan2(aim.z) - worm.face_yaw + PI).rem_euclid(TAU) - PI;
+            let flat = Vec3::new(aim.x, 0.0, aim.z).length();
+            off.clamp(-AIM_TWIST_MAX, AIM_TWIST_MAX) * (flat / 0.3).clamp(0.0, 1.0)
+        };
+        anim.aim_twist += (target - anim.aim_twist) * (1.0 - (-AIM_TWIST_RATE * dt.clamp(0.0, 0.1)).exp());
+        if let Some(slot) = anims.get_mut(i) {
+            slot.aim_twist = anim.aim_twist; // `anim` is a copy; keep the eased value
+        }
+        // The aim expressed in the torso's own frame (feet frame plus twist), so
+        // the eyes and gun turn with the shoulders while still following the
+        // mouse exactly: the rig applies the same twist when it draws them.
+        let (face, right) = basis(worm.face_yaw + anim.aim_twist);
+        let look =Vec3::new(aim.dot(right), aim.dot(Vec3::Y), aim.dot(face)).normalize_or_zero();
 
         let speed = worm.forward_vel.abs();
         let run = (speed / 11.0).clamp(0.0, 1.0);
@@ -955,6 +987,7 @@ pub fn draw(worms: &[Worm], positions: &[Vec3], anims: &mut [Anim], dt: f32) -> 
         };
 
         let mut pose = Pose::default();
+        pose.twist = anim.aim_twist;
         pose.lean = match action {
             Action::Climb => 0.45,
             Action::Rope => -0.08,
@@ -1648,6 +1681,25 @@ mod tests {
                 assert!(sane(c), "{action:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_torso_turns_towards_the_aim_but_not_past_the_cap() {
+        let settle = |face_yaw: f32, aim_yaw: f32| {
+            let mut w = worm(Action::Idle, true);
+            w.face_yaw = face_yaw;
+            w.yaw = aim_yaw;
+            let mut anim = Anim::default();
+            capsules_after(&w, &mut anim, 120);
+            anim.aim_twist
+        };
+        assert!(settle(0.0, 0.0).abs() < 1.0e-3, "aiming ahead needs no twist");
+        let small = settle(0.0, 0.5);
+        assert!((small - 0.5).abs() < 0.02, "a small offset is followed fully: {small}");
+        assert!((settle(0.0, 2.5) - AIM_TWIST_MAX).abs() < 1.0e-3, "a big offset stops at the cap");
+        assert!(settle(0.0, -2.5) < -AIM_TWIST_MAX + 1.0e-3);
+        // Aiming just behind the left shoulder must wrap, not spin the long way.
+        assert!(settle(3.0, -3.0) > 0.0);
     }
 
     #[test]

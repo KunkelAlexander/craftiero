@@ -32,18 +32,22 @@ fn rgb(hex: u32) -> Colour {
 const MARGIN: f32 = 28.0;
 const SLOT_KEYS: &str = "1234567890-=[]\\";
 
-const BRASS: u32 = 0xc99a55;
-const BRASS_LIGHT: u32 = 0xe6c07e;
-const PLATE: u32 = 0x1a1b10;
-const TRACK: u32 = 0x0b0c07;
-const TEXT: u32 = 0xf8ecd0;
-const MUTED: u32 = 0xd3c59f;
-const GOLD: u32 = 0xf4cc60;
-const WARN: u32 = 0xf4b043;
+// The comic look: every panel is a bright sticker with a fat black outline, a
+// hard drop shadow and a slight tilt; numbers are white (or hot) with their own
+// outline. The same ink colour outlines the damage numbers in `cartoon`.
+const INK: u32 = 0x0b0905;
+const TEXT: u32 = 0xffffff;
+const TRACK: u32 = 0x4a3a2e;
+const GOLD: u32 = 0xffe14a;
+const WARN: u32 = 0xff9a2a;
 const DANGER: u32 = 0xff6a4a;
-const READY: u32 = 0xb9dc7a;
-const RELOAD: u32 = 0x9ab5d6;
-const CHARGE: u32 = 0xffa43c;
+const PANEL_BLUE: u32 = 0x3f8fe0;
+const PANEL_GREEN: u32 = 0x4fbf3a;
+const PANEL_RED: u32 = 0xe5432f;
+const PANEL_GREY: u32 = 0x8a8a8a;
+const PANEL_ORANGE: u32 = 0xf0a030;
+const READY: u32 = 0xd8ffb0;
+const RELOAD: u32 = 0xcfe8ff;
 
 const MAX_VERTS: usize = 3 * 10_000;
 
@@ -59,7 +63,6 @@ struct Vertex {
 #[derive(Default)]
 struct Marker {
     seconds: f32,
-    damage: f32,
     kill: bool,
     /// Damage summed over a run of hits: each hit within `COMBO_WINDOW` of the
     /// last adds to it, so a shotgun blast or a burst reads as one number.
@@ -85,6 +88,11 @@ pub struct Hud {
     scale: f32,
     marker: Marker,
     taken: Taken,
+    /// While set, every triangle is rotated about a point: one panel's tilt.
+    tilt: Option<((f32, f32), (f32, f32))>,
+    /// The HP number bounces whenever the value changes (hit, heal, respawn).
+    hp_seen: f32,
+    hp_age: f32,
 }
 
 impl Hud {
@@ -133,7 +141,12 @@ impl Hud {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Hud { pipeline, buffer, verts: Vec::new(), size: (1.0, 1.0), scale: 1.0, marker: Marker::default(), taken: Taken::default() }
+        Hud { pipeline, buffer, verts: Vec::new(), size: (1.0, 1.0), scale: 1.0, marker: Marker::default(),
+            taken: Taken::default(),
+            tilt: None,
+            hp_seen: MAX_HP,
+            hp_age: 10.0,
+        }
     }
 
     /// Feed it the sim's events. Only hits dealt or taken by the player matter
@@ -146,7 +159,7 @@ impl Hud {
             }
             Event::Hit { victim, damage, .. } if victim != me => {
                 let total = if self.marker.total_seconds > 0.0 { self.marker.total + damage } else { damage };
-                self.marker = Marker { seconds: 0.3, damage, kill: false, total, total_seconds: COMBO_WINDOW };
+                self.marker = Marker { seconds: 0.3, kill: false, total, total_seconds: COMBO_WINDOW };
             }
             // `Died` follows the final `Hit` in the same tick: upgrade the marker.
             Event::Died { victim, killer, .. } if killer == me && victim != me => {
@@ -162,6 +175,7 @@ impl Hud {
         self.marker.seconds = (self.marker.seconds - dt).max(0.0);
         self.marker.total_seconds = (self.marker.total_seconds - dt).max(0.0);
         self.taken.seconds = (self.taken.seconds - dt).max(0.0);
+        self.hp_age = (self.hp_age + dt).min(10.0);
     }
 
     /// Paint the HUD for `worm` over `target` (the finished frame).
@@ -170,6 +184,11 @@ impl Hud {
         self.scale = self.size.1 / 720.0;
         let width = self.size.0 / self.scale;
         self.verts.clear();
+        let hp = worm.hp.round();
+        if hp != self.hp_seen {
+            self.hp_seen = hp;
+            self.hp_age = 0.0;
+        }
         self.kills_and_deaths(worm);
         self.vitals(worm);
         self.weapon(worm, width);
@@ -199,12 +218,14 @@ impl Hud {
     /// Top left: `KILLS 4 | DEATHS 2`.
     fn kills_and_deaths(&mut self, worm: &Worm) {
         let (x, y) = (MARGIN, MARGIN);
-        self.plate(x, y, 270.0, 44.0, BRASS);
-        let end = self.text("KILLS", x + 16.0, y + 15.0, 2.0, BRASS_LIGHT);
-        let end = self.text(&worm.kills.to_string(), end + 8.0, y + 12.0, 3.0, TEXT);
-        self.rect(end + 14.0, y + 10.0, 2.0, 24.0, BRASS);
-        let end = self.text("DEATHS", end + 30.0, y + 15.0, 2.0, 0xd9a07e);
-        self.text(&worm.deaths.to_string(), end + 8.0, y + 12.0, 3.0, TEXT);
+        self.tilted(x, y, 270.0, 44.0, -0.035);
+        self.plate(x, y, 270.0, 44.0, PANEL_BLUE);
+        let end = self.label("KILLS", x + 16.0, y + 15.0, TEXT);
+        let end = self.fat(&worm.kills.to_string(), end + 8.0, y + 12.0, 3.0, TEXT);
+        self.rect(end + 14.0, y + 10.0, 3.0, 24.0, INK);
+        let end = self.label("DEATHS", end + 30.0, y + 15.0, TEXT);
+        self.fat(&worm.deaths.to_string(), end + 8.0, y + 12.0, 3.0, TEXT);
+        self.tilt = None;
     }
 
     /// Bottom left: `HP 78` and ten segments of 10 HP each.
@@ -212,22 +233,30 @@ impl Hud {
         let (x, y) = (MARGIN, 720.0 - MARGIN - 84.0);
         let fraction = (worm.hp / MAX_HP).clamp(0.0, 1.0);
         let low = worm.alive && fraction <= 0.25;
-        self.plate(x, y, 280.0, 84.0, if low { DANGER } else { BRASS });
-        self.text("HP", x + 16.0, y + 38.0, 2.0, BRASS_LIGHT);
-        let colour = if !worm.alive { MUTED } else if low { 0xffb4a2 } else { TEXT };
-        self.text(&format!("{:.0}", worm.hp.max(0.0)), x + 46.0, y + 10.0, 6.0, colour);
+        // A low-health panel also shivers: the tilt wobbles with the bounce clock.
+        let shiver = if low { (self.hp_age * 40.0).sin() * 0.012 } else { 0.0 };
+        self.tilted(x, y, 280.0, 84.0, 0.03 + shiver);
+        let fill = if !worm.alive { PANEL_GREY } else if low { PANEL_RED } else { PANEL_GREEN };
+        self.plate(x, y, 280.0, 84.0, fill);
+        self.label("HP", x + 16.0, y + 38.0, TEXT);
+        // Pattern: Tween. The number overshoots and settles each time it changes.
+        let digits = format!("{:.0}", worm.hp.max(0.0));
+        let pixel = 6.0 * pop(self.hp_age);
+        let (cx, cy) = (x + 46.0 + text_width(&digits, 6.0) / 2.0, y + 10.0 + 21.0);
+        self.fat(&digits, cx - text_width(&digits, pixel) / 2.0, cy - 3.5 * pixel, pixel, TEXT);
         let note = if !worm.alive {
-            Some((format!("RESPAWN {:.0}", worm.respawn_timer.ceil()), MUTED))
+            Some(format!("RESPAWN {:.0}", worm.respawn_timer.ceil()))
         } else if low {
-            Some(("LOW HEALTH".to_string(), DANGER))
+            Some("LOW HEALTH".to_string())
         } else {
             None
         };
-        if let Some((note, colour)) = note {
-            self.text(&note, x + 264.0 - text_width(&note, 2.0), y + 14.0, 2.0, colour);
+        if let Some(note) = note {
+            self.label(&note, x + 264.0 - text_width(&note, 2.0), y + 14.0, TEXT);
         }
-        let bar = if fraction > 0.5 { GOLD } else if fraction > 0.25 { WARN } else { DANGER };
+        let bar = if fraction > 0.5 { GOLD } else if fraction > 0.25 { WARN } else { TEXT };
         self.segments(x + 16.0, y + 60.0, 248.0, 14.0, 10, fraction, bar);
+        self.tilt = None;
     }
 
     /// Bottom right: the slot rail above a plate with the name, the ammo and
@@ -238,15 +267,22 @@ impl Hud {
         // The rail: one slot per weapon, keyed like the keyboard. A blue mark
         // under a slot means it is reloading, a red one that it is empty.
         // Right-aligned with the plate: fourteen slots are wider than it.
+        self.tilted(x, y, 332.0, 142.0, -0.025);
         let rail = x + 332.0 - worm.weapons.len() as f32 * 28.0 + 4.0;
         for (i, gun) in worm.weapons.iter().enumerate() {
             let def = &WEAPONS[gun.id as usize];
             let sx = rail + i as f32 * 28.0;
             let current = i == worm.current;
-            self.rect(sx, y - 32.0, 24.0, 24.0, if current { BRASS_LIGHT } else { BRASS });
-            self.rect(sx + 1.0, y - 31.0, 22.0, 22.0, if current { BRASS_LIGHT } else { PLATE });
+            // The chosen slot is a bright chip that sits proud of the rail.
+            let lift = if current { 5.0 } else { 0.0 };
+            self.rect(sx - 2.0, y - 34.0 - lift, 28.0, 28.0 + lift, INK);
+            self.rect(sx, y - 32.0 - lift, 24.0, 24.0 + lift, if current { GOLD } else { 0x7a5a3a });
             let key = &SLOT_KEYS[i..i + 1];
-            self.text(key, sx + 7.0, y - 27.0, 2.0, if current { PLATE } else { MUTED });
+            if current {
+                self.text(key, sx + 7.0, y - 27.0 - lift, 2.0, INK);
+            } else {
+                self.label(key, sx + 7.0, y - 27.0, TEXT);
+            }
             if gun.reload > 0.0 {
                 self.rect(sx + 3.0, y - 12.0, 18.0, 3.0, RELOAD);
             } else if def.mag > 0 && gun.ammo == 0 {
@@ -256,21 +292,22 @@ impl Hud {
 
         let gun = &worm.weapons[worm.current];
         let def = &WEAPONS[gun.id as usize];
-        self.plate(x, y, 332.0, 142.0, BRASS);
-        self.text(&def.name.to_uppercase(), x + 16.0, y + 12.0, 3.0, TEXT);
+        self.plate(x, y, 332.0, 142.0, PANEL_ORANGE);
+        self.fat(&def.name.to_uppercase(), x + 16.0, y + 12.0, 3.0, TEXT);
 
         // Ammo: one pip per round up to eight, a bar beyond that.
         if def.kind != Kind::Whip {
             let ammo = gun.ammo as f32;
             let mag = def.mag as f32;
-            let colour = if gun.ammo == 0 { DANGER } else if ammo <= mag * 0.25 && def.mag > 1 { WARN } else { GOLD };
-            let end = self.text(&gun.ammo.to_string(), x + 16.0, y + 42.0, 5.0, colour);
-            self.text(&format!("/ {}", def.mag), end + 8.0, y + 63.0, 2.0, MUTED);
+            let colour = if gun.ammo == 0 { DANGER } else if ammo <= mag * 0.25 && def.mag > 1 { GOLD } else { TEXT };
+            let end = self.fat(&gun.ammo.to_string(), x + 16.0, y + 42.0, 5.0, colour);
+            self.label(&format!("/ {}", def.mag), end + 8.0, y + 63.0, TEXT);
             if def.mag > 8 {
                 self.segments(x + 16.0, y + 86.0, 300.0, 12.0, 24, ammo / mag, colour);
             } else {
                 let pip = (300.0 - 5.0 * (mag - 1.0)) / mag;
                 let pip = pip.min(56.0);
+                self.rect(x + 14.0, y + 84.0, mag * pip + 5.0 * (mag - 1.0) + 4.0, 16.0, INK);
                 for i in 0..def.mag {
                     let px = x + 16.0 + i as f32 * (pip + 5.0);
                     self.rect(px, y + 86.0, pip, 12.0, TRACK);
@@ -284,19 +321,20 @@ impl Hud {
         // The status line: what the weapon is doing right now.
         let charge = worm.charge_fraction();
         let (label, right, colour, progress) = if def.kind == Kind::Whip {
-            ("MELEE", String::new(), BRASS_LIGHT, None)
+            ("MELEE", String::new(), TEXT, None)
         } else if gun.reload > 0.0 {
             ("RELOADING", format!("{:.1} S", gun.reload), RELOAD, Some(1.0 - gun.reload / def.reload))
         } else if charge > 0.0 {
-            ("CHARGING", format!("{:.0}%", charge * 100.0), CHARGE, Some(charge))
+            ("CHARGING", format!("{:.0}%", charge * 100.0), GOLD, Some(charge))
         } else {
             ("READY", String::new(), READY, None)
         };
-        self.text(label, x + 16.0, y + 106.0, 2.0, colour);
-        self.text(&right, x + 316.0 - text_width(&right, 2.0), y + 106.0, 2.0, colour);
+        self.label(label, x + 16.0, y + 106.0, colour);
+        self.label(&right, x + 316.0 - text_width(&right, 2.0), y + 106.0, colour);
         if let Some(progress) = progress {
             self.segments(x + 16.0, y + 126.0, 300.0, 6.0, 1, progress, colour);
         }
+        self.tilt = None;
     }
 
     /// The four chevrons around the crosshair, plus the hit marker if one is live.
@@ -327,15 +365,76 @@ impl Hud {
         // The number outlives the cross so a quick series of hits stays readable.
         if self.marker.total_seconds > 0.0 {
             let damage = format!("{:.0}", self.marker.total);
-            self.text(&damage, cx + 31.0, cy - 35.0, 3.0, 0x0b0905);
-            self.text(&damage, cx + 29.0, cy - 37.0, 3.0, if self.marker.kill { 0xff9a7a } else { 0xffffff });
+            let fill = if self.marker.kill { 0xff6a4a } else { 0xffe14a };
+            let pixel = 3.5 + (self.marker.total / 120.0).clamp(0.0, 1.0) * 2.5;
+            let left = self.marker.total_seconds;
+            self.cartoon(&damage, (cx + 62.0, cy - 52.0), pixel, 0.12, COMBO_WINDOW - left, left, fill);
         }
         // Incoming damage mirrors it on the other side, below the crosshair.
         if self.taken.seconds > 0.0 {
             let lost = format!("-{:.0}", self.taken.total);
-            let x = cx - 31.0 - text_width(&lost, 3.0);
-            self.text(&lost, x + 2.0, cy + 37.0, 3.0, 0x0b0905);
-            self.text(&lost, x, cy + 35.0, 3.0, DANGER);
+            let pixel = 3.5 + (self.taken.total / 120.0).clamp(0.0, 1.0) * 2.5;
+            let left = self.taken.seconds;
+            self.cartoon(&lost, (cx - 62.0, cy + 52.0), pixel, -0.12, COMBO_WINDOW - left, left, DANGER);
+        }
+    }
+
+    /// A damage number as a cartoon sticker: fat black outline, a light top
+    /// edge, tilted, and it pops in big, settles, floats up and shrinks away.
+    /// `age` is seconds since the last hit, `left` seconds until it is gone.
+    /// Each font pixel is a free (unsnapped) quad so it can rotate and scale.
+    fn cartoon(&mut self, s: &str, centre: (f32, f32), pixel: f32, tilt: f32, age: f32, left: f32, fill: u32) {
+        let pop = pop(age);
+        let fade = (left / 0.25).clamp(0.0, 1.0);
+        let size = pixel * pop * (0.4 + 0.6 * fade);
+        let centre = (centre.0, centre.1 - age * 14.0);
+        let (sin, cos) = tilt.sin_cos();
+        let (w, h) = (s.chars().count() as f32 * 6.0 - 1.0, 7.0);
+        // Font-pixel units (origin at the text's middle) to virtual units.
+        let place = |u: f32, v: f32| {
+            let (u, v) = ((u - w / 2.0) * size, (v - h / 2.0) * size);
+            (centre.0 + u * cos - v * sin, centre.1 + u * sin + v * cos)
+        };
+        let quad = |hud: &mut Hud, u0: f32, v0: f32, u1: f32, v1: f32, colour: Colour| {
+            let (a, b, c, d) = (place(u0, v0), place(u1, v0), place(u1, v1), place(u0, v1));
+            hud.triangle([a, b, c], colour);
+            hud.triangle([a, c, d], colour);
+        };
+        let lit = |ch: char, col: i32, row: i32| {
+            (0..5).contains(&col) && (0..7).contains(&row) && glyph(ch)[row as usize] >> (4 - col) & 1 == 1
+        };
+        let mut ink = rgb(0x0b0905);
+        ink[3] = fade;
+        let mut face = rgb(fill);
+        face[3] = fade;
+        let mut top = rgb(fill);
+        for c in &mut top[..3] {
+            *c = *c * 0.45 + 0.55;
+        }
+        top[3] = fade;
+        let glyphs: Vec<(usize, char)> = s.chars().enumerate().collect();
+        // Outline first (every lit pixel grown by 1.1 font pixels), then the faces.
+        for &(i, ch) in &glyphs {
+            for row in 0..7 {
+                for col in 0..5 {
+                    if lit(ch, col, row) {
+                        let (u, v) = ((i * 6) as f32 + col as f32, row as f32);
+                        quad(self, u - 1.1, v - 1.1, u + 2.1, v + 2.1, ink);
+                    }
+                }
+            }
+        }
+        for &(i, ch) in &glyphs {
+            for row in 0..7 {
+                for col in 0..5 {
+                    if lit(ch, col, row) {
+                        let (u, v) = ((i * 6) as f32 + col as f32, row as f32);
+                        // A hair of overlap hides seams between rotated quads.
+                        let colour = if lit(ch, col, row - 1) { face } else { top };
+                        quad(self, u - 0.02, v - 0.02, u + 1.02, v + 1.02, colour);
+                    }
+                }
+            }
         }
     }
 
@@ -346,6 +445,7 @@ impl Hud {
     fn segments(&mut self, x: f32, y: f32, w: f32, h: f32, segs: u32, fraction: f32, colour: u32) {
         let gap = if segs > 1 { 2.0 } else { 0.0 };
         let cell = (w - gap * (segs - 1) as f32) / segs as f32;
+        self.rect(x - 2.0, y - 2.0, w + 4.0, h + 4.0, INK);
         for i in 0..segs {
             let cx = x + i as f32 * (cell + gap);
             let lit = (fraction * segs as f32 - i as f32).clamp(0.0, 1.0);
@@ -354,15 +454,62 @@ impl Hud {
         }
     }
 
-    /// A chamfered plate: a brass edge with a flat dark fill inside.
-    fn plate(&mut self, x: f32, y: f32, w: f32, h: f32, edge: u32) {
-        self.octagon(x, y, w, h, 18.0, edge);
-        self.octagon(x + 2.0, y + 2.0, w - 4.0, h - 4.0, 17.0, PLATE);
+    /// A comic panel: a hard drop shadow, a fat black outline, a bright fill and
+    /// a pale gloss strip along the top.
+    fn plate(&mut self, x: f32, y: f32, w: f32, h: f32, fill: u32) {
+        let mut shadow = rgb(INK);
+        shadow[3] = 0.4;
+        self.octagon_c(x, y + 1.0, w + 10.0, h + 10.0, 15.0, shadow);
+        self.octagon(x - 5.0, y - 5.0, w + 10.0, h + 10.0, 15.0, INK);
+        self.octagon(x, y, w, h, 11.0, fill);
+        self.rect(x + 14.0, y + 4.0, w - 28.0, 3.0, mix_white(fill, 0.5));
+    }
+
+    /// Rotate everything drawn until `self.tilt` is cleared, about the middle of
+    /// the given box. Panels use it so the whole sticker leans, text included.
+    fn tilted(&mut self, x: f32, y: f32, w: f32, h: f32, angle: f32) {
+        self.tilt = Some(((x + w / 2.0, y + h / 2.0), angle.sin_cos()));
+    }
+
+    /// Small text with a hard 2-unit drop shadow, so it stays readable on any panel.
+    fn label(&mut self, s: &str, x: f32, y: f32, colour: u32) -> f32 {
+        self.text(s, x + 2.0, y + 2.0, 2.0, INK);
+        self.text(s, x, y, 2.0, colour)
+    }
+
+    /// Big text as a sticker: every lit font pixel is grown by one pixel in ink
+    /// first (the outline), then the letters go on top with a paler top edge.
+    fn fat(&mut self, s: &str, x: f32, y: f32, pixel: f32, colour: u32) -> f32 {
+        let lit = |ch: char, col: i32, row: i32| {
+            (0..5).contains(&col) && (0..7).contains(&row) && glyph(ch)[row as usize] >> (4 - col) & 1 == 1
+        };
+        for pass in 0..2 {
+            for (i, ch) in s.chars().enumerate() {
+                for row in 0..7 {
+                    for col in 0..5 {
+                        if !lit(ch, col, row) {
+                            continue;
+                        }
+                        let (px, py) = (x + ((i * 6) as i32 + col) as f32 * pixel, y + row as f32 * pixel);
+                        if pass == 0 {
+                            self.rect(px - pixel, py - pixel, pixel * 3.0, pixel * 3.0, INK);
+                        } else {
+                            let face = if lit(ch, col, row - 1) { colour } else { mix_white(colour, 0.5) };
+                            self.rect(px, py, pixel, pixel, face);
+                        }
+                    }
+                }
+            }
+        }
+        x + text_width(s, pixel)
     }
 
     /// A rectangle with its four corners cut by `c`, as a triangle fan.
     fn octagon(&mut self, x: f32, y: f32, w: f32, h: f32, c: f32, colour: u32) {
-        let colour = rgb(colour);
+        self.octagon_c(x, y, w, h, c, rgb(colour));
+    }
+
+    fn octagon_c(&mut self, x: f32, y: f32, w: f32, h: f32, c: f32, colour: Colour) {
         let p = [
             (x + c, y), (x + w - c, y), (x + w, y + c), (x + w, y + h - c),
             (x + w - c, y + h), (x + c, y + h), (x, y + h - c), (x, y + c),
@@ -397,6 +544,10 @@ impl Hud {
             return;
         }
         for (x, y) in points {
+            let (x, y) = match self.tilt {
+                Some(((px, py), (sin, cos))) => (px + (x - px) * cos - (y - py) * sin, py + (x - px) * sin + (y - py) * cos),
+                None => (x, y),
+            };
             let pos = [x * self.scale / self.size.0 * 2.0 - 1.0, 1.0 - y * self.scale / self.size.1 * 2.0];
             self.verts.push(Vertex { pos, colour });
         }
@@ -416,6 +567,27 @@ impl Hud {
         }
         x + text_width(s, pixel)
     }
+}
+
+/// Pattern: Tween. Scale of something `age` seconds after it changed: it jumps
+/// in small, overshoots to 1.3 and settles at 1.0, a squash-and-stretch pop.
+fn pop(age: f32) -> f32 {
+    if age < 0.06 {
+        0.5 + 0.8 * age / 0.06
+    } else if age < 0.16 {
+        1.3 - 0.3 * (age - 0.06) / 0.10
+    } else {
+        1.0
+    }
+}
+
+/// `hex` blended towards white by `t`.
+fn mix_white(hex: u32, t: f32) -> u32 {
+    let c = |shift: u32| {
+        let v = ((hex >> shift) & 0xff) as f32;
+        ((v + (255.0 - v) * t).round() as u32) << shift
+    };
+    c(16) | c(8) | c(0)
 }
 
 /// Width of `s` in virtual units: five font pixels per letter plus one of space.
