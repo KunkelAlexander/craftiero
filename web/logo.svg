@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-4 -4 136 136" width="136" height="136">
+  <!-- craftiero: a worm popping out of a block of earth. Colours are the game's
+       own: ink outline, grass, dirt, the red worm. -->
+  <rect x="12" y="50" width="104" height="70" rx="11" fill="#8a5a2b" stroke="#1b120a" stroke-width="6"/>
+  <!-- dirt specks, a nod to the blocky "craft" half -->
+  <g fill="#6b4120">
+    <rect x="24" y="90" width="12" height="12" rx="2"/>
+    <rect x="52" y="100" width="12" height="12" rx="2"/>
+    <rect x="86" y="88" width="14" height="14" rx="2"/>
+    <rect x="70" y="80" width="8" height="8" rx="1.5"/>
+  </g>
+  <!-- grass lip with a ragged lower edge -->
+  <path d="M15 72 V61 Q15 53 23 53 H105 Q113 53 113 61 V72 Q103 82 93 73 Q82 82 70 73 Q58 82 46 73 Q34 82 15 72 Z"
+        fill="#6fae3a" stroke="#1b120a" stroke-width="6" stroke-linejoin="round"/>
+  <!-- the hole -->
+  <ellipse cx="62" cy="56" rx="24" ry="8" fill="#1b120a"/>
+  <!-- the worm: dark outline stroke first, then the red body on top -->
+  <path d="M56 58 V36 Q56 14 78 14" fill="none" stroke="#1b120a" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M56 58 V36 Q56 14 78 14" fill="none" stroke="#e03a2e" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M51 50 V36 Q51 20 66 19" fill="none" stroke="#ff8a7a" stroke-width="3.5" stroke-linecap="round" opacity=".8"/>
+  <!-- bead eyes, one catchlight -->
+  <circle cx="79" cy="11" r="5" fill="#fff"/>
+  <circle cx="80.5" cy="11.5" r="2.6" fill="#1b120a"/>
+  <circle cx="81.5" cy="10.5" r=".9" fill="#fff"/>
+  <!-- a spark: something just exploded -->
+  <path d="M104 18 l3 8 8 3 -8 3 -3 8 -3 -8 -8 -3 8 -3 z" fill="#ffd23f" stroke="#1b120a" stroke-width="3" stroke-linejoin="round"/>
+</svg>

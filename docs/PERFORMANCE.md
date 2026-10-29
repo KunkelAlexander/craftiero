@@ -378,3 +378,34 @@ Remaining ideas, with my estimate of the gain (not yet tried unless noted):
    shape): the Nova costs 4 ms in the sim and ~9 ms in the viewer (section 10).
    Small edits are already cheap (0.1-0.5 ms).
 5. Not worth it so far: widening the distance band (tried, above).
+
+## Web build (WebGPU in the browser)
+
+`web/build.ps1` (or `build.sh`) builds `viewer` for `wasm32-unknown-unknown`, runs
+`wasm-bindgen` into `web/pkg` and `-Serve` serves it on :8080. The .wasm is 1.2 MB.
+No threads, so any static host works. WebGPU only: the renderer needs 3D textures
+and storage buffers in fragment shaders, which WebGL2 cannot do.
+
+What differs from native, and why:
+
+- **Surface colour.** A browser canvas cannot be configured as sRGB, so the code
+  configures the plain format and draws through an sRGB *view* (`view_formats`).
+  Without it the linear shading reached the screen unconverted: darker, more
+  saturated, and a dark brown HUD.
+- **Map generation** is single-threaded (`std::thread` panics in a tab). It is
+  part of the ~3.5 s "terrain uploaded" line in the console on the first load
+  (Chrome, Intel UHD, includes shader compile); native takes 0.3-0.6 s.
+- **Resolution cap.** The march never exceeds ~1600 px on the long edge
+  (`scale_ceiling`); a 1.5x hi-DPI laptop canvas is already above that.
+- **Auto-res without timestamps.** If the adapter lacks `timestamp-query` the
+  scale follows the frame interval (`adjust_resolution_by_frame_time`). Chrome on
+  the dev laptop does expose timestamps, so the GPU-time path ran there.
+- **Audio** opens on the first click or key (browsers keep an `AudioContext`
+  suspended before that).
+
+Measured (Chrome, Intel UHD gen-9, 1554x753 canvas, auto-res settled at 40%):
+17-55 fps, varying a lot between runs and within one (the iGPU drifts, see "How
+to trust these numbers"). Native `--bench` at the same size and scale: 16 ms for
+the open-hills view; the browser showed 18-24 ms GPU for the same, i.e. WebGPU
+costs roughly 15-40% more than DX12 here. On this machine the web build is
+therefore playable but not a steady 60 fps; a discrete GPU was not available to test.

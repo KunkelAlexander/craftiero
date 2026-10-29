@@ -1,4 +1,4 @@
-# 3D SDF Liero (working title)
+# craftiero
 
 A real-time 3D worm shooter in the spirit of *Liero*, on **fully destructible,
 formable terrain stored as a signed distance field (SDF)**. Rust, wgpu, no

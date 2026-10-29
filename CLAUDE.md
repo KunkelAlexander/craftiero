@@ -61,7 +61,7 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 ---
 
-# Project: 3D SDF Liero (working title)
+# Project: craftiero (3D SDF worm shooter)
 
 Fork of the 2D "Neon Bomber-Liero" (see git history before the "Fork for 3D" commit for the 2D code). Real-time 3D worm shooter with fully destructible/formable terrain stored as a signed distance field. Rust, native first (wgpu + winit), web later. Cel shading with Okami-like ink outlines. Smooth, fast gameplay beats graphics. The owner wants to **learn**, so the code should teach. The full plan and milestones (M0-M6) are in `PLAN.md`.
 
@@ -82,3 +82,4 @@ Fork of the 2D "Neon Bomber-Liero" (see git history before the "Fork for 3D" com
 ## Commands
 - `cargo test -p sdf -p sim -p protocol -p host -p viewer`, `cargo run -p sdf --release --example bench`
 - `cargo run -p viewer --release` (interactive), `-- --shot out.png [--edits --cam x,y,z,yaw,pitch --worm x,z,yaw [--rope]]` (headless screenshot; `--fire id[,ticks]` fires that weapon and shoots the picture some ticks later, `--weapon id` holds it with no shot, `--no-brush` hides the dig ring, `--no-aim` hides the weapon aim aid (arcs, blast rings, ricochet marks), `--hud` draws the HUD), `-- --bench` (GPU ms per pass). Windows defaults to DX12; `WGPU_BACKEND=vulkan` overrides.
+- Browser (WebGPU only, offline play): `powershell -File web/build.ps1 -Serve`, then open http://127.0.0.1:8080. Needs `rustup target add wasm32-unknown-unknown` and `cargo install wasm-bindgen-cli --version 0.2.129 --locked` (same version as Cargo.lock). See the web section of `docs/PERFORMANCE.md`.

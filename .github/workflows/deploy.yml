@@ -1,4 +1,4 @@
-# Builds the WASM game and publishes web/ to GitHub Pages on every push to main.
+# Builds the browser version (viewer crate, WebGPU) and publishes web/ to GitHub Pages on every push to main.
 # One-time setup in the repo: Settings -> Pages -> Source: "GitHub Actions".
 name: deploy
 on:
@@ -17,17 +17,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      # The game finds the relay through RELAY_URL, fixed at build time (see
-      # game/src/net.rs). Set it once in the repo: Settings -> Secrets and
-      # variables -> Actions -> Variables -> RELAY_URL = wss://<your relay>/ws
-      # Unset, the game would try ws://127.0.0.1 and only work locally.
+      # The wasm-bindgen CLI must be the same version as the crate in Cargo.lock.
+      - name: Install wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
       - name: Build the game
-        env:
-          RELAY_URL: ${{ vars.RELAY_URL }}
-        run: |
-          if [ -z "$RELAY_URL" ]; then unset RELAY_URL; fi
-          cargo build -p game --release --target wasm32-unknown-unknown
-      - run: cp target/wasm32-unknown-unknown/release/game.wasm web/game.wasm
+        run: sh web/build.sh
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web

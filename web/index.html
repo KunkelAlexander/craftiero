@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>craftiero</title>
+<meta name="description" content="craftiero: a 3D worm shooter with fully destructible terrain, running in your browser.">
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
+  /* winit sizes its drawing buffer from this box (times devicePixelRatio). */
+  #game { display: block; width: 100vw; height: 100vh; outline: none; }
+  #msg {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 6px; padding: 16px; text-align: center; color: #cfd6e4;
+    font: 16px/1.5 system-ui, sans-serif; pointer-events: none;
+    background: radial-gradient(ellipse at center, #1c2230 0%, #0b0d12 70%);
+  }
+  #msg.hidden { display: none; }
+  #logo { width: min(34vw, 150px); height: auto; filter: drop-shadow(0 6px 0 #0006); }
+  /* The wordmark is live text in the HUD's colours: warm orange with a dark ink
+     outline (paint-order keeps the outline outside the letters). */
+  #name {
+    margin: 0; font: 900 clamp(40px, 9vw, 76px)/1 "Arial Black", Impact, system-ui, sans-serif;
+    letter-spacing: .04em; text-transform: uppercase; color: #ffb347;
+    -webkit-text-stroke: 8px #1b120a; paint-order: stroke fill;
+    text-shadow: 0 5px 0 #6b2f0c;
+  }
+  #status { max-width: 34em; margin-top: 12px; color: #9fa9bd; font-size: 15px; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 12px; text-align: center; color: #cfd6e4aa;
+    font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" tabindex="0"></canvas>
+<div id="msg">
+  <img id="logo" src="logo.svg" alt="">
+  <h1 id="name">craftiero</h1>
+  <div id="status">Loading...</div>
+</div>
+<div id="hint">Click to play &middot; WASD move &middot; mouse aim &middot; LMB fire &middot; Space jump &middot; Esc release mouse &middot; M mute</div>
+<script type="module">
+  const msg = document.getElementById("msg");
+  const status = document.getElementById("status");
+  const say = (text) => { status.textContent = text; msg.classList.remove("hidden"); };
+
+  // The renderer ray-marches a 3D texture and reads storage buffers in fragment
+  // shaders, which WebGL2 cannot do, so WebGPU is a hard requirement.
+  if (!navigator.gpu) {
+    say("This game needs WebGPU: use a current Chrome, Edge, Firefox (141+) or Safari (26+).");
+  } else {
+    try {
+      const wasm = await import("./pkg/viewer.js");
+      say("Starting (building the arena and compiling shaders, this takes a moment)...");
+      // Let the browser paint the line above before the module's start function
+      // blocks the tab for the map build.
+      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+      await wasm.default();
+      // The canvas starts drawing a frame or so later; hide the message then.
+      setTimeout(() => msg.classList.add("hidden"), 500);
+    } catch (e) {
+      // winit "throws" a harmless control-flow exception to leave its loop.
+      if (!String(e).includes("Using exceptions for control flow")) {
+        say("Could not start: " + e);
+        console.error(e);
+      } else {
+        setTimeout(() => msg.classList.add("hidden"), 500);
+      }
+    }
+  }
+</script>
+</body>
+</html>

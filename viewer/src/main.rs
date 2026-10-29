@@ -1,3 +1,6 @@
+// The headless modes (`--shot`, `--bench`) are native-only, so a browser build
+// leaves them unused.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 // The viewer. M1: a destructible SDF world, raymarched on the GPU, drawn with a
 // toon ramp and ink outlines. M2: a worm from the `sim` crate that you walk,
 // jump, dig and swing around it. M3: eleven weapons, damage and respawning.
@@ -36,8 +39,9 @@ use sim::weapons::{Kind, WHIP};
 use sim::{dig_target, Action, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 use winit::application::ApplicationHandler;
+#[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -68,6 +72,7 @@ Controls
   R reset the world
   M mute the sound (synthesised: every weapon has its own voice)";
 
+#[derive(Clone)]
 struct Config {
     shot: Option<String>,
     /// `--worm-preview`: the SDF body on a studio sheet instead of the game.
@@ -118,7 +123,8 @@ fn parse_args() -> Config {
         worm_preview: false,
         bench: false,
         size: (1280, 720),
-        scale: 1.0,
+        // A browser starts lower and lets the automatic scale find the ceiling.
+        scale: if cfg!(target_arch = "wasm32") { 0.6 } else { 1.0 },
         auto_res: true,
         cam: None,
         edits: false,
@@ -333,6 +339,24 @@ fn demo_edits(grid: &mut Grid) {
     }
 }
 
+/// `println!` goes nowhere in a browser, so the few messages worth keeping go to
+/// the console there.
+pub fn log(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(msg));
+    #[cfg(not(target_arch = "wasm32"))]
+    println!("{msg}");
+}
+
+/// In a browser there is no command line, no files and no blocking, so only the
+/// window game exists there (the headless `--shot` / `--bench` modes are native).
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+    run_window(parse_args());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     println!("{HELP}\n");
     let cfg = parse_args();
@@ -369,10 +393,17 @@ fn prefer_dx12_on_windows(mut desc: wgpu::InstanceDescriptor) -> wgpu::InstanceD
     desc
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn headless_gpu() -> Gpu {
     let desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
     let instance = wgpu::Instance::new(prefer_dx12_on_windows(desc));
-    Gpu::new(&instance, None)
+    Gpu::new_blocking(&instance, None)
+}
+
+/// Never called: a browser has no headless mode (see the wasm `main`).
+#[cfg(target_arch = "wasm32")]
+fn headless_gpu() -> Gpu {
+    unreachable!("the headless modes are native-only")
 }
 
 /// The world for a screenshot: the map, plus one worm if `--worm` asked for it,
@@ -923,6 +954,8 @@ struct Viewer {
     /// The synth and its output stream. It listens to the same events; nothing
     /// in the sim or the effects knows it exists.
     audio: Audio,
+    /// False until the output device is opened (see `start_audio`).
+    audio_started: bool,
     /// The camera's lag, landing dip, shake and shot kick. It moves the clean
     /// camera and adds its cosmetic offsets only when drawing (see `camera.rs`).
     feel: CameraFeel,
@@ -943,6 +976,8 @@ struct Viewer {
     lmb: bool,
     rmb: bool,
     grabbed: bool,
+    /// When the grab was asked for. A browser grants pointer lock a moment later.
+    grabbed_at: Instant,
     brush_radius: f32,
     edit_cooldown: f32,
     shadows: bool,
@@ -955,6 +990,15 @@ struct Viewer {
     march_ms: f32,
     post_ms: f32,
     last_res_change: Instant,
+    /// Without GPU timestamps (a browser) the frame interval stands in for the
+    /// GPU time: its smoothed value, the display's refresh interval as the
+    /// fastest interval seen, how long the frame rate has been fine, and how
+    /// long to wait before trying a higher resolution again.
+    frame_ms: f32,
+    refresh_ms: f32,
+    calm_since: Instant,
+    last_up: Instant,
+    up_delay: f32,
     last_note: &'static str,
     started: Instant,
     last_frame: Instant,
@@ -966,48 +1010,89 @@ struct Viewer {
     synced: usize,
 }
 
+/// The largest render scale for a surface this big. A browser reports the canvas
+/// in device pixels, which on a hi-DPI laptop is 4K, and the ray-marcher's cost
+/// is per pixel. Past about 1600 px on the long edge the browser upscales the
+/// picture instead. A desktop window is already the size the player chose.
+fn scale_ceiling(surface: (u32, u32)) -> f32 {
+    if cfg!(target_arch = "wasm32") {
+        const MAX_LONG_EDGE: f32 = 1600.0;
+        (MAX_LONG_EDGE / surface.0.max(surface.1).max(1) as f32).clamp(MIN_SCALE, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// The lowest resolution the automatic scale will pick.
+const MIN_SCALE: f32 = 0.4;
+
 impl Viewer {
-    fn new(event_loop: &ActiveEventLoop, cfg: &Config) -> Viewer {
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("liero3d M3")
-                        // Physical pixels, not logical: on a display scaled to 150%+ a
-                        // logical 1280 x 720 window is 2-4x the pixels and the frame
-                        // time would depend on the user's desktop scaling.
-                        .with_inner_size(PhysicalSize::new(cfg.size.0, cfg.size.1)),
-                )
-                .expect("cannot create a window"),
-        );
+    /// The window, and the wgpu instance that must know which display it lives
+    /// on. Both are made synchronously inside `resumed`; the slow, async part
+    /// (asking for a GPU) is `Viewer::new`.
+    fn create_window(event_loop: &ActiveEventLoop, cfg: &Config) -> (Arc<Window>, wgpu::Instance) {
+        let attributes = Window::default_attributes().with_title("craftiero");
+        // Physical pixels, not logical: on a display scaled to 150%+ a logical
+        // 1280 x 720 window is 2-4x the pixels and the frame time would depend
+        // on the user's desktop scaling.
+        #[cfg(not(target_arch = "wasm32"))]
+        let attributes = attributes.with_inner_size(PhysicalSize::new(cfg.size.0, cfg.size.1));
+        // In a browser the page owns the size: the canvas in index.html fills
+        // the tab and winit reports its pixels.
+        #[cfg(target_arch = "wasm32")]
+        let attributes = {
+            use winit::platform::web::WindowAttributesExtWebSys;
+            let _ = cfg;
+            let canvas = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id("game"))
+                .and_then(|e| wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlCanvasElement>(e).ok());
+            attributes.with_canvas(canvas).with_append(true)
+        };
+        let window = Arc::new(event_loop.create_window(attributes).expect("cannot create a window"));
         let desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(event_loop.owned_display_handle()));
-        let instance = wgpu::Instance::new(prefer_dx12_on_windows(desc));
+        (window, wgpu::Instance::new(prefer_dx12_on_windows(desc)))
+    }
+
+    async fn new(window: Arc<Window>, instance: wgpu::Instance, cfg: &Config) -> Viewer {
         let surface = instance.create_surface(window.clone()).expect("cannot create a surface");
-        let gpu = Gpu::new(&instance, Some(&surface));
+        let gpu = Gpu::new(&instance, Some(&surface)).await;
 
         let adapter_caps = surface.get_capabilities(&gpu.adapter);
         // An sRGB surface format makes the GPU do the linear -> sRGB conversion
         // when the post pass writes, so all shading maths stays linear.
-        let format = adapter_caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(adapter_caps.formats[0]);
+        // A browser canvas cannot be configured as sRGB (only as plain
+        // Bgra8Unorm / Rgba8Unorm). WebGPU's way around it is to draw through
+        // an sRGB *view* of the same texture: `view_formats` lists it up front.
+        // Without this the linear colours reach the screen unconverted and the
+        // whole picture looks darker and more saturated than on the desktop.
+        let surface_format = adapter_caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(adapter_caps.formats[0]);
+        let format = surface_format.add_srgb_suffix();
+        let view_formats = if format != surface_format { vec![format] } else { vec![] };
         let size = window.inner_size();
         let surface_cfg = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
+            format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: adapter_caps.alpha_modes[0],
-            view_formats: vec![],
+            view_formats,
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&gpu.device, &surface_cfg);
 
-        println!("window {}x{} px, display scale {:.2}", size.width, size.height, window.scale_factor());
-        let audio = Audio::new();
+        log(&format!("window {}x{} px, display scale {:.2}", size.width, size.height, window.scale_factor()));
+        // A browser only lets a page make sound after a click or key press (an
+        // `AudioContext` made earlier stays suspended), so there the device is
+        // opened by `start_audio` on the first input instead.
+        let audio_started = !cfg!(target_arch = "wasm32");
+        let audio = if audio_started { Audio::new() } else { Audio::silent() };
         let mut game = LocalGame::new(world::build(), &world::SPAWNS, SEED);
         let world = &mut game.replica.world;
-        let renderer = Renderer::new(&gpu, format, (surface_cfg.width, surface_cfg.height), cfg.scale, &mut world.grid);
+        let surface_size = (surface_cfg.width, surface_cfg.height);
+        let renderer = Renderer::new(&gpu, format, surface_size, cfg.scale.min(scale_ceiling(surface_size)), &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
         let anims = vec![worms::Anim::default(); world.worms.len()];
         let worms = world.worms.len();
@@ -1034,6 +1119,7 @@ impl Viewer {
             seq: 0,
             effects: Effects::default(),
             audio,
+            audio_started,
             feel: CameraFeel::default(),
             grade: WORLD_GRADE,
             step_dist: vec![0.0; worms],
@@ -1046,6 +1132,7 @@ impl Viewer {
             lmb: false,
             rmb: false,
             grabbed: false,
+            grabbed_at: now,
             brush_radius: 3.0,
             edit_cooldown: 0.0,
             shadows: cfg.shadows,
@@ -1059,6 +1146,11 @@ impl Viewer {
             // In the future on purpose: no adjustment during the first 1.5 s, when
             // shader compilation and the first uploads make frames look slow.
             last_res_change: now + std::time::Duration::from_secs_f32(1.0),
+            frame_ms: 0.0,
+            refresh_ms: 17.5,
+            calm_since: now,
+            last_up: now,
+            up_delay: 2.0,
             last_note: "",
             started: now,
             last_frame: now,
@@ -1076,12 +1168,21 @@ impl Viewer {
         self.game.replica.me as usize
     }
 
+    /// Open the sound device on the first user gesture (a no-op afterwards).
+    fn start_audio(&mut self) {
+        if !self.audio_started {
+            self.audio_started = true;
+            self.audio = Audio::new();
+        }
+    }
+
     fn set_grab(&mut self, grab: bool) {
         if grab {
             // Windows only supports Confined, other platforms only Locked.
             let ok = self.window.set_cursor_grab(CursorGrabMode::Locked).is_ok()
                 || self.window.set_cursor_grab(CursorGrabMode::Confined).is_ok();
             self.grabbed = ok;
+            self.grabbed_at = Instant::now();
             self.window.set_cursor_visible(!ok);
         } else {
             let _ = self.window.set_cursor_grab(CursorGrabMode::None);
@@ -1100,6 +1201,11 @@ impl Viewer {
         self.surface_cfg.height = h;
         self.surface.configure(&self.gpu.device, &self.surface_cfg);
         self.renderer.resize((w, h));
+        // A bigger canvas (a fullscreen switch) must not push the march past its cap.
+        let ceiling = scale_ceiling((w, h));
+        if self.renderer.scale() > ceiling {
+            self.renderer.set_scale(ceiling);
+        }
     }
 
     /// Print a message when the situation changes, not once per frame.
@@ -1122,8 +1228,12 @@ impl Viewer {
     /// keep the number of buffer re-allocations low. It both lowers the scale
     /// when the frame is too slow and raises it again when there is room, so a
     /// slow moment (shader compile, a thermal dip) cannot leave it stuck low.
-    fn adjust_resolution(&mut self) {
+    fn adjust_resolution(&mut self, dt: f32) {
         const TARGET_MS: f32 = 12.0; // +8% band = 13 ms, leaving room in a 16.7 ms frame for the CPU and present
+        let ceiling = scale_ceiling((self.surface_cfg.width, self.surface_cfg.height));
+        if !self.gpu.timestamps {
+            return self.adjust_resolution_by_frame_time(dt, ceiling);
+        }
         if let Some((m, p)) = self.renderer.gpu_ms() {
             self.march_ms = m;
             self.post_ms = p;
@@ -1134,14 +1244,62 @@ impl Viewer {
             return;
         }
         let scale = self.renderer.scale();
-        let wanted = (scale * (TARGET_MS / self.gpu_ms).sqrt()).clamp(0.4, 1.0);
+        let wanted = (scale * (TARGET_MS / self.gpu_ms).sqrt()).clamp(MIN_SCALE, ceiling);
         let over = self.gpu_ms > TARGET_MS * 1.08;
-        let under = self.gpu_ms < TARGET_MS * 0.92 && scale < 1.0;
+        let under = self.gpu_ms < TARGET_MS * 0.92 && scale < ceiling;
         let new = (wanted * 20.0).round() / 20.0;
         if (over || under) && (new - scale).abs() > 0.001 {
             self.renderer.set_scale(new);
             self.last_res_change = Instant::now();
             self.gpu_ms = 0.0; // the old average belongs to the old resolution
+        }
+    }
+
+    /// Dynamic resolution for GPUs that cannot time their own passes, which is
+    /// what a browser gives us. The only signal left is how long a frame takes
+    /// from one to the next, and with vsync that stays at the display's refresh
+    /// interval until the GPU cannot keep up. So: learn the refresh interval as
+    /// the fastest interval seen (60, 120 and 144 Hz screens all work), step down
+    /// when frames run clearly longer, and step up after a calm stretch to see if
+    /// there is room. Stepping up is a probe that can fail (it looks the same as
+    /// "just right" until the frames slow down), so each failure doubles the
+    /// wait before the next probe: that stops it hunting between two scales.
+    fn adjust_resolution_by_frame_time(&mut self, dt: f32, ceiling: f32) {
+        let ms = dt * 1000.0;
+        self.frame_ms = if self.frame_ms == 0.0 { ms } else { self.frame_ms * 0.9 + ms * 0.1 };
+        // The creep lets it learn a slower display, but slowly enough that a
+        // struggling GPU cannot talk it into accepting 30 fps as the refresh rate.
+        self.refresh_ms = (self.refresh_ms * 1.0002).min(self.frame_ms).clamp(4.0, 17.5);
+        if !self.auto_res || self.last_res_change.elapsed().as_secs_f32() < 0.5 {
+            return;
+        }
+        let (refresh, scale) = (self.refresh_ms, self.renderer.scale());
+        if self.frame_ms > refresh * 1.05 {
+            self.calm_since = Instant::now();
+        }
+        let new = if self.frame_ms > refresh * 1.15 && scale > MIN_SCALE {
+            // Cost goes with the pixel count (scale squared), so this is the
+            // scale that would land on the refresh interval; the clamp keeps one
+            // noisy reading from dropping the picture to mush.
+            let wanted = scale * (refresh / self.frame_ms).sqrt();
+            // The probe failed if we are back down within 6 s of going up.
+            self.up_delay = if self.last_up.elapsed().as_secs_f32() < 6.0 { (self.up_delay * 2.0).min(30.0) } else { 2.0 };
+            Some(wanted.clamp(scale - 0.15, scale - 0.05).max(MIN_SCALE))
+        } else if self.calm_since.elapsed().as_secs_f32() >= self.up_delay && scale < ceiling - 0.001 {
+            self.last_up = Instant::now();
+            self.calm_since = self.last_up;
+            Some((scale + 0.05).min(ceiling))
+        } else {
+            None
+        };
+        if let Some(new) = new {
+            let new = (new * 20.0).round() / 20.0;
+            if (new - scale).abs() > 0.001 {
+                self.renderer.set_scale(new);
+                self.last_res_change = Instant::now();
+                self.frame_ms = 0.0; // the old average belongs to the old resolution
+                log(&format!("render scale {:.0}%", new * 100.0));
+            }
         }
     }
 
@@ -1156,7 +1314,8 @@ impl Viewer {
             KeyCode::Escape => {
                 if self.grabbed {
                     self.set_grab(false);
-                } else {
+                } else if cfg!(not(target_arch = "wasm32")) {
+                    // A browser tab has nothing to exit to.
                     event_loop.exit();
                 }
             }
@@ -1204,7 +1363,7 @@ impl Viewer {
                 self.anims = vec![worms::Anim::default(); n];
                 self.renderer = Renderer::new(
                     &self.gpu,
-                    self.surface_cfg.format,
+                    self.surface_cfg.format.add_srgb_suffix(),
                     (self.surface_cfg.width, self.surface_cfg.height),
                     self.renderer.scale(),
                     &mut self.game.replica.world.grid,
@@ -1476,6 +1635,15 @@ impl Viewer {
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        // The browser takes the mouse back when the player presses Esc, without
+        // telling winit. Notice, so the next click grabs it again.
+        #[cfg(target_arch = "wasm32")]
+        if self.grabbed && self.grabbed_at.elapsed().as_secs_f32() > 0.5 {
+            let locked = web_sys::window().and_then(|w| w.document()).is_some_and(|d| d.pointer_lock_element().is_some());
+            if !locked {
+                self.set_grab(false);
+            }
+        }
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -1594,7 +1762,10 @@ impl Viewer {
             wgpu::CurrentSurfaceTexture::Occluded => return self.note("window occluded or minimised, not drawing"),
             wgpu::CurrentSurfaceTexture::Validation => return self.note("surface validation error, frame skipped"),
         };
-        let view = frame.texture.create_view(&Default::default());
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.surface_cfg.format.add_srgb_suffix()),
+            ..Default::default()
+        });
         let params = FrameParams {
             camera: &render_camera,
             capsules: &capsules,
@@ -1632,7 +1803,7 @@ impl Viewer {
             }
         }
 
-        self.adjust_resolution();
+        self.adjust_resolution(dt);
 
         // FPS in the title bar: no text rendering needed for a tech demo.
         self.frames += 1;
@@ -1661,8 +1832,20 @@ impl Viewer {
                 me.kills,
                 me.deaths
             );
+            // A browser tab's title has room for a short line only (and winit's
+            // `set_title` does not touch the page's title there).
+            #[cfg(target_arch = "wasm32")]
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.set_title(&format!(
+                    "craftiero | {:.0} fps | res {:.0}%{} | gpu {:.1} ms | {hud}",
+                    self.frames as f64 / elapsed,
+                    self.renderer.scale() * 100.0,
+                    if self.auto_res { " auto" } else { "" },
+                    self.march_ms + self.post_ms,
+                ));
+            }
             self.window.set_title(&format!(
-                "liero3d M3 {} | {hud} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {} sound {}",
+                "craftiero M3 {} | {hud} | {:.0} fps ({:.1} ms) | gpu {:.1} ms (march {:.1} + post {:.1}) | sim {:.2} ms, edit {:.2} ms, upload {:.2} ms ({} chunks) | brush {:.1} m | res {:.0}%{} | shadows {} ao {} ink {} vsync {} sound {}",
                 if self.fly { "fly" } else { "worm" },
                 self.frames as f64 / elapsed,
                 elapsed * 1000.0 / self.frames as f64,
@@ -1727,13 +1910,41 @@ fn cheat_progress(so_far: usize, key: KeyCode) -> usize {
 struct App {
     cfg: Config,
     viewer: Option<Viewer>,
+    /// Setup has started (on the web it finishes later, in `user_event`).
+    starting: bool,
+    /// Web only: how the finished async setup gets back into the event loop.
+    #[cfg(target_arch = "wasm32")]
+    proxy: winit::event_loop::EventLoopProxy<Viewer>,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Viewer> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.viewer.is_none() {
-            self.viewer = Some(Viewer::new(event_loop, &self.cfg));
+        if self.starting {
+            return;
         }
+        self.starting = true;
+        let (window, instance) = Viewer::create_window(event_loop, &self.cfg);
+        // A desktop program may block until the GPU answers. A browser tab may
+        // not, so there the setup runs as a future and mails the finished
+        // viewer back to the event loop.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.viewer = Some(pollster::block_on(Viewer::new(window, instance, &self.cfg)));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (proxy, cfg) = (self.proxy.clone(), self.cfg.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let viewer = Viewer::new(window, instance, &cfg).await;
+                if proxy.send_event(viewer).is_err() {
+                    log("the event loop is gone");
+                }
+            });
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, viewer: Viewer) {
+        self.viewer = Some(viewer);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1746,6 +1957,7 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
                         ElementState::Pressed => {
+                            v.start_audio();
                             v.keys.insert(code);
                             if !event.repeat {
                                 v.key_pressed(event_loop, code);
@@ -1759,6 +1971,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
+                if down {
+                    v.start_audio();
+                }
                 match button {
                     // The click that captures the mouse does not also dig.
                     MouseButton::Left if down && !v.grabbed => v.set_grab(true),
@@ -1803,9 +2018,18 @@ impl ApplicationHandler for App {
 }
 
 fn run_window(cfg: Config) {
-    let event_loop = EventLoop::new().expect("cannot create the event loop");
+    let event_loop = EventLoop::<Viewer>::with_user_event().build().expect("cannot create the event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App { cfg, viewer: None }).expect("event loop failed");
+    #[cfg(not(target_arch = "wasm32"))]
+    event_loop.run_app(&mut App { cfg, viewer: None, starting: false }).expect("event loop failed");
+    // `run_app` would unwind out of `main` to escape the browser's own loop;
+    // `spawn_app` hands the app to the page and returns.
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        let proxy = event_loop.create_proxy();
+        event_loop.spawn_app(App { cfg, viewer: None, starting: false, proxy });
+    }
 }
 
 #[cfg(test)]

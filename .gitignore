@@ -1,3 +1,4 @@
 /target
 /web/game.wasm
 /.playwright-mcp
+/web/pkg

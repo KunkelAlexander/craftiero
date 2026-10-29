@@ -14,10 +14,24 @@ winit = "0.30"
 wgpu = "30"
 # Plain-old-data casts so uniform structs can be handed to the GPU as bytes.
 bytemuck = { version = "1", features = ["derive"] }
-# Blocks on wgpu's async setup calls; the game itself has no async code.
-pollster = "1"
+# `std::time::Instant` panics in a browser tab; this is the same type on native
+# and a `performance.now()` clock on the web.
+web-time = "1"
 # Native audio output. All sounds are synthesised in `audio.rs`; there are no
-# files. `cpal` gives us the device and the callback, nothing else.
+# files. `cpal` gives us the device and the callback, nothing else. On the web
+# it talks to WebAudio (the `wasm-bindgen` feature), still no files.
 cpal = "0.18"
 # Screenshot output for the headless `--shot` mode.
 png = "0.18"
+
+# Blocks on wgpu's async setup calls. A browser cannot block, so the web build
+# awaits them instead (see `create_viewer` in main.rs).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cpal = { version = "0.18", features = ["wasm-bindgen"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["console", "Window", "Document", "Element", "HtmlCanvasElement"] }

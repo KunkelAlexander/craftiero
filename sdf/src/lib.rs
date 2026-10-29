@@ -168,16 +168,24 @@ impl Grid {
         // Expensive pass: 4096 evaluations per undecided chunk. Chunks do not
         // depend on each other, so spread them over all cores. `f` is a plain
         // fn pointer, which is safe to share between threads.
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let per_thread = undecided.len().div_ceil(threads).max(1);
-        let results: Vec<(IVec3, Chunk)> = std::thread::scope(|scope| {
-            let workers: Vec<_> = undecided
-                .chunks(per_thread)
-                .map(|part| scope.spawn(move || part.iter().map(|&c| (c, eval_chunk(c, f, material))).collect::<Vec<_>>()))
-                .collect();
-            // Joined in order, so the result does not depend on thread timing.
-            workers.into_iter().flat_map(|w| w.join().expect("map worker panicked")).collect()
-        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let results: Vec<(IVec3, Chunk)> = {
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let per_thread = undecided.len().div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = undecided
+                    .chunks(per_thread)
+                    .map(|part| scope.spawn(move || part.iter().map(|&c| (c, eval_chunk(c, f, material))).collect::<Vec<_>>()))
+                    .collect();
+                // Joined in order, so the result does not depend on thread timing.
+                workers.into_iter().flat_map(|w| w.join().expect("map worker panicked")).collect()
+            })
+        };
+        // A browser tab has no `std::thread` (spawning panics), so the same work
+        // runs on this one thread. The result is identical: it is already
+        // independent of how the chunks were split up.
+        #[cfg(target_arch = "wasm32")]
+        let results: Vec<(IVec3, Chunk)> = undecided.iter().map(|&c| (c, eval_chunk(c, f, material))).collect();
         for (c, chunk) in results {
             let idx = g.chunk_index(c);
             if matches!(chunk, Chunk::Data(_)) {

@@ -1,4 +1,4 @@
-# 3D SDF Liero: plan (the 2D plan is in docs/PLAN_2D.md)
+# craftiero: plan (the 2D plan is in docs/PLAN_2D.md)
 
 ## Context
 Goal: a 3D, Liero-style worm shooter with fully destructible/formable terrain based on signed distance fields (SDFs), cel-shaded with Okami-like ink outlines, smooth fast gameplay first, possible online multiplayer, Rust-native, structured like this repo. Prior attempt (voxellini, marching cubes in Godot) was too slow.

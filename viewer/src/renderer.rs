@@ -13,7 +13,7 @@ use crate::shaders;
 use bytemuck::Zeroable;
 use glam::{IVec3, Vec3};
 use sdf::{Grid, CHUNK, CHUNK_VOL};
-use std::time::Instant;
+use web_time::Instant;
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// The inked picture is HDR: fire, plasma and muzzle flashes are brighter than
@@ -35,27 +35,39 @@ pub struct Gpu {
 
 impl Gpu {
     /// `surface` is None for the headless modes.
-    pub fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface>) -> Gpu {
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: surface,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("no GPU adapter found");
+    ///
+    /// Async because a browser cannot block while it asks the user's GPU for a
+    /// device. Native callers use `Gpu::new_blocking`.
+    pub async fn new(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Gpu {
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: surface,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+            .expect("no GPU adapter found");
         let info = adapter.get_info();
-        println!("GPU: {} ({:?})", info.name, info.backend);
+        crate::log(&format!("GPU: {} ({:?})", info.name, info.backend));
         // Optional: timestamp queries let us read how long each pass took on the
         // GPU. Without them the viewer still works, it just cannot show GPU times.
         let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("viewer"),
-            required_features: if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
-            // The 3D texture is 512 x 256 x 512, well inside the default limit of 2048.
-            ..Default::default()
-        }))
-        .expect("could not open the GPU");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("viewer"),
+                required_features: if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
+                // The 3D texture is 512 x 256 x 512, well inside the default limit of 2048.
+                ..Default::default()
+            })
+            .await
+            .expect("could not open the GPU");
         Gpu { adapter, device, queue, timestamps }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_blocking(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Gpu {
+        pollster::block_on(Gpu::new(instance, surface))
     }
 }
 
@@ -988,11 +1000,11 @@ impl Renderer {
         grid.take_dirty(); // everything is on the GPU now
         self.upload_coarse(grid);
         let dims = n * CHUNK;
-        println!(
+        crate::log(&format!(
             "terrain uploaded: {} MB in {:.0} ms",
             dims.x as i64 * dims.y as i64 * dims.z as i64 / (1 << 20),
             t.elapsed().as_secs_f64() * 1000.0
-        );
+        ));
     }
 
     /// Copy the box of chunks `lo..=hi` to the texture in ONE write.

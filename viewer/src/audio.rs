@@ -854,6 +854,16 @@ impl Audio {
         }
     }
 
+    /// An `Audio` with no device, for the time before the first click on the web.
+    pub fn silent() -> Audio {
+        Audio {
+            backend: None,
+            queue: Arc::new(Mutex::new(Vec::new())),
+            charge: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            muted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn available(&self) -> bool {
         self.backend.is_some()
     }
