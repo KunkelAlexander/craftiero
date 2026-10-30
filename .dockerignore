@@ -2,6 +2,8 @@
 target
 .git
 web
+dist
+mockups
 screenshots
 docs
 .playwright-mcp

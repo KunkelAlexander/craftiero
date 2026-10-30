@@ -1,14 +1,21 @@
-# Render "Blueprint": tells Render how to run the relay. In the Render
-# dashboard: New -> Blueprint -> pick this repo. See docs/DEPLOY.md.
+# Render "Blueprint": tells Render how to run the relay (and the matches it
+# hosts). In the Render dashboard: New -> Blueprint -> pick this repo. See
+# docs/DEPLOY.md.
 #
-# Free plan: the service falls asleep after 15 minutes without incoming
-# traffic and takes about a minute to wake on the next connection. Hosts send a
-# small keep-alive ping every 20 s, so it stays awake while someone is hosting.
+# Free plan (0.1 CPU, 512 MB): the service falls asleep after 15 minutes without
+# incoming traffic and takes about a minute to wake on the next connection.
+# Hosts send a small keep-alive ping every 20 s, so it stays awake while someone
+# is hosting. The relay alone needs almost no CPU; a SERVER ROOM (a match the
+# server runs) needs more: see "Server rooms" in docs/DEPLOY.md before relying
+# on it, and switch `plan` to `starter` (0.5 CPU, $7 a month) if it stutters.
 services:
   - type: web
-    name: neon-bomber-relay
+    name: craftiero-relay
     runtime: docker
     plan: free
+    # A service's region cannot be changed afterwards (it would need a new
+    # service). Singapore is close to the players; pick another to move.
+    region: singapore
     dockerfilePath: ./server/Dockerfile
     dockerContext: .
     # "/" answers with a short text page (see server/src/lib.rs).

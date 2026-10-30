@@ -8,6 +8,7 @@
 // of free hosting. It is TCP underneath, so frames arrive reliably and in
 // order.
 
+pub mod matches;
 pub mod rooms;
 
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use protocol::decode_to_relay;
+use protocol::{decode_to_relay, ToRelay};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -32,7 +33,7 @@ type Shared = Arc<Mutex<Rooms>>;
 pub async fn serve(listener: TcpListener) {
     let app = Router::new()
         // A plain page so a browser or a hosting health check can see we are up.
-        .route("/", get(|| async { "neon bomber relay" }))
+        .route("/", get(|| async { "craftiero relay" }))
         .route("/ws", get(upgrade))
         .with_state(Shared::default());
     axum::serve(listener, app).await.expect("relay server crashed");
@@ -66,6 +67,12 @@ async fn connection(socket: WebSocket, rooms: Shared) {
         let Message::Binary(bytes) = frame else { continue };
         // Garbage from a client is dropped, never fatal.
         let Some(msg) = decode_to_relay(&bytes) else { continue };
+        // A hosted room needs a task to run the match, which `Rooms` (plain
+        // synchronous code) cannot start, so it is answered here.
+        if let ToRelay::CreateHostedRoom { version } = msg {
+            matches::start(&rooms, &mut role, &tx, version);
+            continue;
+        }
         rooms.lock().unwrap().handle(&mut role, &tx, msg);
     }
 

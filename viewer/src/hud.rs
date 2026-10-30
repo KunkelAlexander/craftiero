@@ -16,6 +16,7 @@
 //! wide as the window needs. `scale` turns them into real pixels, so the HUD is
 //! the same size relative to the window at any resolution.
 
+use crate::menu::{self, Menu, Page, Rect};
 use crate::renderer::Gpu;
 use crate::touch::{self, Button, TouchControls};
 use sim::weapons::Kind;
@@ -90,6 +91,8 @@ pub struct Hud {
     /// The HP number bounces whenever the value changes (hit, heal, respawn).
     hp_seen: f32,
     hp_age: f32,
+    /// One line across the top while playing: the room code, friends, ping.
+    note: Option<String>,
 }
 
 impl Hud {
@@ -142,7 +145,13 @@ impl Hud {
             taken: Taken::default(),
             hp_seen: MAX_HP,
             hp_age: 10.0,
+            note: None,
         }
+    }
+
+    /// The line shown across the top while playing (`None` hides it).
+    pub fn set_note(&mut self, note: Option<String>) {
+        self.note = note;
     }
 
     /// Feed it the sim's events. Only hits dealt or taken by the player matter
@@ -191,10 +200,83 @@ impl Hud {
         self.vitals(worm);
         self.weapon(worm, width, if touch.is_some() { touch::WEAPON_PLATE_Y } else { 720.0 - MARGIN - 142.0 });
         self.reticle(width / 2.0);
+        if let Some(note) = self.note.take() {
+            self.plate_text(&note, width, MARGIN);
+            self.note = Some(note);
+        }
         if let Some(touch) = touch {
             self.touch_controls(touch);
+            // A screen with no Esc key needs its own way out of the match.
+            self.draw_button(menu::menu_button(width), "MENU", false, true, 3.0);
         }
+        self.submit(gpu, encoder, target);
+    }
 
+    /// The main menu over the (orbiting) world: the title and the page's buttons.
+    pub fn draw_menu(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), menu: &Menu) {
+        let width = self.begin(screen);
+        match menu.page() {
+            Page::Title => {
+                let title = "CRAFTIERO";
+                let x = (width - text_width(title, 10.0)) / 2.0;
+                self.fat(title, x, menu::TITLE_Y, 10.0, GOLD);
+                let sub = "PLAY OFFLINE OR ONLINE WITH FRIENDS";
+                self.label(sub, (width - text_width(sub, 2.0)) / 2.0, menu::TITLE_Y + 100.0, TEXT);
+            }
+            Page::Code => {
+                let head = "ENTER THE ROOM CODE";
+                self.fat(head, (width - text_width(head, 4.0)) / 2.0, 30.0, 4.0, TEXT);
+                let typed: Vec<char> = menu.code().chars().collect();
+                for (i, slot) in menu::code_slots(width).into_iter().enumerate() {
+                    let filled = typed.get(i).copied();
+                    self.plate(slot.x, slot.y, slot.w, slot.h, if filled.is_some() { PANEL_ORANGE } else { TRACK });
+                    if let Some(c) = filled {
+                        let s = c.to_string();
+                        self.fat(&s, slot.x + (slot.w - text_width(&s, 8.0)) / 2.0, slot.y + (slot.h - 56.0) / 2.0, 8.0, TEXT);
+                    }
+                }
+            }
+        }
+        for b in menu.buttons(width) {
+            let pixel = if b.label.len() == 1 { 4.0 } else { 5.0 };
+            self.draw_button(b.rect, &b.label, b.primary, b.enabled, pixel);
+        }
+        self.submit(gpu, encoder, target);
+    }
+
+    /// A message in the middle of the screen with a way back: connecting,
+    /// refused, the host left. `lines` are upper case (the font has no more).
+    pub fn draw_notice(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), lines: &[&str]) {
+        let width = self.begin(screen);
+        let panel_w = (width - 2.0 * MARGIN).min(860.0);
+        let panel = Rect { x: (width - panel_w) / 2.0, y: 190.0, w: panel_w, h: 70.0 + lines.len() as f32 * 46.0 };
+        self.plate(panel.x, panel.y, panel.w, panel.h, PANEL_GREY);
+        for (i, line) in lines.iter().enumerate() {
+            // The biggest text that fits, so a long refusal still reads.
+            let pixel = if text_width(line, 3.0) <= panel.w - 40.0 { 3.0 } else { 2.0 };
+            let y = panel.y + 34.0 + i as f32 * 46.0;
+            let x = panel.x + (panel.w - text_width(line, pixel)) / 2.0;
+            // `label` is the small shadowed text, `fat` the big cel-shaded one.
+            if pixel > 2.0 {
+                self.fat(line, x, y, pixel, TEXT);
+            } else {
+                self.label(line, x, y, TEXT);
+            }
+        }
+        self.draw_button(menu::notice_button(width), "BACK", true, true, 5.0);
+        self.submit(gpu, encoder, target);
+    }
+
+    /// Start a frame of HUD drawing; returns the screen width in virtual units.
+    fn begin(&mut self, screen: (u32, u32)) -> f32 {
+        self.size = (screen.0 as f32, screen.1 as f32);
+        self.scale = self.size.1 / 720.0;
+        self.verts.clear();
+        self.size.0 / self.scale
+    }
+
+    /// Send the triangles to the GPU and paint them over `target`.
+    fn submit(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
         gpu.queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.verts));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hud"),
@@ -529,6 +611,26 @@ impl Hud {
         x + text_width(s, pixel)
     }
 
+    /// A button: a plate with its label centred. A disabled one is dim.
+    fn draw_button(&mut self, r: Rect, label: &str, primary: bool, enabled: bool, pixel: f32) {
+        let fill = match (enabled, primary) {
+            (false, _) => TRACK,
+            (true, true) => PANEL_ORANGE,
+            (true, false) => PANEL_GREY,
+        };
+        self.plate(r.x, r.y, r.w, r.h, fill);
+        let colour = if enabled { TEXT } else { PANEL_GREY };
+        let x = r.x + (r.w - text_width(label, pixel)) / 2.0;
+        self.fat(label, x, r.y + (r.h - 7.0 * pixel) / 2.0, pixel, colour);
+    }
+
+    /// A plate just wide enough for `s`, centred at the top of the screen.
+    fn plate_text(&mut self, s: &str, width: f32, y: f32) {
+        let w = text_width(s, 2.0) + 40.0;
+        self.plate((width - w) / 2.0, y, w, 44.0, PANEL_GREY);
+        self.label(s, (width - w) / 2.0 + 20.0, y + 15.0, TEXT);
+    }
+
     /// A rectangle with its four corners cut by `c`, as a triangle fan.
     fn octagon(&mut self, x: f32, y: f32, w: f32, h: f32, c: f32, colour: u32) {
         self.octagon_c(x, y, w, h, c, rgb(colour));
@@ -693,8 +795,12 @@ mod tests {
     #[test]
     fn the_font_has_every_character_the_hud_can_say() {
         let fixed = "KILLS DEATHS HP LOW HEALTH RESPAWN READY RELOADING CHARGING MELEE 0123456789 /%.-=";
+        // The menu and the online notices: every string the viewer can show
+        // here must be in the font (see `notice_for` and `room_note` in main.rs).
+        let menu = "CRAFTIERO PLAY HOST JOIN BACK DEL MENU ENTER THE ROOM CODE OFFLINE OR ONLINE WITH FRIENDS ROOM PING MS FRIENDS OPENING A CONNECTING TO RELAY KNOCKING WAITING FOR LOST PLAYING THE SERVER IS BUSY TRY AGAIN IN MINUTE NO THAT FULL RUNS ANOTHER VERSION RELOAD GAME LEFT MATCH OVER ALREADY REFUSED CONNECTION";
+        let keys = protocol::relay::CODE_ALPHABET;
         let names = WEAPONS.iter().map(|w| w.name.to_uppercase()).collect::<Vec<_>>().join(" ");
-        for ch in fixed.chars().chain(names.chars()) {
+        for ch in fixed.chars().chain(names.chars()).chain(menu.chars()).chain(keys.chars()) {
             assert!(FONT.iter().any(|(c, _)| *c == ch), "no glyph for {ch:?}");
         }
     }

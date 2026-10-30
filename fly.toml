@@ -1,4 +1,4 @@
-# Fly.io config for the relay (the paid-but-cheap alternative to Render's free
+# Fly.io config for the relay and server-hosted matches (the paid-but-cheap alternative to Render's free
 # tier: about $2 a month, no cold start if one machine stays running).
 # Deploy from the repo root:  fly launch --no-deploy --copy-config   then
 #                             fly deploy --ha=false
@@ -6,8 +6,8 @@
 # ONE machine only: rooms live in the server's memory, so a second machine would
 # be a second, separate set of rooms, and a friend could land on the wrong one.
 # (`--ha=false` stops Fly from creating a standby copy.)
-app = "neon-bomber-relay"   # app names are global: change it if taken
-primary_region = "ams"      # pick the region closest to your players
+app = "craftiero-relay"     # app names are global: change it if taken
+primary_region = "sin"      # Singapore; pick the region closest to your players
 
 [build]
   dockerfile = "server/Dockerfile"
@@ -24,4 +24,6 @@ primary_region = "ams"      # pick the region closest to your players
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  # The relay alone needs little, but every match the server hosts holds its own
+  # copy of the terrain (tens of MB): give it room.
+  memory = "512mb"

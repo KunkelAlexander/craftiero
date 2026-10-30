@@ -7,6 +7,11 @@
 // `Grid::from_fn` skips chunks that are far from the surface, which is only
 // valid if this function never OVER-estimates the distance. So the height
 // field uses a slope-corrected estimate and the shapes are lower bounds.
+//
+// Every client and the server run this same generator and get the same map
+// (it is pure integer-hash noise: no clock, no thread timing). That is why a
+// `Welcome` carries only the terrain EDITS and not the map. It also means a
+// change here is a protocol change: bump `PROTOCOL_VERSION`.
 
 use glam::{IVec3, Vec3};
 use sdf::{Grid, Material};
@@ -21,8 +26,11 @@ pub const WORLD_METRES: Vec3 = Vec3::new(
 );
 
 /// Where worms start, as (x, z) columns: they drop from the sky onto the hills
-/// in view of the spawn camera. The second one is a target dummy for now.
-pub const SPAWNS: [(f32, f32); 2] = [(64.0, 38.0), (69.0, 41.0)];
+/// in view of the spawn camera. One per seat: the first is the local player,
+/// friends take the next ones in a hosted room, and a seat nobody holds is a
+/// target dummy until bots arrive (M6). Also where dead worms respawn, the
+/// one farthest from the living enemies.
+pub const SPAWNS: [(f32, f32); 4] = [(64.0, 38.0), (69.0, 41.0), (58.0, 44.0), (74.0, 34.0)];
 
 /// Thickness of the indestructible rock around the arena: the four walls and
 /// the floor. Players can throw anything at it; it does not move.

@@ -18,6 +18,7 @@
 pub mod combat;
 pub mod input;
 pub mod lava;
+pub mod map;
 pub mod movement;
 pub mod rng;
 pub mod weapons;

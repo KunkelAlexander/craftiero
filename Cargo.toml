@@ -3,16 +3,28 @@
 #   sim       the rules (no window, GPU, clock or sockets)
 #   protocol  message shapes + bytes, and the client's `Replica` of the world
 #   host      the authority: runs `sim`, takes inputs, makes snapshots
-#   game      the macroquad client: window, input devices, drawing
-#   server    the relay: rooms by code, forwards bytes, knows no game rules
+#   viewer    the game: window, input, menu, the raymarcher; plays offline,
+#             hosts a room or joins one (the 2D `game` crate is gone, ported)
+#   server    the relay: rooms by code, forwards bytes, knows no game rules;
+#             also hosts matches itself (server/src/matches.rs)
 #
 # Why they are separate crates: none of sim/protocol/host depends on macroquad,
 # so anything that can run Rust can run them: the player's browser today, a
 # dedicated server tomorrow. That keeps the door open to a central server
 # without a rewrite.
 [workspace]
-members = ["sdf", "sim", "protocol", "host", "viewer"]  # server, game return as they are ported to 3D (see PLAN.md)
+members = ["sdf", "sim", "protocol", "host", "viewer", "server"]
 resolver = "2"
+
+# The map generator evaluates millions of distances (sdf calls the terrain
+# function in sim). Unoptimised that takes about half a minute, which made every
+# test that builds the real map (a hosted match, a join) crawl. Optimising just
+# these two crates in the dev profile keeps the rest of the build fast to
+# compile and still debuggable.
+[profile.dev.package.sdf]
+opt-level = 2
+[profile.dev.package.sim]
+opt-level = 2
 
 [profile.release]
 # Smaller .wasm download for GitHub Pages.

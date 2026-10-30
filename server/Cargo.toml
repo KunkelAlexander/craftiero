@@ -5,12 +5,19 @@ edition = "2021"
 
 [dependencies]
 protocol = { path = "../protocol" }
+# A hosted match runs the real game: the same Host, Session and map as a
+# player's client would.
+host = { path = "../host" }
+sim = { path = "../sim" }
+sdf = { path = "../sdf" }
 axum = { version = "0.7", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 futures-util = "0.3"
 rand = "0.8"
 
 [dev-dependencies]
+# For the tick_cost example.
+glam = { version = "0.27", features = ["scalar-math"] }
 # A plain blocking WebSocket client, for the end-to-end test.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 # The end-to-end test starts the server itself, so it needs the runtime too.

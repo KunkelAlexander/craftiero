@@ -6,7 +6,8 @@
 //
 //   * offline / loopback: inside the game process, wired straight to the local
 //     client (today);
-//   * one player's computer, with friends connected through a relay (M5);
+//   * one player's computer, with friends connected through a relay (M5; the
+//     `Session` in session.rs is the glue between this struct and the relay);
 //   * a dedicated server binary that links this crate (maybe, one day).
 //
 // To make that possible it knows nothing about windows, sockets or clocks. Its
@@ -24,8 +25,10 @@
 // free, a friend across the internet gets fewer), so it is decided by whoever
 // owns the link, using a `Throttle`.
 
+pub mod session;
 pub mod throttle;
 
+pub use session::Session;
 pub use throttle::Throttle;
 
 use protocol::{ClientMsg, PlayerId, Snapshot, Welcome};
@@ -66,9 +69,23 @@ impl Host {
     pub fn join(&mut self) -> Option<Welcome> {
         let slot = self.controllers.iter().position(|c| matches!(c, Controller::Idle))?;
         self.controllers[slot] = Controller::Human(Input::default());
+        Some(self.welcome(slot as PlayerId))
+    }
+
+    /// The Welcome again for a player who already has a slot: a rematch, or a
+    /// client whose terrain went wrong and asked to start over
+    /// (`ClientMsg::Resync`). `None` if nobody holds that slot.
+    pub fn rewelcome(&self, id: PlayerId) -> Option<Welcome> {
+        match self.controllers.get(id as usize) {
+            Some(Controller::Human(_)) => Some(self.welcome(id)),
+            _ => None,
+        }
+    }
+
+    fn welcome(&self, you: PlayerId) -> Welcome {
         // No events: the edit log is already up to date, and replaying
         // explosions from before the newcomer arrived would be wrong.
-        Some(Welcome { you: slot as PlayerId, edits: self.edits.clone(), snapshot: self.snapshot(Vec::new()) })
+        Welcome { you, edits: self.edits.clone(), snapshot: self.snapshot(Vec::new()) }
     }
 
     /// A human goes away: the worm stays as a dummy, so the match carries on.
@@ -95,7 +112,9 @@ impl Host {
             }
             // A ping tests the connection, not the game, so whoever owns the
             // connection answers it (the host session), not this struct.
-            ClientMsg::Ping { .. } => {}
+            // A resync is the same kind of thing: the session sends the reply
+            // (`rewelcome`) down that client's own connection.
+            ClientMsg::Ping { .. } | ClientMsg::Resync => {}
         }
     }
 
@@ -151,6 +170,7 @@ impl Host {
             zones: self.world.zones.clone(),
             lava: self.world.lava.clone(),
             events,
+            edits_total: self.edits.len() as u32,
         }
     }
 }
@@ -160,7 +180,9 @@ mod tests {
     use super::*;
     use glam::{IVec3, Vec2, Vec3};
     use protocol::replica::Replica;
-    use protocol::{decode_client, decode_host, encode_client, encode_host, HostMsg};
+    use protocol::{
+        decode_client, decode_host, encode_client, encode_host, welcome_messages, HostMsg, WelcomeBuilder,
+    };
     use sim::weapons::ROCKET;
     use std::f32::consts::FRAC_PI_2;
 
@@ -184,12 +206,20 @@ mod tests {
         decode_host(&encode_host(msg)).expect("host message survives encoding")
     }
 
+    /// A welcome the way it really travels: cut into messages, each one
+    /// encoded and decoded, and put back together by the client.
+    fn over_the_wire_in_pieces(welcome: protocol::Welcome) -> protocol::Welcome {
+        let mut builder = WelcomeBuilder::default();
+        let mut done = None;
+        for msg in welcome_messages(welcome) {
+            done = builder.push(&over_the_wire(&msg));
+        }
+        done.expect("the last piece completes the welcome")
+    }
+
     fn join_as_client(host: &mut Host) -> Replica {
         let welcome = host.join().expect("a free slot");
-        match over_the_wire(&HostMsg::Welcome(welcome)) {
-            HostMsg::Welcome(w) => Replica::new(w, ground(), 0),
-            _ => unreachable!(),
-        }
+        Replica::new(over_the_wire_in_pieces(welcome), ground(), 0)
     }
 
     /// One tick of the whole pipeline: input out as bytes, snapshot back as bytes.
@@ -250,6 +280,45 @@ mod tests {
         let replica = join_as_client(&mut host);
         assert_eq!(replica.me, 1);
         assert_eq!(replica.world.grid.checksum(), host.world().grid.checksum());
+    }
+
+    /// The case the old single-message Welcome could not carry: a match that
+    /// has been dug up thousands of times. (The edits are made through the
+    /// host, as a long match would, and cover all of the ground.)
+    #[test]
+    fn a_late_joiner_can_join_a_match_with_thousands_of_edits() {
+        let mut host = host();
+        host.join();
+        for i in 0..3000 {
+            let x = 1.0 + (i % 60) as f32 * 0.4;
+            let z = 1.0 + (i / 60) as f32 * 0.5;
+            host.debug_edit(Shape::Sphere { center: Vec3::new(x, 4.0, z), radius: 0.6 }, Op::Carve);
+            if i % 10 == 0 {
+                host.tick(); // edits reach the log when a tick drains them
+            }
+        }
+        host.tick();
+        let welcome = host.rewelcome(0).expect("slot 0 is held");
+        assert_eq!(welcome.edits.len(), 3000);
+        assert!(encode_host(&HostMsg::Snapshot(welcome.snapshot.clone())).len() < 64 * 1024);
+
+        let replica = join_as_client(&mut host);
+        assert_eq!(replica.world.grid.checksum(), host.world().grid.checksum());
+        assert!(!replica.desynced());
+    }
+
+    #[test]
+    fn a_resync_gives_a_held_slot_a_fresh_welcome() {
+        let mut host = host();
+        assert!(host.rewelcome(0).is_none(), "nobody holds slot 0 yet");
+        host.join();
+        host.debug_edit(Shape::Sphere { center: Vec3::new(16.0, 4.0, 16.0), radius: 3.0 }, Op::Carve);
+        host.tick();
+        let w = host.rewelcome(0).expect("slot 0 is held");
+        assert_eq!(w.you, 0);
+        assert_eq!(w.edits.len(), 1);
+        assert_eq!(w.snapshot.edits_total, 1);
+        assert!(host.rewelcome(1).is_none(), "the idle slot gets nothing");
     }
 
     #[test]

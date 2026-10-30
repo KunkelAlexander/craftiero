@@ -19,11 +19,16 @@ mod camera;
 mod effects;
 mod feel;
 mod hud;
+mod join;
 mod local;
+mod menu;
+mod net;
+mod play;
 mod renderer;
 mod shaders;
+mod share;
+mod socket;
 mod touch;
-mod world;
 mod worm_preview;
 mod worms;
 
@@ -33,7 +38,10 @@ use effects::Effects;
 use feel::shot_kick;
 use glam::{Vec2, Vec3};
 use hud::Hud;
-use local::LocalGame;
+use play::{Play, SEED};
+// The map generator lives in `sim` so the dedicated server builds the very same
+// one; the viewer only needs to say `world::build()`.
+use sim::map as world;
 use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
 use sim::weapons::{Kind, WHIP};
@@ -51,7 +59,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 const HELP: &str = "\
 Controls
-  click the window  capture the mouse        Esc  release it (again to quit)
+  menu              click or tap PLAY / HOST / JOIN (keys P, H, J; Enter plays)
+  click the window  capture the mouse        Esc  release it (again: back to the menu)
   W A S D           run (the worm turns), mouse  look and aim
   Space             jump (hold for height); press again in mid-air to double
   left mouse        fire (hold)              right mouse  shoot the rope / let go
@@ -70,8 +79,16 @@ Controls
   F1 F2 F3          fixed render resolution 100% / 75% / 50%
   T                 automatic resolution (default): holds ~60 fps by scaling it
   G shadows   H ambient occlusion   O ink outlines   C colour grade   V vsync
-  R reset the world
-  M mute the sound (synthesised: every weapon has its own voice)";
+  R reset the world (offline only)
+  M mute the sound (synthesised: every weapon has its own voice)
+
+Online (see docs/NETWORKING.md)
+  --play | --host | --server | --join CODE
+                                  skip the menu: play offline, host a room, ask the
+                                  server to host one, or join a room
+  --shot out.png --menu title|code|notice   a picture of a menu screen
+  --relay URL                     the relay server (default ws://127.0.0.1:9001/ws,
+                                  or what RELAY_URL was at build time)";
 
 #[derive(Clone)]
 struct Config {
@@ -116,6 +133,11 @@ struct Config {
     shadows: bool,
     ao: bool,
     outlines: bool,
+    /// `--play`, `--host` or `--join CODE`: skip the menu.
+    start: Option<menu::Action>,
+    /// `--menu title|code|notice`: draw that menu screen into a screenshot, to
+    /// look at the layout without clicking through to it.
+    menu: Option<String>,
 }
 
 fn parse_args() -> Config {
@@ -143,6 +165,8 @@ fn parse_args() -> Config {
         shadows: true,
         ao: true,
         outlines: true,
+        start: None,
+        menu: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -195,14 +219,17 @@ fn parse_args() -> Config {
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
             "--no-outlines" => c.outlines = false,
+            "--menu" => c.menu = Some(value("--menu")),
+            "--play" => c.start = Some(menu::Action::Play),
+            "--host" => c.start = Some(menu::Action::Host),
+            "--server" => c.start = Some(menu::Action::ServerRoom),
+            "--join" => c.start = Some(menu::Action::Join(value("--join").trim().to_uppercase())),
+            "--relay" => net::set_relay_url(value("--relay")),
             other => panic!("unknown argument {other}\n{HELP}"),
         }
     }
     c
 }
-
-/// The seed of the sim's random numbers (weapon spread, bomblets).
-const SEED: u32 = 1;
 
 /// How far the world is pulled towards grey by default. A third is enough to
 /// stop the grass competing with the weapons without making the map look dead.
@@ -233,6 +260,17 @@ fn weapon_key(key: KeyCode) -> Option<u8> {
 
 fn spawn_camera() -> Camera {
     Camera { pos: Vec3::new(64.0, 56.0, 28.0), yaw: 0.0, pitch: -0.42, fov_y: 70f32.to_radians() }
+}
+
+/// The camera behind the menu: a slow circle high above the arena, looking at
+/// its middle. Inside the world's bounds (like the spawn camera) and above the
+/// rim peaks, so it never sits in rock.
+fn menu_camera(seconds: f32) -> Camera {
+    let centre = world::WORLD_METRES * Vec3::new(0.5, 0.0, 0.5) + Vec3::Y * 16.0;
+    let angle = seconds * 0.1;
+    let pos = Vec3::new(centre.x + angle.sin() * 44.0, 54.0, centre.z + angle.cos() * 44.0);
+    let to = (centre - pos).normalize();
+    Camera { pos, yaw: to.x.atan2(to.z), pitch: to.y.asin(), fov_y: 70f32.to_radians() }
 }
 
 fn camera_from(c: &Config) -> Camera {
@@ -478,7 +516,8 @@ fn run_shot(cfg: &Config, path: &str) {
         demo_edits(&mut world.grid);
         println!("synced {} chunks", renderer.sync(&mut world.grid));
     }
-    let cam = camera_from(cfg);
+    // The menu's own camera, unless one was asked for.
+    let cam = if cfg.menu.is_some() && cfg.cam.is_none() { menu_camera(0.0) } else { camera_from(cfg) };
     let target = Offscreen::new(&gpu.device, cfg.size);
     let positions: Vec<Vec3> = world.worms.iter().map(|w| w.pos).collect();
     let mut anims: Vec<worms::Anim> = world.worms.iter().map(|_| worms::Anim::default()).collect();
@@ -574,6 +613,25 @@ fn run_shot(cfg: &Config, path: &str) {
     renderer.render(&mut encoder, &target.view, &params);
     if cfg.hud {
         Hud::new(&gpu.device, Offscreen::FORMAT).draw(&gpu, &mut encoder, &target.view, cfg.size, &world.worms[0], None);
+    }
+    if let Some(page) = &cfg.menu {
+        let mut hud = Hud::new(&gpu.device, Offscreen::FORMAT);
+        let mut menu = menu::Menu::default();
+        match page.as_str() {
+            "title" => hud.draw_menu(&gpu, &mut encoder, &target.view, cfg.size, &menu),
+            "code" => {
+                for c in "jk7q".chars() {
+                    menu.key(menu::Key::Char(c));
+                }
+                hud.draw_menu(&gpu, &mut encoder, &target.view, cfg.size, &menu);
+            }
+            "notice" => {
+                let lines = join::Status::Connecting.lines("K7QP");
+                let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+                hud.draw_notice(&gpu, &mut encoder, &target.view, cfg.size, &lines);
+            }
+            other => panic!("--menu title, code or notice (not {other})"),
+        }
     }
     gpu.queue.submit([encoder.finish()]);
     renderer.end_frame();
@@ -930,6 +988,16 @@ fn run_bench(cfg: &Config) {
 
 // --- the interactive viewer ------------------------------------------------
 
+/// What the window is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    /// The main menu over the slowly turning arena.
+    Menu,
+    /// A match (offline, hosted or joined), or the notice that is shown while
+    /// a join is still being set up.
+    Playing,
+}
+
 struct Viewer {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -938,9 +1006,19 @@ struct Viewer {
     renderer: Renderer,
     /// Health, weapon and hit markers, drawn over the finished frame.
     hud: Hud,
-    /// The match: a host that steps the sim and the replica of it that gets
-    /// drawn (`game.replica.world`), joined by an in-memory wire. See `local.rs`.
-    game: LocalGame,
+    /// The match: its host (here, or a friend's) and the replica of it that
+    /// gets drawn (`play.replica().world`). See `play.rs` and `local.rs`.
+    play: Play,
+    /// The untouched map. A new match, a join and a return to the menu all
+    /// start from a copy of it instead of generating it again (a second or
+    /// more of work, several in a browser).
+    pristine: Grid,
+    screen: Screen,
+    menu: menu::Menu,
+    /// Where the mouse is, in window pixels (the menu needs it; play grabs it).
+    cursor: (f32, f32),
+    /// Which `Replica` the renderer was built for (see `Play::replica_id`).
+    seen_replica: u32,
     /// Fixed timestep: real time not yet turned into sim ticks.
     acc: f32,
     /// Where each worm was before the last tick, for drawing between ticks.
@@ -1092,8 +1170,10 @@ impl Viewer {
         // opened by `start_audio` on the first input instead.
         let audio_started = !cfg!(target_arch = "wasm32");
         let audio = if audio_started { Audio::new() } else { Audio::silent() };
-        let mut game = LocalGame::new(world::build(), &world::SPAWNS, SEED);
-        let world = &mut game.replica.world;
+        let pristine = world::build();
+        let mut play = Play::offline(pristine.clone());
+        let me = play.replica().me as usize;
+        let world = &mut play.replica_mut().world;
         let surface_size = (surface_cfg.width, surface_cfg.height);
         let renderer = Renderer::new(&gpu, format, surface_size, cfg.scale.min(scale_ceiling(surface_size)), &mut world.grid);
         let prev_pos = world.worms.iter().map(|w| w.pos).collect();
@@ -1105,17 +1185,22 @@ impl Viewer {
         if !fly {
             // Start already behind the worm; otherwise the first frame would
             // ease in from the spawn overview.
-            camera.follow(camera_target(world.worms[game.replica.me as usize].pos), FOLLOW_DIST, &world.grid);
+            camera.follow(camera_target(world.worms[me].pos), FOLLOW_DIST, &world.grid);
         }
         let now = Instant::now();
-        Viewer {
+        let mut viewer = Viewer {
             window,
             surface,
             surface_cfg,
             hud: Hud::new(&gpu.device, format),
             gpu,
             renderer,
-            game,
+            play,
+            pristine,
+            screen: Screen::Menu,
+            menu: menu::Menu::default(),
+            cursor: (0.0, 0.0),
+            seen_replica: 0,
             acc: 0.0,
             prev_pos,
             anims,
@@ -1164,12 +1249,162 @@ impl Viewer {
             edit_ms: 0.0,
             sync_ms: 0.0,
             synced: 0,
+        };
+        // An explicit `--cam` means "look at this spot": no menu in the way.
+        if let Some(action) = cfg.start.clone().or(fly.then_some(menu::Action::Play)) {
+            viewer.do_action(action, false);
         }
+        viewer
     }
 
     /// The worm this window plays: the slot the host gave us.
     fn me(&self) -> usize {
-        self.game.replica.me as usize
+        self.play.replica().me as usize
+    }
+
+    /// A menu choice: start the match it names and leave the menu. `by_mouse`
+    /// says the player clicked, which is also the gesture a browser needs
+    /// before it hands over the pointer.
+    fn do_action(&mut self, action: menu::Action, by_mouse: bool) {
+        // While a join is still connecting there is a notice with a button on
+        // screen; a grabbed mouse could not press it.
+        let grab = by_mouse && matches!(action, menu::Action::Play | menu::Action::Host);
+        match action {
+            menu::Action::Play => {}
+            menu::Action::Host => self.play.open_room(),
+            menu::Action::Join(code) => self.play.join(code, self.pristine.clone()),
+            menu::Action::ServerRoom => self.play.join_hosted(self.pristine.clone()),
+        }
+        self.screen = Screen::Playing;
+        if !self.fly {
+            self.snap_camera();
+        }
+        if grab {
+            self.set_grab(true);
+        }
+    }
+
+    /// Leave the match (dropping a room or a join closes its connection, which
+    /// tells the relay) and show the menu over a fresh offline world.
+    fn back_to_menu(&mut self) {
+        self.set_grab(false);
+        self.play = Play::offline(self.pristine.clone());
+        self.screen = Screen::Menu;
+        self.menu = menu::Menu::default();
+        self.rebind();
+    }
+
+    /// The match on screen is a different one (a reset, a join that began, a
+    /// resync after a lost edit): rebuild everything that was made for the old
+    /// one. The renderer in particular holds a GPU copy of one specific grid.
+    fn rebind(&mut self) {
+        self.seen_replica = self.play.replica_id();
+        self.effects = Effects::default();
+        self.audio.stop_all();
+        self.feel = CameraFeel::default();
+        let n = self.play.replica().world.worms.len();
+        self.step_dist = vec![0.0; n];
+        self.before = vec![(true, 0.0); n];
+        self.prev_pos = self.play.replica().world.worms.iter().map(|w| w.pos).collect();
+        self.anims = vec![worms::Anim::default(); n];
+        self.renderer = Renderer::new(
+            &self.gpu,
+            self.surface_cfg.format.add_srgb_suffix(),
+            (self.surface_cfg.width, self.surface_cfg.height),
+            self.renderer.scale(),
+            &mut self.play.replica_mut().world.grid,
+        );
+        if !self.fly {
+            self.snap_camera();
+        }
+    }
+
+    /// Put the worm camera right behind the player's worm instead of sweeping
+    /// in from wherever it was.
+    fn snap_camera(&mut self) {
+        let target = camera_target(self.play.replica().world.worms[self.me()].pos);
+        self.camera.follow(target, FOLLOW_DIST, &self.play.replica().world.grid);
+        self.feel.snap(target);
+    }
+
+    /// A window pixel position as HUD units (720 tall), and the screen width in them.
+    fn to_virtual(&self, px: (f32, f32)) -> ((f32, f32), f32) {
+        let scale = self.surface_cfg.height as f32 / 720.0;
+        ((px.0 / scale, px.1 / scale), self.surface_cfg.width as f32 / scale)
+    }
+
+    /// What to say instead of the match while a join has not (yet) worked.
+    fn notice(&self) -> Option<Vec<String>> {
+        let join = self.play.joined()?;
+        let status = join.status();
+        (status != join::Status::Playing).then(|| status.lines(join.code()))
+    }
+
+    /// The line across the top while playing online: the room, and who is in it.
+    fn room_note(&self) -> Option<String> {
+        if let Some(join) = self.play.joined() {
+            return Some(match join.rtt_ms() {
+                Some(ms) => format!("ROOM {}  PING {ms:.0} MS", join.code()),
+                None => format!("ROOM {}", join.code()),
+            });
+        }
+        let room = self.play.room()?;
+        Some(match (room.problem(), room.code()) {
+            (Some(problem), _) => problem.to_string(),
+            (None, Some(code)) => format!("ROOM {code}  FRIENDS {}", room.friends()),
+            (None, None) => "OPENING A ROOM...".into(),
+        })
+    }
+
+    /// A press (mouse down, finger down) at window pixels `px`. True if the
+    /// menu, a notice or the corner MENU button took it, so the game must not.
+    fn ui_press(&mut self, px: (f32, f32), by_mouse: bool) -> bool {
+        let (at, width) = self.to_virtual(px);
+        if self.screen == Screen::Menu {
+            if let Some(action) = self.menu.press(at, width) {
+                self.do_action(action, by_mouse);
+            }
+            return true;
+        }
+        if self.notice().is_some() {
+            if menu::notice_button(width).contains(at) {
+                self.back_to_menu();
+            }
+            return true;
+        }
+        // Only drawn for touch: with a mouse, Esc does it.
+        if !by_mouse && self.touch.active && menu::menu_button(width).contains(at) {
+            self.back_to_menu();
+            return true;
+        }
+        false
+    }
+
+    /// A key press while the menu is up. `text` is what the key types.
+    fn menu_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, text: Option<&str>, repeat: bool) {
+        let mut keys = Vec::new();
+        match code {
+            KeyCode::Backspace => keys.push(menu::Key::Backspace),
+            KeyCode::Enter | KeyCode::NumpadEnter if !repeat => keys.push(menu::Key::Enter),
+            KeyCode::Escape if !repeat => {
+                // Esc backs out of the code page; on the title it quits (a
+                // browser tab has nothing to quit to).
+                if self.menu.page() == menu::Page::Title && cfg!(not(target_arch = "wasm32")) {
+                    event_loop.exit();
+                }
+                keys.push(menu::Key::Escape);
+            }
+            _ if !repeat => {
+                keys.extend(text.into_iter().flat_map(str::chars).filter(char::is_ascii_alphanumeric).map(menu::Key::Char))
+            }
+            _ => {}
+        }
+        for key in keys {
+            if let Some(action) = self.menu.key(key) {
+                self.do_action(action, false);
+                break;
+            }
+        }
     }
 
     /// Open the sound device on the first user gesture (a no-op afterwards).
@@ -1190,6 +1425,13 @@ impl Viewer {
 
     /// One finger event from the touch screen (see `touch.rs`).
     fn touch_event(&mut self, id: u64, phase: touch::Phase, pos: (f32, f32)) {
+        if phase == touch::Phase::Down && self.ui_press(pos, false) {
+            return;
+        }
+        // Menu and notice screens only care about the tap itself.
+        if self.screen == Screen::Menu || self.notice().is_some() {
+            return;
+        }
         let first = !self.touch.active;
         let screen = (self.surface_cfg.width, self.surface_cfg.height);
         let reaction = self.touch.event(id, phase, pos, screen);
@@ -1334,20 +1576,21 @@ impl Viewer {
         }
     }
 
-    fn key_pressed(&mut self, event_loop: &ActiveEventLoop, key: KeyCode) {
+    fn key_pressed(&mut self, key: KeyCode) {
         self.cheat = cheat_progress(self.cheat, key);
         if self.cheat == KONAMI.len() {
             self.cheat = 0;
-            let on = self.game.toggle_infinite_ammo();
-            println!("cheat: infinite ammo {}", if on { "on" } else { "off" });
+            match self.play.toggle_infinite_ammo() {
+                Some(on) => println!("cheat: infinite ammo {}", if on { "on" } else { "off" }),
+                None => println!("cheat: only the host can change the rules"),
+            }
         }
         match key {
             KeyCode::Escape => {
                 if self.grabbed {
                     self.set_grab(false);
-                } else if cfg!(not(target_arch = "wasm32")) {
-                    // A browser tab has nothing to exit to.
-                    event_loop.exit();
+                } else {
+                    self.back_to_menu();
                 }
             }
             // A fixed scale turns the automatic one off, so the choice sticks.
@@ -1377,28 +1620,17 @@ impl Viewer {
                 if !self.fly {
                     // Coming back from the fly camera: put the worm camera
                     // where it belongs instead of sweeping in from the sky.
-                    let target = camera_target(self.game.replica.world.worms[self.me()].pos);
-                    self.camera.follow(target, FOLLOW_DIST, &self.game.replica.world.grid);
+                    let target = camera_target(self.play.replica().world.worms[self.me()].pos);
+                    self.camera.follow(target, FOLLOW_DIST, &self.play.replica().world.grid);
                     self.feel.snap(target);
                 }
             }
             KeyCode::KeyR => {
-                self.game = LocalGame::new(world::build(), &world::SPAWNS, SEED);
-                self.effects = Effects::default();
-                self.audio.stop_all();
-                self.feel = CameraFeel::default();
-                let n = self.game.replica.world.worms.len();
-                self.step_dist = vec![0.0; n];
-                self.before = vec![(true, 0.0); n];
-                self.prev_pos = self.game.replica.world.worms.iter().map(|w| w.pos).collect();
-                self.anims = vec![worms::Anim::default(); n];
-                self.renderer = Renderer::new(
-                    &self.gpu,
-                    self.surface_cfg.format.add_srgb_suffix(),
-                    (self.surface_cfg.width, self.surface_cfg.height),
-                    self.renderer.scale(),
-                    &mut self.game.replica.world.grid,
-                );
+                // A new world, but not under other people's feet.
+                if !self.play.is_joined() && self.play.room().is_none() {
+                    self.play = Play::offline(self.pristine.clone());
+                    self.rebind();
+                }
             }
             // The number row picks the weapon with that id; `-` and `=` are the
             // last two.
@@ -1412,7 +1644,7 @@ impl Viewer {
 
     /// What the keyboard and mouse ask worm 0 to do this tick.
     fn worm_input(&self) -> Input {
-        let worm = &self.game.replica.world.worms[self.me()];
+        let worm = &self.play.replica().world.worms[self.me()];
         if self.fly {
             // The free camera has the keys: the worm just stands and looks as before.
             return Input { yaw: worm.yaw, pitch: worm.pitch, weapon: self.weapon, ..Input::default() };
@@ -1440,7 +1672,7 @@ impl Viewer {
             pitch: self.camera.pitch,
             // The camera is off the look ray, so tell the sim where the
             // crosshair actually is (see `crosshair_aim`).
-            aim: crosshair_aim(&self.game.replica.world.grid, &aim_cam, worm.eye()),
+            aim: crosshair_aim(&self.play.replica().world.grid, &aim_cam, worm.eye()),
             jump: held(KeyCode::Space) || tap(touch::Button::Jump),
             dig: (live && held(KeyCode::ShiftLeft)) || tap(touch::Button::Dig),
             rope: (live && self.rmb) || tap(touch::Button::Rope),
@@ -1460,22 +1692,27 @@ impl Viewer {
         // Decay the screen flash here, not in `CameraFeel::update`: that one is
         // skipped in fly mode, and a flash must never get stuck on screen.
         self.feel.tick(dt);
-        let mut input = self.worm_input();
+        // The menu is a picture of the arena, not a game: nobody steers a worm.
+        let mut input = if self.screen == Screen::Menu { Input::default() } else { self.worm_input() };
+        // A notice (or the host leaving) can appear while the mouse is held.
+        if self.grabbed && self.notice().is_some() {
+            self.set_grab(false);
+        }
         let t = Instant::now();
         let mut ticks = 0;
         while self.acc >= DT {
-            self.prev_pos = self.game.replica.world.worms.iter().map(|w| w.pos).collect();
+            self.prev_pos = self.play.replica().world.worms.iter().map(|w| w.pos).collect();
             // Landing impact must be read before the tick: `movement::land`
             // clears `vel.y`, so afterwards every landing looks like zero.
             self.before.clear();
-            self.before.extend(self.game.replica.world.worms.iter().map(|w| (w.on_ground, w.vel.y)));
+            self.before.extend(self.play.replica().world.worms.iter().map(|w| (w.on_ground, w.vel.y)));
             input.seq = self.seq;
             self.seq = self.seq.wrapping_add(1);
-            self.game.tick(input);
+            self.play.tick(input);
             // A trail is history: it has to be emitted per sim tick, not per
             // frame, or it would grow with the frame rate.
-            self.effects.trails(&self.game.replica.world.projectiles);
-            self.effects.lava(&self.game.replica.world.lava);
+            self.effects.trails(&self.play.replica().world.projectiles);
+            self.effects.lava(&self.play.replica().world.lava);
             self.landings();
             self.acc -= DT;
             ticks += 1;
@@ -1483,13 +1720,18 @@ impl Viewer {
         if ticks > 0 {
             self.sim_ms = t.elapsed().as_secs_f64() * 1000.0;
         }
+        // A join just got its first Welcome, or was rebuilt after a lost edit:
+        // the world on screen is another one.
+        if self.play.replica_id() != self.seen_replica {
+            self.rebind();
+        }
         // The sim's events start the effects (a fireball per explosion, a line per
         // beam) and the sounds. Both are pure consumers: neither can steer the
         // sim. The renderer needs no event for terrain edits: it asks the grid
         // which chunks changed.
         let (sound_right, _) = self.camera.right_up();
         let me = self.me() as u8;
-        for event in self.game.replica.drain_events() {
+        for event in self.play.replica_mut().drain_events() {
             self.effects.add(&event);
             self.hud.event(&event, me);
             self.audio.play(&event, self.camera.pos, sound_right);
@@ -1550,7 +1792,7 @@ impl Viewer {
                     if let Some(anim) = self.anims.get_mut(victim as usize) {
                         anim.hurt(damage);
                     }
-                    self.effects.blood(pos, dir, damage, &self.game.replica.world.grid);
+                    self.effects.blood(pos, dir, damage, &self.play.replica().world.grid);
                     let away = (pos - self.camera.pos).length();
                     // The player being hit is always felt hardest.
                     let hurt = if victim == me { 1.6 } else { 1.0 };
@@ -1565,7 +1807,7 @@ impl Viewer {
                 Event::Died { victim, killer, pos } => {
                     // A death is a fountain, not a puff: the body comes apart
                     // in front of the killer.
-                    self.effects.blood(pos, Vec3::Y, 120.0, &self.game.replica.world.grid);
+                    self.effects.blood(pos, Vec3::Y, 120.0, &self.play.replica().world.grid);
                     let away = (pos - self.camera.pos).length();
                     let amount = if victim == me { 0.080 } else { 0.045 };
                     self.feel.shake(amount * (1.0 - away / 30.0).clamp(0.0, 1.0));
@@ -1583,7 +1825,7 @@ impl Viewer {
             // sliding there from where it stood, and the camera must not fly
             // across the map after it.
             if let Event::Respawned { worm } | Event::Teleported { worm, .. } = event {
-                let at = self.game.replica.world.worms[worm as usize].pos;
+                let at = self.play.replica().world.worms[worm as usize].pos;
                 self.prev_pos[worm as usize] = at;
                 self.feel.snap(camera_target(at));
                 if let Some(d) = self.step_dist.get_mut(worm as usize) {
@@ -1600,7 +1842,7 @@ impl Viewer {
             self.fly_and_edit(dt);
         }
         let t = Instant::now();
-        let n = self.renderer.sync(&mut self.game.replica.world.grid);
+        let n = self.renderer.sync(&mut self.play.replica_mut().world.grid);
         if n > 0 {
             self.sync_ms = t.elapsed().as_secs_f64() * 1000.0;
             self.synced = n;
@@ -1611,9 +1853,9 @@ impl Viewer {
     /// this tick, and how fast. Dust for every worm, a camera dip for the player
     /// only (the camera follows our own worm).
     fn landings(&mut self) {
-        for i in 0..self.before.len().min(self.game.replica.world.worms.len()) {
+        for i in 0..self.before.len().min(self.play.replica().world.worms.len()) {
             let (was_grounded, fall) = self.before[i];
-            let w = &self.game.replica.world.worms[i];
+            let w = &self.play.replica().world.worms[i];
             let Some(impact) = landing_impact(was_grounded, w.on_ground, fall) else {
                 continue;
             };
@@ -1659,16 +1901,16 @@ impl Viewer {
         // Edit. A button held down repeats at 20 Hz, so digging is a motion and
         // not a series of clicks.
         self.edit_cooldown -= dt;
-        let aim = aim_point(&self.game.replica.world.grid, &self.camera);
+        let aim = aim_point(&self.play.replica().world.grid, &self.camera);
         if self.grabbed && (self.lmb || self.rmb) && self.edit_cooldown <= 0.0 {
             if let Some(p) = aim {
                 let t = Instant::now();
                 let (shape, op) = if self.lmb {
                     carve_edit(p, self.brush_radius)
                 } else {
-                    build_edit(&self.game.replica.world.grid, p, self.brush_radius)
+                    build_edit(&self.play.replica().world.grid, p, self.brush_radius)
                 };
-                self.game.debug_edit(shape, op);
+                self.play.debug_edit(shape, op);
                 self.edit_ms = t.elapsed().as_secs_f64() * 1000.0;
                 self.edit_cooldown = 0.05;
             }
@@ -1689,10 +1931,10 @@ impl Viewer {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         self.update(dt);
-        if self.anims.len() != self.game.replica.world.worms.len() {
-            self.anims.resize(self.game.replica.world.worms.len(), worms::Anim::default());
+        if self.anims.len() != self.play.replica().world.worms.len() {
+            self.anims.resize(self.play.replica().world.worms.len(), worms::Anim::default());
         }
-        for (anim, worm) in self.anims.iter_mut().zip(&self.game.replica.world.worms) {
+        for (anim, worm) in self.anims.iter_mut().zip(&self.play.replica().world.worms) {
             anim.update(worm, dt);
         }
 
@@ -1700,39 +1942,43 @@ impl Viewer {
         // Without this, on a display that is not exactly 60 Hz some frames would
         // show two ticks of movement and some none, and the worm would judder.
         let alpha = (self.acc / DT).clamp(0.0, 1.0);
+        let me = self.me();
+        let menu_up = self.screen == Screen::Menu;
         let draw_pos: Vec<Vec3> =
-            self.game.replica.world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
+            self.play.replica().world.worms.iter().zip(&self.prev_pos).map(|(w, &p)| p.lerp(w.pos, alpha)).collect();
         // Speed widens the view: the world streams past faster at the edges,
         // which is a cheap way to make fast movement FEEL fast. Horizontal
         // speed only: a straight-up jump must not read as a speed boost (the
         // sim's jump rule is the same, see `movement.rs`).
         const CALM_SPEED: f32 = 6.0; // no widening up to this speed
-        let speed = if self.fly { 0.0 } else { Vec2::new(self.game.replica.world.worms[self.me()].vel.x, self.game.replica.world.worms[self.me()].vel.z).length() };
+        let speed = if self.fly { 0.0 } else { Vec2::new(self.play.replica().world.worms[self.me()].vel.x, self.play.replica().world.worms[self.me()].vel.z).length() };
         let widen = ((speed - CALM_SPEED) / 12.0).clamp(0.0, 1.0);
         let target_fov = (70.0 + 14.0 * widen).to_radians();
         self.camera.fov_y += (target_fov - self.camera.fov_y) * (dt * 5.0).min(1.0);
         // A wind-up narrows the view, so the release has something to open out
         // from. Only the drawn copy changes; the clean fov is the aim's.
-        let charge = if self.fly { 0.0 } else { self.game.replica.world.worms[self.me()].charge_fraction() };
+        let charge = if self.fly { 0.0 } else { self.play.replica().world.worms[self.me()].charge_fraction() };
         self.feel.set_charge(charge);
         self.audio.set_charge(charge);
         // The camera follows a smoothed point and adds its cosmetic offsets to
         // a copy. `self.camera` stays the clean camera used for aim.
-        let render_camera = if self.fly {
+        let render_camera = if menu_up {
+            menu_camera((now - self.started).as_secs_f32())
+        } else if self.fly {
             self.camera
         } else {
-            self.feel.update(dt, &mut self.camera, camera_target(draw_pos[0]), FOLLOW_DIST, &self.game.replica.world.grid);
+            self.feel.update(dt, &mut self.camera, camera_target(draw_pos[me]), FOLLOW_DIST, &self.play.replica().world.grid);
             self.feel.render(self.camera)
         };
 
         // Footsteps: a puff every couple of metres, so running reads as
         // contact with the ground even though the worm has no legs.
-        if self.step_dist.len() != self.game.replica.world.worms.len() {
-            self.step_dist.resize(self.game.replica.world.worms.len(), 0.0);
+        if self.step_dist.len() != self.play.replica().world.worms.len() {
+            self.step_dist.resize(self.play.replica().world.worms.len(), 0.0);
         }
         if !self.fly {
-            for i in 0..self.game.replica.world.worms.len() {
-                let w = &self.game.replica.world.worms[i];
+            for i in 0..self.play.replica().world.worms.len() {
+                let w = &self.play.replica().world.worms[i];
                 let speed = Vec3::new(w.vel.x, 0.0, w.vel.z).length();
                 // A dash leaves speed lines instead of footsteps, spaced by the
                 // distance run like the steps are.
@@ -1758,35 +2004,37 @@ impl Viewer {
             }
         }
 
-        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.game.replica.world.worms, &draw_pos, &mut self.anims, dt);
+        let (mut capsules, whip_glow, worm_sdfs) = worms::draw(&self.play.replica().world.worms, &draw_pos, &mut self.anims, dt);
         // A charge is state, not an event: draw it for every worm, so a Nova
         // spin-up is a warning you can see coming.
-        for worm in &self.game.replica.world.worms {
+        for worm in &self.play.replica().world.worms {
             capsules.extend(effects::charging(worm));
         }
         // The aim aid comes before the effects so a busy fight trims smoke and
         // sparks, not the marker the player is looking at.
-        if !self.fly {
-            if let Some(path) = self.game.replica.world.aim_path(0) {
-                capsules.extend(effects::trajectory(&path, &self.game.replica.world.grid));
+        if !self.fly && !menu_up {
+            if let Some(path) = self.play.replica().world.aim_path(me) {
+                capsules.extend(effects::trajectory(&path, &self.play.replica().world.grid));
             }
         }
-        capsules.extend(effects::projectiles(&self.game.replica.world.projectiles, alpha));
+        capsules.extend(effects::projectiles(&self.play.replica().world.projectiles, alpha));
         capsules.extend(self.effects.core_capsules());
         // Soft effects, surface marks and blood: billboards and decals, sorted
         // so alpha smoke draws back-to-front. Blood never touches the capsule
         // pool, so spray cannot trim a worm, the aim aid or a rocket.
         let mut sprites = self.effects.sprites();
-        let (lava_glow, lava_body) = effects::lava_sprites(&self.game.replica.world.lava, alpha);
+        let (lava_glow, lava_body) = effects::lava_sprites(&self.play.replica().world.lava, alpha);
         sprites.glow.extend(lava_glow);
         sprites.smoke.extend(lava_body);
         sprites.glow.extend(whip_glow);
         sprites.sort_smoke(render_camera.pos);
         // Show where a dig would land (or, flying, where the brush would).
-        let brush = if self.fly {
-            aim_point(&self.game.replica.world.grid, &self.camera).map(|p| (p, self.brush_radius))
+        let brush = if menu_up {
+            None
+        } else if self.fly {
+            aim_point(&self.play.replica().world.grid, &self.camera).map(|p| (p, self.brush_radius))
         } else {
-            dig_target(&self.game.replica.world.grid, &self.game.replica.world.worms[self.me()]).map(|p| (p, DIG_RADIUS))
+            dig_target(&self.play.replica().world.grid, &self.play.replica().world.worms[self.me()]).map(|p| (p, DIG_RADIUS))
         };
 
         let (frame, suboptimal) = match self.surface.get_current_texture() {
@@ -1828,11 +2076,18 @@ impl Viewer {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.renderer.render(&mut encoder, &view, &params);
         self.hud.tick(dt);
-        // The free camera is a debug view, not a worm's: no worm HUD there.
-        if !self.fly {
-            let screen = (self.surface_cfg.width, self.surface_cfg.height);
+        let screen = (self.surface_cfg.width, self.surface_cfg.height);
+        if menu_up {
+            self.hud.draw_menu(&self.gpu, &mut encoder, &view, screen, &self.menu);
+        } else if let Some(lines) = self.notice() {
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            self.hud.draw_notice(&self.gpu, &mut encoder, &view, screen, &lines);
+        } else if !self.fly {
+            // The free camera is a debug view, not a worm's: no worm HUD there.
             let touch = self.touch.active.then_some(&self.touch);
-            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.game.replica.world.worms[self.me()], touch);
+            let note = self.room_note();
+            self.hud.set_note(note);
+            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.play.replica().world.worms[me], touch);
         }
         self.gpu.queue.submit([encoder.finish()]);
         self.renderer.end_frame();
@@ -1853,7 +2108,7 @@ impl Viewer {
         if elapsed >= 0.5 {
             let on = |b| if b { "on" } else { "off" };
             // No text rendering yet (the HUD is M6): the title bar carries it.
-            let me = &self.game.replica.world.worms[self.me()];
+            let me = &self.play.replica().world.worms[self.me()];
             let gun = &me.weapons[me.current];
             let def = &WEAPONS[gun.id as usize];
             let ammo = if !me.alive {
@@ -2001,8 +2256,10 @@ impl ApplicationHandler<Viewer> for App {
                         ElementState::Pressed => {
                             v.start_audio();
                             v.keys.insert(code);
-                            if !event.repeat {
-                                v.key_pressed(event_loop, code);
+                            if v.screen == Screen::Menu {
+                                v.menu_key(event_loop, code, event.text.as_deref(), event.repeat);
+                            } else if !event.repeat {
+                                v.key_pressed(code);
                             }
                         }
                         ElementState::Released => {
@@ -2011,12 +2268,15 @@ impl ApplicationHandler<Viewer> for App {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => v.cursor = (position.x as f32, position.y as f32),
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 if down {
                     v.start_audio();
                 }
                 match button {
+                    // A click on the menu, a notice or a button is not the game's.
+                    MouseButton::Left if down && v.ui_press(v.cursor, true) => {}
                     // The click that captures the mouse does not also dig.
                     MouseButton::Left if down && !v.grabbed => v.set_grab(true),
                     MouseButton::Left => v.lmb = down,
@@ -2086,6 +2346,18 @@ fn run_window(cfg: Config) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_menu_camera_circles_inside_the_world_and_faces_the_middle() {
+        let bounds = world::WORLD_METRES;
+        let middle = bounds * Vec3::new(0.5, 0.0, 0.5);
+        for step in 0..100 {
+            let cam = menu_camera(step as f32 * 0.7);
+            assert!(cam.pos.cmpgt(Vec3::ZERO).all() && cam.pos.cmplt(bounds).all(), "camera left the world at {:?}", cam.pos);
+            let to_middle = (middle + Vec3::Y * 16.0 - cam.pos).normalize();
+            assert!(cam.forward().dot(to_middle) > 0.999, "not looking at the arena");
+        }
+    }
+
     #[test]
     fn the_cheat_code_needs_the_whole_sequence_and_forgives_a_stutter() {
         let run = |keys: &[KeyCode]| keys.iter().fold(0, |p, &k| cheat_progress(p, k));

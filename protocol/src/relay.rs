@@ -31,13 +31,29 @@ pub const MAX_PEERS: usize = 5;
 pub const CODE_LEN: usize = 4;
 pub const CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+/// Which build of the game's wire format and rules this is. The relay never
+/// decodes game bytes, so it cannot tell an old client from a new one by
+/// itself. Instead the host states its version when it opens a room and a
+/// joiner states its own: the relay only compares the two numbers.
+///
+/// BUMP THIS whenever `ClientMsg`/`HostMsg`/`Snapshot`/`Event`, `sdf::Shape`
+/// or the map generator change. Without it a stale browser tab would decode
+/// the new bytes into nonsense (bincode has no field names) or fail silently.
+pub const PROTOCOL_VERSION: u16 = 1;
+
 /// Client -> relay.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ToRelay {
     /// "Open a room and make me its host."
-    CreateRoom,
-    /// "Put me in the room with this code."
-    JoinRoom { code: String },
+    CreateRoom { version: u16 },
+    /// "Run a match for me on the server." The server opens a room, hosts it
+    /// itself (see server/src/matches.rs) and puts this connection in it as an
+    /// ordinary joiner: it answers `RoomCreated` and then `RoomJoined`. The
+    /// code works for friends exactly as with `CreateRoom`.
+    CreateHostedRoom { version: u16 },
+    /// "Put me in the room with this code." Refused with
+    /// `Reject::VersionMismatch` unless `version` equals the host's.
+    JoinRoom { code: String, version: u16 },
     /// Forward `bytes` to someone in my room.
     ///   * from the host: `to` picks one peer, or `None` for everyone;
     ///   * from a joiner: always goes to the host and `to` is ignored (a
@@ -74,4 +90,9 @@ pub enum Reject {
     RoomFull,
     /// You already host or have joined a room on this connection.
     AlreadyInRoom,
+    /// The room's host runs a different build (`PROTOCOL_VERSION`): one of you
+    /// needs to reload or update.
+    VersionMismatch,
+    /// The server cannot take on another hosted match right now.
+    ServerBusy,
 }

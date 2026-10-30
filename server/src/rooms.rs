@@ -29,12 +29,17 @@ pub enum Role {
 
 struct Room {
     host: Tx,
+    /// The host's `PROTOCOL_VERSION`; joiners must match it.
+    version: u16,
     peers: BTreeMap<PeerId, Tx>,
 }
 
 #[derive(Default)]
 pub struct Rooms {
     rooms: HashMap<String, Room>,
+    /// Matches the server itself is running (see matches.rs), counted so it
+    /// can refuse more than it can carry.
+    pub hosted_matches: usize,
 }
 
 fn send(tx: &Tx, msg: &FromRelay) {
@@ -48,17 +53,23 @@ impl Rooms {
     /// outgoing queue; `role` is updated if the message changes it.
     pub fn handle(&mut self, role: &mut Role, tx: &Tx, msg: ToRelay) {
         match msg {
-            ToRelay::CreateRoom => {
+            ToRelay::CreateRoom { version } => {
                 if !matches!(role, Role::Lobby) {
                     return send(tx, &FromRelay::Rejected(Reject::AlreadyInRoom));
                 }
                 let code = self.new_code();
-                self.rooms.insert(code.clone(), Room { host: tx.clone(), peers: BTreeMap::new() });
+                let room = Room { host: tx.clone(), version, peers: BTreeMap::new() };
+                self.rooms.insert(code.clone(), room);
                 send(tx, &FromRelay::RoomCreated { code: code.clone() });
                 *role = Role::Host { code };
             }
 
-            ToRelay::JoinRoom { code } => {
+            // Needs a task that runs the match, which this synchronous code
+            // cannot start; `connection` in lib.rs hands it to `matches::start`
+            // before it ever gets here.
+            ToRelay::CreateHostedRoom { .. } => {}
+
+            ToRelay::JoinRoom { code, version } => {
                 if !matches!(role, Role::Lobby) {
                     return send(tx, &FromRelay::Rejected(Reject::AlreadyInRoom));
                 }
@@ -67,6 +78,9 @@ impl Rooms {
                 let Some(room) = self.rooms.get_mut(&code) else {
                     return send(tx, &FromRelay::Rejected(Reject::NoSuchRoom));
                 };
+                if room.version != version {
+                    return send(tx, &FromRelay::Rejected(Reject::VersionMismatch));
+                }
                 // Lowest free id from 1 up. Ids are reused after someone leaves.
                 let free = (1..=MAX_PEERS as PeerId).find(|p| !room.peers.contains_key(p));
                 let Some(peer) = free else {
@@ -144,7 +158,7 @@ impl Rooms {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::decode_from_relay;
+    use protocol::{decode_from_relay, PROTOCOL_VERSION};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
     /// A fake connection: its role, its outgoing queue, and the receiving end
@@ -177,7 +191,7 @@ mod tests {
 
     /// Host creates a room; returns its code.
     fn open_room(rooms: &mut Rooms, host: &mut Conn) -> String {
-        host.say(rooms, ToRelay::CreateRoom);
+        host.say(rooms, ToRelay::CreateRoom { version: PROTOCOL_VERSION });
         match host.heard().pop() {
             Some(FromRelay::RoomCreated { code }) => code,
             other => panic!("expected RoomCreated, got {other:?}"),
@@ -191,7 +205,7 @@ mod tests {
         let code = open_room(&mut rooms, &mut host);
         assert_eq!(code.len(), CODE_LEN);
 
-        friend.say(&mut rooms, ToRelay::JoinRoom { code: code.to_lowercase() });
+        friend.say(&mut rooms, ToRelay::JoinRoom { code: code.to_lowercase(), version: PROTOCOL_VERSION });
         assert!(matches!(friend.heard()[..], [FromRelay::RoomJoined]));
         assert!(matches!(host.heard()[..], [FromRelay::PeerJoined(1)]));
     }
@@ -201,8 +215,8 @@ mod tests {
         let mut rooms = Rooms::default();
         let (mut host, mut a, mut b) = (conn(), conn(), conn());
         let code = open_room(&mut rooms, &mut host);
-        a.say(&mut rooms, ToRelay::JoinRoom { code: code.clone() });
-        b.say(&mut rooms, ToRelay::JoinRoom { code });
+        a.say(&mut rooms, ToRelay::JoinRoom { code: code.clone(), version: PROTOCOL_VERSION });
+        b.say(&mut rooms, ToRelay::JoinRoom { code, version: PROTOCOL_VERSION });
         host.heard();
         a.heard();
         b.heard();
@@ -226,12 +240,26 @@ mod tests {
     fn bad_requests_are_rejected() {
         let mut rooms = Rooms::default();
         let (mut host, mut friend) = (conn(), conn());
-        friend.say(&mut rooms, ToRelay::JoinRoom { code: "ZZZZ".into() });
+        friend.say(&mut rooms, ToRelay::JoinRoom { code: "ZZZZ".into(), version: PROTOCOL_VERSION });
         assert!(matches!(friend.heard()[..], [FromRelay::Rejected(Reject::NoSuchRoom)]));
 
         open_room(&mut rooms, &mut host);
-        host.say(&mut rooms, ToRelay::CreateRoom);
+        host.say(&mut rooms, ToRelay::CreateRoom { version: PROTOCOL_VERSION });
         assert!(matches!(host.heard()[..], [FromRelay::Rejected(Reject::AlreadyInRoom)]));
+    }
+
+    #[test]
+    fn a_joiner_from_another_build_is_turned_away() {
+        let mut rooms = Rooms::default();
+        let (mut host, mut friend) = (conn(), conn());
+        let code = open_room(&mut rooms, &mut host);
+
+        friend.say(&mut rooms, ToRelay::JoinRoom { code, version: PROTOCOL_VERSION + 1 });
+        assert!(matches!(friend.heard()[..], [FromRelay::Rejected(Reject::VersionMismatch)]));
+        // The host never hears about it, and the friend can still try again
+        // from the lobby (with the right build).
+        assert!(host.heard().is_empty());
+        assert!(matches!(friend.role, Role::Lobby));
     }
 
     #[test]
@@ -241,15 +269,15 @@ mod tests {
         let code = open_room(&mut rooms, &mut host);
         let mut joiners: Vec<Conn> = (0..MAX_PEERS).map(|_| conn()).collect();
         for j in &mut joiners {
-            j.say(&mut rooms, ToRelay::JoinRoom { code: code.clone() });
+            j.say(&mut rooms, ToRelay::JoinRoom { code: code.clone(), version: PROTOCOL_VERSION });
         }
         let mut extra = conn();
-        extra.say(&mut rooms, ToRelay::JoinRoom { code: code.clone() });
+        extra.say(&mut rooms, ToRelay::JoinRoom { code: code.clone(), version: PROTOCOL_VERSION });
         assert!(matches!(extra.heard()[..], [FromRelay::Rejected(Reject::RoomFull)]));
 
         // Peer 3 leaves; the next arrival takes id 3.
         rooms.leave(&joiners[2].role);
-        extra.say(&mut rooms, ToRelay::JoinRoom { code });
+        extra.say(&mut rooms, ToRelay::JoinRoom { code, version: PROTOCOL_VERSION });
         assert!(matches!(extra.role, Role::Joiner { peer: 3, .. }));
     }
 
@@ -258,7 +286,7 @@ mod tests {
         let mut rooms = Rooms::default();
         let (mut host, mut friend) = (conn(), conn());
         let code = open_room(&mut rooms, &mut host);
-        friend.say(&mut rooms, ToRelay::JoinRoom { code });
+        friend.say(&mut rooms, ToRelay::JoinRoom { code, version: PROTOCOL_VERSION });
         friend.heard();
 
         rooms.leave(&host.role);
@@ -271,7 +299,7 @@ mod tests {
         let mut rooms = Rooms::default();
         let (mut host, mut friend) = (conn(), conn());
         let code = open_room(&mut rooms, &mut host);
-        friend.say(&mut rooms, ToRelay::JoinRoom { code });
+        friend.say(&mut rooms, ToRelay::JoinRoom { code, version: PROTOCOL_VERSION });
         host.heard();
 
         rooms.leave(&friend.role);

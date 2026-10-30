@@ -28,10 +28,24 @@ png = "0.18"
 # awaits them instead (see `create_viewer` in main.rs).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "1"
+# Native WebSocket for online play (the web build uses the browser's own, see
+# socket.rs). The rustls feature lets a desktop client reach a `wss://` relay:
+# Render only serves https/wss.
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# The end-to-end tests in local.rs run a real relay in-process.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+server = { path = "../server" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 cpal = { version = "0.18", features = ["wasm-bindgen"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3", features = ["console", "Window", "Document", "Element", "HtmlCanvasElement"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console", "Window", "Document", "Element", "HtmlCanvasElement",
+    # The relay connection (socket.rs).
+    "WebSocket", "BinaryType", "MessageEvent",
+] }

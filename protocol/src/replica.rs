@@ -61,6 +61,10 @@ pub struct Replica {
     /// Seconds since the newest snapshot arrived. Snapshots come in steps, but
     /// time does not, so this makes the target move smoothly too.
     since_newest: f32,
+    /// Terrain edits applied to `world.grid` so far (the Welcome's log plus
+    /// every `Edit` event shown). Compared with the host's own count.
+    edits_applied: u32,
+    desynced: bool,
 }
 
 impl Replica {
@@ -84,17 +88,29 @@ impl Replica {
             queue: VecDeque::from([welcome.snapshot]),
             playhead,
             since_newest: 0.0,
+            edits_applied: welcome.edits.len() as u32,
+            desynced: false,
         };
         replica.present();
         replica
     }
 
+    /// True once this replica has shown a snapshot whose edit count differs
+    /// from the number of edits it applied: a terrain edit got lost, so the
+    /// terrain no longer matches the host's. The cure is a new Welcome
+    /// (`ClientMsg::Resync`) and a new `Replica` built from it. Stays true:
+    /// there is no repairing a replica in place.
+    pub fn desynced(&self) -> bool {
+        self.desynced
+    }
+
     /// Feed in one message from the host.
     pub fn apply(&mut self, msg: HostMsg) {
         match msg {
-            // A second Welcome means the host restarted the match; the caller
-            // (who owns the map generator) builds a new `Replica` for it.
-            HostMsg::Welcome(_) => {}
+            // A second Welcome means the host restarted the match (or answered
+            // a resync); the caller (who owns the map generator) collects it
+            // with a `WelcomeBuilder` and builds a new `Replica` for it.
+            HostMsg::Welcome(_) | HostMsg::Edits(_) => {}
             // Only queued: nothing is drawn from it until `advance` gets there.
             HostMsg::Snapshot(s) => {
                 self.queue.push_back(s);
@@ -154,12 +170,18 @@ impl Replica {
             for event in &passed.events {
                 if let Event::Edit { shape, op } = *event {
                     self.world.grid.apply(shape, op);
+                    self.edits_applied += 1;
                 }
             }
             self.events.append(&mut passed.events);
         }
 
         let from = &self.queue[0];
+        // Everything up to `from` has now happened here, so our count must be
+        // the host's count at that snapshot.
+        if self.edits_applied != from.edits_total {
+            self.desynced = true;
+        }
         self.playhead = self.playhead.max(from.tick as f32);
         self.world.tick = from.tick;
         // Overwrite, don't merge: the host is the authority, so its word is
@@ -230,7 +252,10 @@ mod tests {
     fn snapshot(tick: u32, events: Vec<Event>) -> Snapshot {
         let mut worms = world().worms;
         worms[0].pos = vec3(tick as f32, 0.0, 0.0);
-        Snapshot { tick, worms, projectiles: Vec::new(), zones: Vec::new(), lava: Vec::new(), events }
+        // The helper's matches only ever start from a fresh map, so the host's
+        // running count is simply the edits these events carry.
+        let edits_total = events.iter().filter(|e| matches!(e, Event::Edit { .. })).count() as u32;
+        Snapshot { tick, worms, projectiles: Vec::new(), zones: Vec::new(), lava: Vec::new(), events, edits_total }
     }
 
     fn replica(delay: u32) -> Replica {
@@ -327,7 +352,41 @@ mod tests {
         let (shape, op) = crater();
         let mut host_map = map();
         host_map.apply(shape, op);
-        let r = Replica::new(Welcome { you: 0, edits: vec![(shape, op)], snapshot: snapshot(0, Vec::new()) }, map(), 0);
+        let mut at_join = snapshot(0, Vec::new());
+        at_join.edits_total = 1; // the host had made that one edit already
+        let r = Replica::new(Welcome { you: 0, edits: vec![(shape, op)], snapshot: at_join }, map(), 0);
         assert_eq!(r.world.grid.checksum(), host_map.checksum());
+        assert!(!r.desynced(), "the log in the welcome counts as applied");
+    }
+
+    #[test]
+    fn a_replica_that_applied_every_edit_is_in_sync() {
+        let mut r = replica(0);
+        let (shape, op) = crater();
+        arrive(&mut r, 1, vec![Event::Edit { shape, op }]);
+        r.advance(0.0);
+        assert!(!r.desynced());
+    }
+
+    #[test]
+    fn a_missing_edit_is_noticed() {
+        let mut r = replica(0);
+        // The host says one edit exists by this snapshot, but its event never
+        // reached us (a bug, a lost message).
+        let mut s = snapshot(1, Vec::new());
+        s.edits_total = 1;
+        r.apply(HostMsg::Snapshot(s));
+        r.advance(0.0);
+        assert!(r.desynced());
+    }
+
+    #[test]
+    fn an_edit_still_in_our_future_is_not_a_desync() {
+        let mut r = replica(6);
+        let (shape, op) = crater();
+        arrive(&mut r, 2, vec![Event::Edit { shape, op }]);
+        r.playhead = 1.0; // the snapshot with the edit is not shown yet
+        r.present();
+        assert!(!r.desynced(), "we compare at the moment a snapshot is shown, not when it arrives");
     }
 }

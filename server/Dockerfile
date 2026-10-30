@@ -1,8 +1,9 @@
 # The relay as a container. Build it from the REPO ROOT (the server depends on
-# the `protocol` and `sim` crates next to it):
+# the `protocol`, `host`, `sim` and `sdf` crates next to it, and Cargo needs the
+# whole workspace to resolve Cargo.lock):
 #
-#     docker build -f server/Dockerfile -t neon-relay .
-#     docker run -p 9001:8080 neon-relay        # then ws://127.0.0.1:9001/ws
+#     docker build -f server/Dockerfile -t craftiero-relay .
+#     docker run -p 9001:8080 craftiero-relay   # then ws://127.0.0.1:9001/ws
 #
 # Two stages: compile with the whole Rust toolchain, then ship only the binary
 # in a small image. Both stages name the same Debian release on purpose: a

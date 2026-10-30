@@ -20,8 +20,15 @@ jobs:
       # The wasm-bindgen CLI must be the same version as the crate in Cargo.lock.
       - name: Install wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      # Where the game finds the relay: a repository variable (Settings ->
+      # Secrets and variables -> Actions -> Variables), e.g. wss://<name>.onrender.com/ws.
+      # An empty or missing one must not override the built-in default.
       - name: Build the game
-        run: sh web/build.sh
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL }}
+        run: |
+          if [ -z "$RELAY_URL" ]; then unset RELAY_URL; fi
+          sh web/build.sh
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web
