@@ -8,7 +8,7 @@ gameplay beats graphics.
 It is also a learning project: the code is commented to explain *why*, names the
 patterns from *Game Programming Patterns* where they are used, and will explain
 the networking concepts where they appear.
-
+ 
 **Where it is:** milestone M3 of seven. You play a worm in a cave-and-hills
 world: walk, jump, dig tunnels and swing on a ninja rope, at 60 fps on an
 integrated laptop GPU, and now fight: twelve weapons (rockets, a railgun, bombs,
