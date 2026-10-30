@@ -43,6 +43,14 @@
   #rotate svg { width: 72px; height: 72px; animation: turn 2.4s ease-in-out infinite; }
   @keyframes turn { 0%, 30% { transform: rotate(0); } 70%, 100% { transform: rotate(-90deg); } }
   @media (orientation: portrait) and (pointer: coarse) { #rotate { display: flex; } }
+  /* Touch devices only; shown while the page is not fullscreen. */
+  #fs {
+    display: none; position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right));
+    z-index: 5; width: 44px; height: 44px; padding: 0; border-radius: 10px; cursor: pointer;
+    border: 2px solid #1b120a; background: #ffb347cc; touch-action: manipulation;
+  }
+  #fs svg { width: 24px; height: 24px; }
+  @media (pointer: coarse) { #fs.can { display: block; } }
   #hint {
     position: fixed; left: 0; right: 0; bottom: 12px; text-align: center; color: #cfd6e4aa;
     font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
@@ -62,6 +70,11 @@
   </svg>
   <div>Turn your phone sideways to play</div>
 </div>
+<button id="fs" aria-label="Fullscreen">
+  <svg viewBox="0 0 24 24" fill="none" stroke="#1b120a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>
+  </svg>
+</button>
 <div id="hint">Click to play &middot; WASD move &middot; mouse aim &middot; LMB fire &middot; RMB rope &middot; Shift dig &middot; Space jump &middot; Esc release mouse &middot; M mute</div>
 <script type="module">
   const msg = document.getElementById("msg");
@@ -74,6 +87,21 @@
   if (matchMedia("(pointer: coarse)").matches) {
     hint.textContent = "Left thumb: move · right thumb: look · hold FIRE or DIG and drag to aim at the same time · tap the weapon to switch";
     addEventListener("touchstart", () => hint.remove(), { once: true, passive: true });
+  }
+
+  // Fullscreen: a button, plus an automatic switch on the first tap. The browser
+  // only allows it inside a user gesture, and touchend counts (touchstart does
+  // not). iPhone Safari has no element fullscreen, so there the button stays hidden.
+  const fs = document.getElementById("fs");
+  const root = document.documentElement;
+  const enterFullscreen = () => (root.requestFullscreen || root.webkitRequestFullscreen)?.call(root)?.catch?.(() => {});
+  if (matchMedia("(pointer: coarse)").matches && (root.requestFullscreen || root.webkitRequestFullscreen)) {
+    const sync = () => fs.classList.toggle("can", !(document.fullscreenElement || document.webkitFullscreenElement));
+    sync();
+    document.addEventListener("fullscreenchange", sync);
+    document.addEventListener("webkitfullscreenchange", sync);
+    fs.addEventListener("click", enterFullscreen);
+    addEventListener("touchend", () => { if (fs.classList.contains("can")) enterFullscreen(); }, { once: true, passive: true });
   }
 
   // The renderer ray-marches a 3D texture and reads storage buffers in fragment
