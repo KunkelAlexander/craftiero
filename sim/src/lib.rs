@@ -34,5 +34,5 @@ pub use lava::{LavaBit, STAMP_RADIUS};
 pub use weapons::{WeaponDef, WeaponState, ARSENAL, WEAPONS};
 pub use world::{
     dig_target, Action, Event, Rope, World, Worm, Zone, ZoneKind, DIG_RADIUS, DT, EYE_HEIGHT,
-    WORM_HEIGHT, WORM_RADIUS,
+    SCORE_LIMIT, WORM_HEIGHT, WORM_RADIUS,
 };

@@ -130,6 +130,8 @@ struct Config {
     aim: bool,
     /// `--hud`: draw the HUD in a screenshot (the live game always has it).
     hud: bool,
+    /// `--won`: show the HUD of a finished match (with `--hud`).
+    won: bool,
     shadows: bool,
     ao: bool,
     outlines: bool,
@@ -155,6 +157,7 @@ fn parse_args() -> Config {
         rope: false,
         fire: None,
         weapon: None,
+        won: false,
         hurt: None,
         flash: None,
         boom: None,
@@ -216,6 +219,7 @@ fn parse_args() -> Config {
             "--no-brush" => c.brush = false,
             "--no-aim" => c.aim = false,
             "--hud" => c.hud = true,
+            "--won" => c.won = true,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
             "--no-outlines" => c.outlines = false,
@@ -612,7 +616,17 @@ fn run_shot(cfg: &Config, path: &str) {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     renderer.render(&mut encoder, &target.view, &params);
     if cfg.hud {
-        Hud::new(&gpu.device, Offscreen::FORMAT).draw(&gpu, &mut encoder, &target.view, cfg.size, &world.worms[0], None);
+        if cfg.won {
+            // Two rivals with scores, so the result has rows to show.
+            for (kills, deaths) in [(9, 14), (4, 15)] {
+                let mut rival = sim::Worm::new(world.worms[0].pos);
+                (rival.kills, rival.deaths) = (kills, deaths);
+                world.worms.push(rival);
+            }
+            world.worms[0].kills = world.score_limit;
+            world.winner = Some(0);
+        }
+        Hud::new(&gpu.device, Offscreen::FORMAT).draw(&gpu, &mut encoder, &target.view, cfg.size, &world, 0, None);
     }
     if let Some(page) = &cfg.menu {
         let mut hud = Hud::new(&gpu.device, Offscreen::FORMAT);
@@ -1377,6 +1391,15 @@ impl Viewer {
             self.back_to_menu();
             return true;
         }
+        // Likewise R, for the button under the result of a finished match.
+        if !by_mouse
+            && self.touch.active
+            && self.play.replica().world.winner.is_some()
+            && menu::rematch_button(width).contains(at)
+        {
+            self.play.rematch();
+            return true;
+        }
         false
     }
 
@@ -1626,8 +1649,12 @@ impl Viewer {
                 }
             }
             KeyCode::KeyR => {
-                // A new world, but not under other people's feet.
-                if !self.play.is_joined() && self.play.room().is_none() {
+                if self.play.replica().world.winner.is_some() {
+                    // The match is over: ask for another with the same people
+                    // (the host starts it, and every replica is rebuilt).
+                    self.play.rematch();
+                } else if !self.play.is_joined() && self.play.room().is_none() {
+                    // A new world, but not under other people's feet.
                     self.play = Play::offline(self.pristine.clone());
                     self.rebind();
                 }
@@ -2087,7 +2114,7 @@ impl Viewer {
             let touch = self.touch.active.then_some(&self.touch);
             let note = self.room_note();
             self.hud.set_note(note);
-            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.play.replica().world.worms[me], touch);
+            self.hud.draw(&self.gpu, &mut encoder, &view, screen, &self.play.replica().world, me, touch);
         }
         self.gpu.queue.submit([encoder.finish()]);
         self.renderer.end_frame();

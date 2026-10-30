@@ -268,6 +268,13 @@ pub fn notice_button(width: f32) -> Rect {
     Rect { x: (width - w) / 2.0, y: 470.0, w, h: BUTTON_H }
 }
 
+/// The "NEW MATCH" button under the result of a finished match. Only drawn for
+/// touch: a keyboard has R.
+pub fn rematch_button(width: f32) -> Rect {
+    let w = 300.0;
+    Rect { x: (width - w) / 2.0, y: 470.0, w, h: BUTTON_H }
+}
+
 /// The small MENU button in a corner while playing, so a touch screen (which
 /// has no Esc) can leave the match.
 pub fn menu_button(width: f32) -> Rect {
@@ -439,5 +446,15 @@ mod tests {
     #[test]
     fn the_corner_button_stays_out_of_the_way_of_the_notice_button() {
         assert!(!menu_button(WIDE).contains(centre(notice_button(WIDE))));
+    }
+
+    #[test]
+    fn the_rematch_button_is_in_reach_and_clear_of_the_corner_button() {
+        for width in [WIDE, 960.0, 1480.0] {
+            let b = rematch_button(width);
+            assert!(!menu_button(width).contains(centre(b)));
+            assert!(b.x >= 0.0 && b.x + b.w <= width, "on screen at {width}");
+            assert!(b.y + b.h <= 720.0);
+        }
     }
 }

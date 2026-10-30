@@ -47,7 +47,17 @@ mod tests {
     use super::*;
 
     fn snapshot(tick: u32, events: Vec<Event>) -> Snapshot {
-        Snapshot { tick, worms: Vec::new(), projectiles: Vec::new(), zones: Vec::new(), lava: Vec::new(), events, edits_total: 0 }
+        Snapshot {
+            tick,
+            worms: Vec::new(),
+            projectiles: Vec::new(),
+            zones: Vec::new(),
+            lava: Vec::new(),
+            events,
+            edits_total: 0,
+            score_limit: 15,
+            winner: None,
+        }
     }
 
     #[test]

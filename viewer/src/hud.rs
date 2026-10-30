@@ -20,7 +20,7 @@ use crate::menu::{self, Menu, Page, Rect};
 use crate::renderer::Gpu;
 use crate::touch::{self, Button, TouchControls};
 use sim::weapons::Kind;
-use sim::world::Worm;
+use sim::world::{World, Worm};
 use sim::{Event, MAX_HP, WEAPONS};
 
 type Colour = [f32; 4];
@@ -183,26 +183,30 @@ impl Hud {
         self.hp_age = (self.hp_age + dt).min(10.0);
     }
 
-    /// Paint the HUD for `worm` over `target` (the finished frame). With
-    /// `touch` the weapon plate moves out from under the thumbs and the touch
-    /// controls are drawn on top.
-    pub fn draw(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), worm: &Worm, touch: Option<&TouchControls>) {
+    /// Paint the HUD for worm `me` of `world` over `target` (the finished
+    /// frame). With `touch` the weapon plate moves out from under the thumbs
+    /// and the touch controls are drawn on top.
+    pub fn draw(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), world: &World, me: usize, touch: Option<&TouchControls>) {
         self.size = (screen.0 as f32, screen.1 as f32);
         self.scale = self.size.1 / 720.0;
         let width = self.size.0 / self.scale;
         self.verts.clear();
+        let worm = &world.worms[me];
         let hp = worm.hp.round();
         if hp != self.hp_seen {
             self.hp_seen = hp;
             self.hp_age = 0.0;
         }
-        self.kills_and_deaths(worm);
+        self.kills_and_deaths(worm, world.score_limit);
         self.vitals(worm);
         self.weapon(worm, width, if touch.is_some() { touch::WEAPON_PLATE_Y } else { 720.0 - MARGIN - 142.0 });
         self.reticle(width / 2.0);
         if let Some(note) = self.note.take() {
             self.plate_text(&note, width, MARGIN);
             self.note = Some(note);
+        }
+        if let Some(winner) = world.winner {
+            self.match_over(world, me, winner as usize, width, touch.is_some());
         }
         if let Some(touch) = touch {
             self.touch_controls(touch);
@@ -298,8 +302,8 @@ impl Hud {
 
     // --- panels ---------------------------------------------------------
 
-    /// Top left: `KILLS 4 | DEATHS 2`.
-    fn kills_and_deaths(&mut self, worm: &Worm) {
+    /// Top left: `KILLS 4 | DEATHS 2`, and under it what it takes to win.
+    fn kills_and_deaths(&mut self, worm: &Worm, score_limit: i32) {
         let (x, y) = (MARGIN, MARGIN);
         self.plate(x, y, 270.0, 44.0, PANEL_ORANGE);
         let end = self.label("KILLS", x + 16.0, y + 15.0, TEXT);
@@ -307,6 +311,41 @@ impl Hud {
         self.rect(end + 14.0, y + 10.0, 3.0, 24.0, INK);
         let end = self.label("DEATHS", end + 32.0, y + 15.0, TEXT);
         self.fat(&worm.deaths.to_string(), end + 10.0, y + 12.0, 3.0, TEXT);
+        self.label(&format!("FIRST TO {score_limit}"), x + 4.0, y + 58.0, TEXT);
+    }
+
+    /// The result of a finished match, over the frozen world: who won, every
+    /// player's score, and how to go on (a button for touch, R for a keyboard).
+    /// Seats nobody scored in are left out, or four seats would always be
+    /// listed in a game of two.
+    fn match_over(&mut self, world: &World, me: usize, winner: usize, width: f32, touch: bool) {
+        let mut rows: Vec<usize> = (0..world.worms.len())
+            .filter(|&i| i == winner || i == me || world.worms[i].kills != 0 || world.worms[i].deaths != 0)
+            .collect();
+        rows.sort_by_key(|&i| std::cmp::Reverse(world.worms[i].kills));
+
+        let panel_w = 560.0_f32.min(width - 2.0 * MARGIN);
+        let panel = Rect { x: (width - panel_w) / 2.0, y: 110.0, w: panel_w, h: 120.0 + rows.len() as f32 * 36.0 };
+        self.plate(panel.x, panel.y, panel.w, panel.h, PANEL_GREY);
+        let title = if winner == me { "YOU WIN".to_string() } else { format!("PLAYER {} WINS", winner + 1) };
+        let pixel = if text_width(&title, 6.0) <= panel.w - 40.0 { 6.0 } else { 4.0 };
+        self.fat(&title, panel.x + (panel.w - text_width(&title, pixel)) / 2.0, panel.y + 28.0, pixel, GOLD);
+        for (n, &i) in rows.iter().enumerate() {
+            let y = panel.y + 100.0 + n as f32 * 36.0;
+            let colour = if i == winner { GOLD } else { TEXT };
+            let who = if i == me { format!("PLAYER {} - YOU", i + 1) } else { format!("PLAYER {}", i + 1) };
+            self.label(&who, panel.x + 28.0, y, colour);
+            let worm = &world.worms[i];
+            let scores = format!("KILLS {}   DEATHS {}", worm.kills, worm.deaths);
+            self.label(&scores, panel.x + panel.w - 28.0 - text_width(&scores, 2.0), y, colour);
+        }
+        if touch {
+            self.draw_button(menu::rematch_button(width), "NEW MATCH", true, true, 4.0);
+        } else {
+            let hint = "PRESS R FOR A NEW MATCH";
+            let y = panel.y + panel.h + 20.0;
+            self.plate_text(hint, width, y);
+        }
     }
 
     /// Bottom left: `HP 78` and ten segments of 10 HP each.
@@ -794,7 +833,7 @@ mod tests {
     // A letter missing from the font draws as a blank gap: easy to miss by eye.
     #[test]
     fn the_font_has_every_character_the_hud_can_say() {
-        let fixed = "KILLS DEATHS HP LOW HEALTH RESPAWN READY RELOADING CHARGING MELEE 0123456789 /%.-=";
+        let fixed = "KILLS DEATHS HP LOW HEALTH RESPAWN READY RELOADING CHARGING MELEE 0123456789 /%.-= FIRST TO YOU WIN WINS PLAYER PRESS R FOR A NEW MATCH";
         // The menu and the online notices: every string the viewer can show
         // here must be in the font (see `notice_for` and `room_note` in main.rs).
         let menu = "CRAFTIERO PLAY HOST JOIN BACK DEL MENU ENTER THE ROOM CODE OFFLINE OR ONLINE WITH FRIENDS ROOM PING MS FRIENDS OPENING A CONNECTING TO RELAY KNOCKING WAITING FOR LOST PLAYING THE SERVER IS BUSY TRY AGAIN IN MINUTE NO THAT FULL RUNS ANOTHER VERSION RELOAD GAME LEFT MATCH OVER ALREADY REFUSED CONNECTION";

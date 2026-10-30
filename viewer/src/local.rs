@@ -73,6 +73,21 @@ impl Loopback {
     }
 }
 
+/// The Welcome travels in pieces (see `welcome_messages`); the client puts it
+/// back together and builds its replica from it. `map` is the untouched map.
+fn welcomed(link: &mut Loopback, welcome: protocol::Welcome, map: Grid) -> Replica {
+    for msg in welcome_messages(welcome) {
+        link.host_send(&msg);
+    }
+    let mut builder = WelcomeBuilder::default();
+    let welcome = std::iter::from_fn(|| link.client_recv())
+        .find_map(|msg| builder.push(&msg))
+        .expect("the loopback delivers the Welcome we just sent");
+    // Delay 0: no interpolation. The wire is a function call, so there
+    // is no jitter to hide, and the local player gets no extra lag.
+    Replica::new(welcome, map, 0)
+}
+
 pub struct LocalGame {
     host: Host,
     link: Loopback,
@@ -85,6 +100,13 @@ pub struct LocalGame {
     /// local player stays on the loopback (zero lag, every snapshot); friends
     /// come in through this.
     share: Option<Share>,
+    /// The untouched map, for building a replica again after a rematch.
+    map: Grid,
+    /// The `Host::match_number` this replica was built for. When the host's
+    /// moves on, somebody (us, or a friend) asked for a rematch.
+    match_number: u32,
+    /// How many replicas this game has built (see `Play::replica_id`).
+    generation: u32,
 }
 
 impl LocalGame {
@@ -101,19 +123,19 @@ impl LocalGame {
         // match), and the client builds its replica from it.
         let welcome = host.join().expect("a fresh match has free slots");
         let peer = welcome.you;
-        for msg in welcome_messages(welcome) {
-            link.host_send(&msg);
-        }
-        // The Welcome travels in pieces (see `welcome_messages`); the client
-        // puts it back together.
-        let mut builder = WelcomeBuilder::default();
-        let welcome = std::iter::from_fn(|| link.client_recv())
-            .find_map(|msg| builder.push(&msg))
-            .expect("the loopback delivers the Welcome we just sent");
-        // Delay 0: no interpolation. The wire is a function call, so there
-        // is no jitter to hide, and the local player gets no extra lag.
-        let replica = Replica::new(welcome, map, 0);
-        LocalGame { host, link, peer, replica, share: None }
+        let replica = welcomed(&mut link, welcome, map.clone());
+        LocalGame { host, link, peer, replica, share: None, map, match_number: 0, generation: 0 }
+    }
+
+    /// Ask for another match. Like a friend's request it is a message the host
+    /// may refuse: it only starts one if this match is over.
+    pub fn rematch(&mut self) {
+        self.link.client_send(&ClientMsg::Rematch);
+    }
+
+    /// How many replicas this game has built: it grows with every rematch.
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     /// One 1/60 s tick of the whole pipeline: the player's wishes go to the
@@ -136,7 +158,18 @@ impl LocalGame {
         if let Some(share) = &mut self.share {
             share.broadcast(&mut self.host, snapshot.clone());
         }
-        self.link.host_send(&HostMsg::Snapshot(snapshot));
+        if self.host.match_number() == self.match_number {
+            self.link.host_send(&HostMsg::Snapshot(snapshot));
+        } else {
+            // A rematch began this tick. The snapshot belongs to the new
+            // match and our replica is still showing the old one: welcome
+            // the local player into the new one instead, as the session does
+            // for friends.
+            self.match_number = self.host.match_number();
+            let welcome = self.host.rewelcome(self.peer).expect("the local player holds their seat");
+            self.replica = welcomed(&mut self.link, welcome, self.map.clone());
+            self.generation += 1;
+        }
 
         // The client's half again: apply everything the host said.
         while let Some(msg) = self.link.client_recv() {
@@ -273,6 +306,77 @@ mod tests {
             j.replica().is_some_and(|r| r.world.grid.checksum() == h.replica.world.grid.checksum())
         });
         assert!(!joiner.replica().unwrap().desynced());
+    }
+
+    /// Worm 0 shoots worm 1 (16 m away along +x) until the match has a winner.
+    /// The limit is one kill, so the first one ends it.
+    fn play_to_the_end(host: &mut LocalGame, joiner: &mut Option<&mut JoinGame>) {
+        host.host.set_score_limit(1);
+        host.toggle_infinite_ammo();
+        let aim = Input {
+            fire: true,
+            weapon: sim::weapons::BLASTER,
+            yaw: std::f32::consts::FRAC_PI_2,
+            ..Input::default()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while host.replica.world.winner.is_none() {
+            assert!(Instant::now() < deadline, "nobody won");
+            host.tick(aim);
+            if let Some(joiner) = joiner {
+                joiner.tick(Input::default());
+            }
+        }
+    }
+
+    #[test]
+    fn the_local_player_can_start_another_match_once_one_is_over() {
+        let mut host = host();
+        host.rematch();
+        host.tick(Input::default());
+        assert_eq!(host.generation(), 0, "a running match is not restarted");
+
+        play_to_the_end(&mut host, &mut None);
+        assert_eq!(host.replica.world.winner, Some(0));
+        assert!(host.replica.world.worms[0].kills >= 1);
+        host.debug_edit(Shape::Sphere { center: Vec3::new(16.0, 4.0, 16.0), radius: 3.0 }, Op::Carve);
+        host.tick(Input::default());
+        assert_ne!(host.replica.world.grid.checksum(), ground().checksum());
+
+        host.rematch();
+        host.tick(Input::default());
+        assert_eq!(host.generation(), 1, "a new replica was built");
+        let world = &host.replica.world;
+        assert_eq!((world.winner, world.worms[0].kills, world.worms[1].deaths), (None, 0, 0));
+        assert_eq!(world.grid.checksum(), ground().checksum(), "the craters are gone");
+        assert_eq!(world.score_limit, 1, "the rules stay");
+        // And play goes on: the clock of the new match runs.
+        let tick = world.tick;
+        host.tick(Input::default());
+        assert!(host.replica.world.tick > tick);
+    }
+
+    #[test]
+    fn a_friends_rematch_starts_a_new_match_for_the_host_too() {
+        let (mut host, mut joiner) = room_with_friend();
+        play_to_the_end(&mut host, &mut Some(&mut joiner));
+        run(&mut host, &mut joiner, "the friend to see the result", |_, j| {
+            j.replica().is_some_and(|r| r.world.winner.is_some())
+        });
+        let before = (host.generation(), joiner.generation());
+
+        // The friend asks, not the host.
+        joiner.rematch();
+        run(&mut host, &mut joiner, "both to be in the new match", |h, j| {
+            h.generation() > before.0 && j.generation() > before.1
+        });
+        run(&mut host, &mut joiner, "the new match to show on both screens", |h, j| {
+            let (a, b) = (&h.replica.world, &j.replica().unwrap().world);
+            a.winner.is_none() && b.winner.is_none() && b.tick > 2
+        });
+        assert!(!joiner.replica().unwrap().desynced());
+        assert_eq!(joiner.replica().unwrap().me, 1, "the same seat");
+        assert_eq!(host.room().unwrap().friends(), 1);
     }
 
     #[test]

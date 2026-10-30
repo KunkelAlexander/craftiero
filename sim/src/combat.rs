@@ -1044,6 +1044,10 @@ impl World {
             // Killing yourself costs a point; killing someone else earns one.
             self.worms[source].kills += if victim == source { -1 } else { 1 };
             self.events.push(Event::Died { victim: victim as u8, killer: source as u8, pos });
+            if self.worms[source].kills >= self.score_limit && self.winner.is_none() {
+                self.winner = Some(source as u8);
+                self.events.push(Event::MatchWon { worm: source as u8 });
+            }
         }
     }
 
@@ -2018,6 +2022,58 @@ mod tests {
         let back = &w.worms[1];
         assert!(back.alive && back.hp == MAX_HP && back.invuln > 1.0);
         assert!(w.spawns.iter().any(|s| s.distance(back.pos) < 1.0), "at a spawn point: {:?}", back.pos);
+    }
+
+    #[test]
+    fn the_kill_that_reaches_the_score_limit_wins_the_match() {
+        let mut w = duel();
+        w.score_limit = 2;
+        w.worms[0].kills = 1;
+        w.worms[1].hp = 5.0;
+        let mut events = shoot(&mut w, BLASTER, LEVEL);
+        events.extend(run(&mut w, 30));
+        assert_eq!(w.winner, Some(0));
+        let won: Vec<_> = events.iter().filter(|e| matches!(e, Event::MatchWon { worm: 0 })).collect();
+        assert_eq!(won.len(), 1, "announced once");
+    }
+
+    #[test]
+    fn one_kill_short_of_the_limit_wins_nothing() {
+        let mut w = duel();
+        w.score_limit = 2;
+        w.worms[1].hp = 5.0;
+        shoot(&mut w, BLASTER, LEVEL);
+        run(&mut w, 30);
+        assert_eq!(w.worms[0].kills, 1);
+        assert_eq!(w.winner, None);
+    }
+
+    #[test]
+    fn nobody_wins_by_killing_themselves() {
+        // Suicide costs a point, so it can only move a score away from the limit.
+        let mut w = duel();
+        w.score_limit = 0;
+        w.worms[1].hp = 5.0;
+        w.damage(1, 50.0, BLASTER, 1, Vec3::ZERO);
+        assert_eq!(w.worms[1].kills, -1);
+        assert_eq!(w.winner, None, "-1 is below a limit of 0");
+    }
+
+    #[test]
+    fn a_won_match_is_frozen_but_the_clock_runs() {
+        let mut w = duel();
+        w.winner = Some(0);
+        w.worms[1].hp = 0.0;
+        w.worms[1].alive = false;
+        w.worms[1].respawn_timer = 0.5;
+        let (pos, tick) = (w.worms[0].pos, w.tick);
+        let mut events = shoot(&mut w, BLASTER, LEVEL);
+        events.extend(run(&mut w, (RESPAWN_TIME / DT) as usize));
+        assert!(events.is_empty(), "no shots, no respawns: {events:?}");
+        assert!(w.projectiles.is_empty());
+        assert!(!w.worms[1].alive, "the dead stay dead");
+        assert_eq!(w.worms[0].pos, pos);
+        assert!(w.tick > tick, "snapshots are labelled with the tick, so it keeps counting");
     }
 
     #[test]

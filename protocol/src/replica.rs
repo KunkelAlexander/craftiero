@@ -192,6 +192,8 @@ impl Replica {
         self.world.projectiles = from.projectiles.clone();
         self.world.zones = from.zones.clone();
         self.world.lava = from.lava.clone();
+        self.world.score_limit = from.score_limit;
+        self.world.winner = from.winner;
 
         // Projectiles fly in (nearly) straight lines, so instead of matching
         // them up between two snapshots (they have no id) we just move each one
@@ -255,7 +257,17 @@ mod tests {
         // The helper's matches only ever start from a fresh map, so the host's
         // running count is simply the edits these events carry.
         let edits_total = events.iter().filter(|e| matches!(e, Event::Edit { .. })).count() as u32;
-        Snapshot { tick, worms, projectiles: Vec::new(), zones: Vec::new(), lava: Vec::new(), events, edits_total }
+        Snapshot {
+            tick,
+            worms,
+            projectiles: Vec::new(),
+            zones: Vec::new(),
+            lava: Vec::new(),
+            events,
+            edits_total,
+            score_limit: 15,
+            winner: None,
+        }
     }
 
     fn replica(delay: u32) -> Replica {

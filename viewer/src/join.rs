@@ -194,6 +194,12 @@ impl Joiner {
         to_host(&ClientMsg::Ping { token: now_ms })
     }
 
+    /// "Play again": the host starts a new match if this one is over, and
+    /// answers with a new Welcome like any other.
+    pub fn rematch(&self) -> ToRelay {
+        to_host(&ClientMsg::Rematch)
+    }
+
     pub fn replica(&self) -> Option<&Replica> {
         self.replica.as_ref()
     }
@@ -309,6 +315,13 @@ impl JoinGame {
 
     pub fn status(&self) -> Status {
         self.joiner.status(self.link.state())
+    }
+
+    /// Ask the host for another match (only meaningful once this one is over).
+    pub fn rematch(&mut self) {
+        if self.status() == Status::Playing {
+            self.link.send(&self.joiner.rematch());
+        }
     }
 
     pub fn replica(&self) -> Option<&Replica> {

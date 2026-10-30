@@ -80,7 +80,19 @@ impl Play {
     /// starting, a resync rebuilding it). The renderer holds a GPU copy of one
     /// specific grid, so when this changes it has to be rebuilt.
     pub fn replica_id(&self) -> u32 {
-        self.joined.as_ref().map_or(0, JoinGame::generation)
+        // Only one of the two moves at a time (the local game is not stepped
+        // while a join is on), and each one only ever counts up, so the sum
+        // changes exactly when the replica on screen is a new one.
+        self.local.generation() + self.joined.as_ref().map_or(0, JoinGame::generation)
+    }
+
+    /// Ask for another match once this one has a winner. Hosting or joined,
+    /// it is the same request, and the host decides.
+    pub fn rematch(&mut self) {
+        match &mut self.joined {
+            Some(joined) => joined.rematch(),
+            None => self.local.rematch(),
+        }
     }
 
     /// One fixed step with the player's input.

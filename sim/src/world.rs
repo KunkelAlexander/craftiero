@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 /// jump and whether you tunnel through a wall.
 pub const DT: f32 = 1.0 / 60.0;
 
+/// Kills needed to win a match. A match can choose another (`World::score_limit`).
+pub const SCORE_LIMIT: i32 = 15;
+
 // --- the worm's body -----------------------------------------------------
 /// The collision capsule. The *drawn* body is slimmer than this (see
 /// `body_r` in the viewer): the character reads better thin, but the movement
@@ -430,6 +433,8 @@ pub enum Event {
     /// `worm` jumped from `from` to `to` (the Teleport gun).
     Teleported { worm: u8, from: Vec3, to: Vec3 },
     Respawned { worm: u8 },
+    /// `worm` reached the score limit: the match is over and the world is frozen.
+    MatchWon { worm: u8 },
     /// A `Zone` appeared: the viewer draws its ring and the audio sounds it.
     ZoneStarted { kind: ZoneKind, pos: Vec3, radius: f32, seconds: f32 },
     /// A bit of lava turned to rock at `pos` (the terrain edit comes separately).
@@ -466,6 +471,10 @@ pub struct World {
     pub lava: Vec<LavaBit>,
     /// The cheat: firing costs no ammo. Set by whoever hosts the match.
     pub infinite_ammo: bool,
+    /// Kills that win the match: a rule, set by whoever creates the world.
+    pub score_limit: i32,
+    /// Who won, once somebody has. From then on `step` only counts ticks.
+    pub winner: Option<u8>,
     /// Where worms start, and come back after dying.
     pub spawns: Vec<Vec3>,
     /// Ticks simulated so far. Online, this is the shared clock that snapshots
@@ -502,6 +511,8 @@ impl World {
             zones: Vec::new(),
             lava: Vec::new(),
             infinite_ammo: false,
+            score_limit: SCORE_LIMIT,
+            winner: None,
             spawns,
             tick: 0,
             events: Vec::new(),
@@ -538,6 +549,13 @@ impl World {
     /// Advance the game by one tick (`DT`). `inputs[i]` drives worm `i`; a
     /// worm without an input stands still.
     pub fn step(&mut self, inputs: &[Input]) {
+        if self.winner.is_some() {
+            // Match over: nothing moves, shoots or respawns. The tick still
+            // counts, because snapshots are labelled with it and a replica
+            // plays them back by it (a clock that stopped would stall it).
+            self.tick += 1;
+            return;
+        }
         for i in 0..self.worms.len() {
             let input = clean(&inputs.get(i).copied().unwrap_or_default());
             if self.worms[i].alive {

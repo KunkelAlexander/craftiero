@@ -44,6 +44,9 @@ pub struct Session {
     /// Friends waiting for their Welcome (new arrivals, and friends who asked
     /// for a resync). Served by `after_tick`.
     welcome_due: Vec<PeerId>,
+    /// The match the friends are watching (`Host::match_number`). When the
+    /// host's number moves on, somebody asked for a rematch.
+    match_number: u32,
 }
 
 impl Default for Session {
@@ -54,7 +57,7 @@ impl Default for Session {
 
 impl Session {
     pub fn new() -> Session {
-        Session { throttle: Throttle::new(SEND_EVERY), peers: HashMap::new(), welcome_due: Vec::new() }
+        Session { throttle: Throttle::new(SEND_EVERY), peers: HashMap::new(), welcome_due: Vec::new(), match_number: 0 }
     }
 
     /// How many friends hold a slot.
@@ -109,6 +112,24 @@ impl Session {
     pub fn after_tick(&mut self, host: &mut Host, snapshot: Snapshot) -> Vec<ToRelay> {
         let mut out = Vec::new();
         let send_tick = snapshot.tick % SEND_EVERY == 0;
+
+        // A rematch (asked for by any player) replaced the host's world: every
+        // friend's copy is now of a match that no longer exists, so they all
+        // need a new Welcome. Unlike a lone newcomer's, it can go out at once:
+        // the throttle is emptied here and this tick's snapshot is not sent
+        // (the Welcome already says what it says), so nothing held back can
+        // be applied twice.
+        let rematch = host.match_number() != self.match_number;
+        self.match_number = host.match_number();
+        if rematch && !self.peers.is_empty() {
+            self.throttle = Throttle::new(SEND_EVERY);
+            let mut everyone: Vec<PeerId> = self.peers.keys().copied().collect();
+            everyone.extend(std::mem::take(&mut self.welcome_due).into_iter().filter(|p| !self.peers.contains_key(p)));
+            for peer in everyone {
+                self.welcome(host, peer, &mut out);
+            }
+            return out;
+        }
 
         if self.peers.is_empty() {
             // Nobody listening: spend no upload, and forget the events held
@@ -211,6 +232,8 @@ mod tests {
         builder: WelcomeBuilder,
         replica: Option<Replica>,
         got_full: bool,
+        /// How many complete Welcomes this friend has been given.
+        welcomes: u32,
     }
 
     impl Friend {
@@ -224,6 +247,7 @@ mod tests {
                 let Some(msg) = decode_host(bytes) else { continue };
                 if let Some(welcome) = self.builder.push(&msg) {
                     self.replica = Some(Replica::new(welcome, ground(), 0));
+                    self.welcomes += 1;
                 } else if matches!(msg, HostMsg::Full) {
                     self.got_full = true;
                 } else if let Some(replica) = &mut self.replica {
@@ -301,6 +325,70 @@ mod tests {
             }
             assert_eq!(b.replica.as_ref().unwrap().me, 1);
         }
+    }
+
+    /// Whoever asks, every friend gets a new Welcome and the new match runs in
+    /// step with the host: no old edit, no leftover event, no desync.
+    #[test]
+    fn a_rematch_reaches_every_friend_and_leaves_them_in_sync() {
+        let (mut host, mut session) = (host(), Session::new());
+        let (mut a, mut b) = (Friend::default(), Friend::default());
+        for peer in [1, 2] {
+            session.on_relay(&mut host, FromRelay::PeerJoined(peer));
+        }
+        for i in 0..8 {
+            host.debug_edit(Shape::Sphere { center: Vec3::new(2.0 + i as f32, 4.0, 16.0), radius: 0.7 }, Op::Carve);
+            tick(&mut host, &mut session, &mut [(1, &mut a), (2, &mut b)]);
+        }
+        let old = a.replica.as_ref().unwrap().world.grid.checksum();
+        assert_ne!(old, ground().checksum());
+
+        // A running match ignores the request.
+        to_host(&mut session, &mut host, 2, &ClientMsg::Rematch);
+        assert_eq!(host.match_number(), 0);
+
+        host.world.winner = Some(0);
+        to_host(&mut session, &mut host, 2, &ClientMsg::Rematch);
+        assert_eq!(host.match_number(), 1);
+
+        // Edits made right away, in the new match, on every kind of tick.
+        for i in 0..6 {
+            host.debug_edit(Shape::Sphere { center: Vec3::new(4.0 + i as f32, 4.0, 10.0), radius: 0.7 }, Op::Carve);
+            tick(&mut host, &mut session, &mut [(1, &mut a), (2, &mut b)]);
+        }
+        for (name, friend) in [("a", &a), ("b", &b)] {
+            let r = friend.replica.as_ref().unwrap();
+            assert!(!r.desynced(), "friend {name} desynced after the rematch");
+            assert_eq!(r.world.winner, None, "friend {name} still sees the old result");
+            assert!(r.world.tick <= host.world().tick, "friend {name} shows the new match's clock");
+        }
+        assert_eq!((a.welcomes, b.welcomes), (2, 2), "each was welcomed once more, not twice");
+        assert_eq!(a.replica.as_ref().unwrap().me, 0);
+        assert_eq!(b.replica.as_ref().unwrap().me, 1, "same seats");
+        assert_eq!(session.friends(), 2);
+    }
+
+    #[test]
+    fn a_rematch_the_host_player_asked_for_also_reaches_the_friends() {
+        // The local player is not a peer: they act on the host directly (see
+        // viewer/src/local.rs), and the session only sees the match number move.
+        let (mut host, mut session) = (host(), Session::new());
+        let mut a = Friend::default();
+        session.on_relay(&mut host, FromRelay::PeerJoined(1));
+        for _ in 0..4 {
+            tick(&mut host, &mut session, &mut [(1, &mut a)]);
+        }
+        host.world.winner = Some(0);
+        host.handle(1, ClientMsg::Rematch); // slot 1 is empty: ignored
+        host.join(); // the local player takes slot 1
+        host.handle(1, ClientMsg::Rematch);
+        for _ in 0..4 {
+            tick(&mut host, &mut session, &mut [(1, &mut a)]);
+        }
+        assert_eq!(a.welcomes, 2, "the friend was welcomed into the new match");
+        let r = a.replica.as_ref().unwrap();
+        assert_eq!(r.world.winner, None);
+        assert!(!r.desynced());
     }
 
     #[test]

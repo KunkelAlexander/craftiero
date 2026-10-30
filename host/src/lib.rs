@@ -53,15 +53,67 @@ pub struct Host {
     /// Every terrain edit since the match began, in order: what a late joiner
     /// replays on top of the untouched map (see `Welcome::edits`).
     edits: Vec<(Shape, Op)>,
+    /// What a rematch starts from: the untouched map and the way the first
+    /// match began. (Digging changes `world.grid`, so it cannot be rebuilt
+    /// from that.)
+    pristine: Grid,
+    spawns: Vec<(f32, f32)>,
+    seed: u32,
+    /// Which match this is: 0, then one more after each rematch. Whoever hands
+    /// out Welcomes (the `Session`, the local client) compares it with the
+    /// number it last saw, so a rematch asked for by anyone reaches everyone.
+    match_number: u32,
 }
 
 impl Host {
     /// A new match on `map` with a worm for each spawn column, all idle until
     /// humans join.
     pub fn new(map: Grid, spawns: &[(f32, f32)], seed: u32) -> Host {
-        let world = World::new(map, spawns, seed);
+        let world = World::new(map.clone(), spawns, seed);
         let controllers = spawns.iter().map(|_| Controller::Idle).collect();
-        Host { world, controllers, edits: Vec::new() }
+        Host {
+            world,
+            controllers,
+            edits: Vec::new(),
+            pristine: map,
+            spawns: spawns.to_vec(),
+            seed,
+            match_number: 0,
+        }
+    }
+
+    /// The kills that win a match (`SCORE_LIMIT` unless this says otherwise).
+    /// A rule of the room, so it carries over to rematches.
+    pub fn set_score_limit(&mut self, kills: i32) {
+        self.world.score_limit = kills;
+    }
+
+    /// Which match is running (see the field). It changes exactly when
+    /// everyone's copy of the world has to be replaced by a fresh Welcome.
+    pub fn match_number(&self) -> u32 {
+        self.match_number
+    }
+
+    /// Start the next match on the same map with the same people in the same
+    /// seats. Their last inputs are cleared, so a held trigger does not fire
+    /// the moment the new match begins.
+    fn rematch(&mut self) {
+        self.match_number += 1;
+        let mut world = World::new(
+            self.pristine.clone(),
+            &self.spawns,
+            self.seed.wrapping_add(self.match_number),
+        );
+        // The rules and the cheat belong to the room, not to one match.
+        world.score_limit = self.world.score_limit;
+        world.infinite_ammo = self.world.infinite_ammo;
+        self.world = world;
+        self.edits.clear();
+        for c in &mut self.controllers {
+            if let Controller::Human(input) = c {
+                *input = Input::default();
+            }
+        }
     }
 
     /// A human arrives: give them the first slot nobody holds.
@@ -115,6 +167,14 @@ impl Host {
             // A resync is the same kind of thing: the session sends the reply
             // (`rewelcome`) down that client's own connection.
             ClientMsg::Ping { .. } | ClientMsg::Resync => {}
+            // The rematch is the host's to allow: only a finished match can be
+            // restarted, and only by someone who is in it.
+            ClientMsg::Rematch => {
+                let human = matches!(self.controllers.get(id as usize), Some(Controller::Human(_)));
+                if human && self.world.winner.is_some() {
+                    self.rematch();
+                }
+            }
         }
     }
 
@@ -171,6 +231,8 @@ impl Host {
             lava: self.world.lava.clone(),
             events,
             edits_total: self.edits.len() as u32,
+            score_limit: self.world.score_limit,
+            winner: self.world.winner,
         }
     }
 }
@@ -319,6 +381,56 @@ mod tests {
         assert_eq!(w.edits.len(), 1);
         assert_eq!(w.snapshot.edits_total, 1);
         assert!(host.rewelcome(1).is_none(), "the idle slot gets nothing");
+    }
+
+    #[test]
+    fn a_running_match_cannot_be_restarted() {
+        let mut host = host();
+        host.join();
+        host.tick();
+        host.handle(0, ClientMsg::Rematch);
+        assert_eq!(host.match_number(), 0);
+        assert_eq!(host.world().tick, 1, "the match went on");
+    }
+
+    #[test]
+    fn a_rematch_starts_over_with_the_same_people_and_rules() {
+        let mut host = host();
+        host.join();
+        host.join();
+        host.world.score_limit = 3;
+        host.world.worms[0].kills = 3;
+        host.world.winner = Some(0);
+        host.debug_edit(Shape::Sphere { center: Vec3::new(16.0, 4.0, 16.0), radius: 3.0 }, Op::Carve);
+        host.tick();
+        let dug = host.world().grid.checksum();
+
+        // An empty seat cannot ask; a player can.
+        host.leave(1);
+        host.handle(1, ClientMsg::Rematch);
+        assert_eq!(host.match_number(), 0, "nobody is in seat 1");
+        host.handle(0, ClientMsg::Rematch);
+
+        assert_eq!(host.match_number(), 1);
+        let w = host.world();
+        assert_eq!((w.winner, w.tick, w.worms[0].kills, w.score_limit), (None, 0, 0, 3));
+        assert_ne!(w.grid.checksum(), dug, "the craters are gone");
+        assert_eq!(w.grid.checksum(), ground().checksum());
+        let welcome = host.rewelcome(0).expect("still seated");
+        assert!(welcome.edits.is_empty(), "a fresh edit log");
+        assert_eq!(welcome.snapshot.winner, None);
+        assert_eq!(welcome.snapshot.score_limit, 3);
+    }
+
+    #[test]
+    fn a_rematch_clears_what_the_players_were_holding() {
+        let mut host = host();
+        host.join();
+        host.handle(0, ClientMsg::Input(Input { fire: true, weapon: ROCKET, ..Input::default() }));
+        host.world.winner = Some(1);
+        host.handle(0, ClientMsg::Rematch);
+        let events = host.tick().events;
+        assert!(events.iter().all(|e| !matches!(e, Event::Shot { .. })), "the trigger is not held: {events:?}");
     }
 
     #[test]

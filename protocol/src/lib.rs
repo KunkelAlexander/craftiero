@@ -46,6 +46,10 @@ pub enum ClientMsg {
     /// notices it missed an edit (`Replica::desynced`). The host answers with
     /// a fresh Welcome, exactly as for a rematch.
     Resync,
+    /// "Play again." Only honoured once the match is over (`Snapshot::winner`),
+    /// so a client cannot reset a match that is still running. Any player may
+    /// ask: a match the server hosts has no owner to ask instead.
+    Rematch,
 }
 
 /// Host -> client.
@@ -167,6 +171,12 @@ pub struct Snapshot {
     /// terrain is wrong (`Replica::desynced`). A count costs 4 bytes; hashing
     /// the grid to check the same thing took ~70 ms per call.
     pub edits_total: u32,
+    /// The rules of the match and how it stands: the kills that win it, and
+    /// who has, once somebody has. They ride in every snapshot (6 bytes)
+    /// instead of in a message of their own, so a Welcome, which contains a
+    /// snapshot, carries them to a late joiner with no extra code.
+    pub score_limit: i32,
+    pub winner: Option<u8>,
 }
 
 // ---- bytes ---------------------------------------------------------------
@@ -238,6 +248,8 @@ mod tests {
             lava: Vec::new(),
             events: Vec::new(),
             edits_total,
+            score_limit: 15,
+            winner: None,
         }
     }
 

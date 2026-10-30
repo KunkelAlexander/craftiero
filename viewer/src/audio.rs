@@ -316,6 +316,9 @@ impl Sfx {
                     Place::at(pos, listener, right),
                 );
             }
+            // The result is for everybody, wherever the winner stands: play
+            // it at the listener.
+            Event::MatchWon { .. } => self.fanfare(Place::at(listener, listener, right)),
             Event::Edit { .. } | Event::LavaFroze { .. } | Event::Respawned { .. } => {}
         }
     }
@@ -640,6 +643,20 @@ impl Sfx {
             Voice::new(vec![Layer::noise(0.20, 0.020, 1.2, 2.2, 180.0)]).delayed(0.10),
             p,
         );
+    }
+
+    /// Three rising notes (C, E, G): the match is over.
+    fn fanfare(&mut self, p: Place) {
+        for (k, note) in [523.0, 659.0, 784.0].into_iter().enumerate() {
+            self.add(
+                Voice::new(vec![
+                    Layer::sine(0.30, 0.004, 2.5, 1.2, note, note),
+                    Layer::sine(0.10, 0.004, 3.0, 1.0, note * 2.0, note * 2.0),
+                ])
+                .delayed(k as f32 * 0.14),
+                p,
+            );
+        }
     }
 
     fn teleport(&mut self, p: Place) {

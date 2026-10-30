@@ -79,7 +79,10 @@ numbers past your plan before inviting people. If it stutters, either change
 HOST. The server refuses more than 4 matches at once (`MAX_MATCHES` in
 `server/src/matches.rs`), because each one also holds its own copy of the
 terrain in memory; that number has not been measured against 512 MB, so lower it
-if the service restarts under load.
+if the service restarts under load. By arithmetic, not measurement: the map's
+distance data is about 27 MB, a match holds two copies of it (the one being dug
+up and the untouched one a rematch starts from), and the server keeps one more
+to build matches from, so four matches are roughly 250 MB before anything else.
 
 ### Alternative: Fly.io
 

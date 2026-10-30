@@ -39,7 +39,7 @@ pub const CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// BUMP THIS whenever `ClientMsg`/`HostMsg`/`Snapshot`/`Event`, `sdf::Shape`
 /// or the map generator change. Without it a stale browser tab would decode
 /// the new bytes into nonsense (bincode has no field names) or fail silently.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Client -> relay.
 #[derive(Serialize, Deserialize, Clone, Debug)]
