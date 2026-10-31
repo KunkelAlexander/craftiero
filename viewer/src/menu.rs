@@ -428,17 +428,18 @@ pub fn rematch_button(width: f32) -> Rect {
     Rect { x: (width - w) / 2.0, y: 470.0, w, h: BUTTON_H }
 }
 
-/// The small MENU button in a corner while playing, so a touch screen (which
-/// has no Esc) can leave the match.
-pub fn menu_button(width: f32) -> Rect {
-    Rect { x: width - MARGIN - 130.0, y: MARGIN, w: 130.0, h: 44.0 }
+/// The small MENU button while playing, so a touch screen (which has no Esc)
+/// can leave the match. It sits right of the kills plate (270 wide, top left):
+/// the top right belongs to the weapon plate and the minimap on a touch screen.
+pub fn menu_button(_width: f32) -> Rect {
+    Rect { x: MARGIN + 270.0 + GAP, y: MARGIN, w: 130.0, h: 44.0 }
 }
 
-/// The small RESTART button under it: any player may start the match over for
+/// The small RESTART button beside it: any player may start the match over for
 /// everybody (the keyboard has R).
 pub fn restart_button(width: f32) -> Rect {
     let menu = menu_button(width);
-    Rect { y: menu.y + menu.h + GAP, ..menu }
+    Rect { x: menu.x + menu.w + GAP, ..menu }
 }
 
 #[cfg(test)]
@@ -696,10 +697,10 @@ mod tests {
     }
 
     #[test]
-    fn the_restart_button_sits_under_the_menu_button_on_screen() {
+    fn the_restart_button_sits_beside_the_menu_button_on_screen() {
         for width in [WIDE, 960.0] {
             let (menu, restart) = (menu_button(width), restart_button(width));
-            assert!(restart.y >= menu.y + menu.h, "no overlap");
+            assert!(restart.x >= menu.x + menu.w, "no overlap");
             assert!(restart.x >= 0.0 && restart.x + restart.w <= width);
         }
     }

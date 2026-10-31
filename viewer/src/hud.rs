@@ -207,9 +207,10 @@ impl Hud {
         self.vitals(worm);
         self.weapon(worm, width, if touch.is_some() { touch::WEAPON_PLATE_Y } else { 720.0 - MARGIN - 142.0 });
         self.reticle(width / 2.0);
-        // Under the touch MENU and RESTART buttons, which own the corner there.
-        let corner_y = if touch.is_some() { menu::restart_button(width).y + 44.0 + MINIMAP_R } else { MARGIN + MINIMAP_R };
-        self.minimap(worm, (width - MARGIN - MINIMAP_R, corner_y));
+        // The corner is free on a keyboard screen. On touch the weapon plate
+        // (332 wide) is there, so the minimap sits just left of it.
+        let right = if touch.is_some() { width - MARGIN - 332.0 - 20.0 } else { width - MARGIN };
+        self.minimap(worm, (right - MINIMAP_R - 6.0, MARGIN + MINIMAP_R + 6.0));
         if let Some(note) = self.note.take() {
             self.plate_text(&note, width, MARGIN);
             self.note = Some(note);
