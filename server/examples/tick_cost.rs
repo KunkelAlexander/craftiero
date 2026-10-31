@@ -16,17 +16,25 @@ use std::time::Instant;
 use glam::Vec2;
 use host::{Host, Session};
 use protocol::{encode_host, FromRelay, HostMsg};
-use sim::{map, Input, ARSENAL, DT};
+use sim::{map, Input, DT};
 
 fn main() {
     let started = Instant::now();
     let grid = map::build();
     println!("map generation: {:.0} ms (once per server run)", started.elapsed().as_secs_f64() * 1000.0);
 
-    let mut host = Host::new(grid, &map::SPAWNS, 1);
+    let mut host = Host::new(grid, 0, map::MAX_PLAYERS, 0, 1);
     let mut session = Session::new();
-    for peer in 1..=map::SPAWNS.len() as u8 {
+    for peer in 1..=map::MAX_PLAYERS as u8 {
         session.on_relay(&mut host, FromRelay::PeerJoined(peer));
+    }
+
+    // The match waits for everybody to pick their weapons: each player takes a
+    // different random set, so the bench still fires most of the arsenal.
+    let loadouts: Vec<Vec<u8>> =
+        (0..map::MAX_PLAYERS).map(|slot| sim::weapons::random_loadout(&mut sim::rng::Rng::new(slot as u32 + 1))).collect();
+    for (slot, ids) in loadouts.iter().enumerate() {
+        host.handle(slot as u8, protocol::ClientMsg::Loadout(ids.clone()));
     }
 
     let ticks = 30 * 60;
@@ -36,7 +44,7 @@ fn main() {
     for tick in 0..ticks {
         // Four busy players: everyone runs in a circle of their own, fires all
         // the time and changes weapon every couple of seconds.
-        for slot in 0..map::SPAWNS.len() {
+        for slot in 0..map::MAX_PLAYERS {
             let turn = tick as f32 * 0.02 + slot as f32 * 1.7;
             let input = Input {
                 seq: tick as u32,
@@ -46,7 +54,7 @@ fn main() {
                 jump: tick % 90 == slot * 20,
                 dig: tick % 240 < 40,
                 fire: true,
-                weapon: ARSENAL[(tick / 120 + slot) % ARSENAL.len()],
+                weapon: loadouts[slot][(tick / 120 + slot) % loadouts[slot].len()],
                 ..Input::default()
             };
             host.handle(slot as u8, protocol::ClientMsg::Input(input));
@@ -73,7 +81,7 @@ fn main() {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = times.iter().sum::<f64>() / times.len() as f64;
     let budget = DT as f64 * 1000.0;
-    println!("{} players, {ticks} ticks (30 s of game time)", map::SPAWNS.len());
+    println!("{} players, {ticks} ticks (30 s of game time)", map::MAX_PLAYERS);
     println!(
         "tick: mean {mean:.2} ms, median {:.2}, p99 {:.2}, worst {:.2}   (budget {budget:.1} ms; mean = {:.0}% of one core of this machine)",
         times[times.len() / 2],
@@ -85,6 +93,6 @@ fn main() {
     println!(
         "snapshot: {per_snapshot:.0} bytes, {sent} sent -> {:.0} KB/s uploaded by the host for everybody (the relay copies it to each of {} players)",
         per_snapshot * 30.0 / 1024.0,
-        map::SPAWNS.len()
+        map::MAX_PLAYERS
     );
 }

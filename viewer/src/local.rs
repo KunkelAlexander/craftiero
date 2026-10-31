@@ -110,13 +110,19 @@ pub struct LocalGame {
 }
 
 impl LocalGame {
-    /// A match on `map` with a worm per spawn column; the human gets the first.
-    pub fn new(map: Grid, spawns: &[(f32, f32)], seed: u32) -> LocalGame {
+    /// A match on `map` (number `map_id` of the maps) with `humans` seats for
+    /// people (the local player takes the first, friends the others once a
+    /// room is open) and `npcs` dummies, at random places picked from `seed`.
+    pub fn new(map: Grid, map_id: u8, humans: usize, npcs: usize, seed: u32) -> LocalGame {
+        LocalGame::with_host(map.clone(), Host::new(map, map_id, humans, npcs, seed))
+    }
+
+    /// The local player joins `host`'s match. `map` is the host's untouched
+    /// map: the client needs it too (`Welcome` does not carry it: online, the
+    /// client builds it from the same generator). Both sides start from one
+    /// copy of the same grid instead of generating it twice.
+    fn with_host(map: Grid, mut host: Host) -> LocalGame {
         let mut link = Loopback::default();
-        // The client needs the untouched map too (`Welcome` does not carry it:
-        // online, the client builds it from the same generator). Both sides
-        // start from one copy of the same grid instead of generating it twice.
-        let mut host = Host::new(map.clone(), spawns, seed);
 
         // The handshake, exactly as it will happen online: the newcomer
         // arrives, the host answers with a Welcome (the full state of the
@@ -127,10 +133,16 @@ impl LocalGame {
         LocalGame { host, link, peer, replica, share: None, map, match_number: 0, generation: 0 }
     }
 
-    /// Ask for another match. Like a friend's request it is a message the host
-    /// may refuse: it only starts one if this match is over.
+    /// Ask for another match, even if this one is still running: any player
+    /// may restart it for everyone. Like a friend's request it is a message
+    /// the host may refuse (it is the host's call who counts as a player).
     pub fn rematch(&mut self) {
         self.link.client_send(&ClientMsg::Rematch);
+    }
+
+    /// Tell the host which weapons the local player picked.
+    pub fn loadout(&mut self, ids: Vec<u8>) {
+        self.link.client_send(&ClientMsg::Loadout(ids));
     }
 
     /// How many replicas this game has built: it grows with every rematch.
@@ -238,7 +250,7 @@ mod tests {
 
     fn host() -> LocalGame {
         relay();
-        LocalGame::new(ground(), &[(8.0, 16.0), (24.0, 16.0)], 7)
+        LocalGame::with_host(ground(), Host::with_places(ground(), 2, 0, 7, host::flat_places))
     }
 
     /// Tick everything the way the game loop does, until `done` or a deadline.
@@ -265,7 +277,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the relay never made the room");
             std::thread::sleep(Duration::from_millis(2));
         };
-        let mut joiner = JoinGame::new(code, ground());
+        let mut joiner = JoinGame::new(code, ground(), 0);
         run(&mut host, &mut joiner, "the join to start", |_, j| j.status() == Status::Playing);
         (host, joiner)
     }
@@ -301,7 +313,7 @@ mod tests {
             host.debug_edit(Shape::Sphere { center: Vec3::new(3.0 + i as f32 * 0.6, 4.0, 10.0), radius: 0.8 }, Op::Carve);
             host.tick(Input::default());
         }
-        let mut joiner = JoinGame::new(code, ground());
+        let mut joiner = JoinGame::new(code, ground(), 0);
         run(&mut host, &mut joiner, "the late join", |h, j| {
             j.replica().is_some_and(|r| r.world.grid.checksum() == h.replica.world.grid.checksum())
         });
@@ -332,9 +344,11 @@ mod tests {
     #[test]
     fn the_local_player_can_start_another_match_once_one_is_over() {
         let mut host = host();
+        host.tick(Input::default());
         host.rematch();
         host.tick(Input::default());
-        assert_eq!(host.generation(), 0, "a running match is not restarted");
+        assert_eq!(host.generation(), 1, "a running match can be restarted too");
+        assert_eq!(host.replica.world.tick, 1, "from the start");
 
         play_to_the_end(&mut host, &mut None);
         assert_eq!(host.replica.world.winner, Some(0));
@@ -345,7 +359,7 @@ mod tests {
 
         host.rematch();
         host.tick(Input::default());
-        assert_eq!(host.generation(), 1, "a new replica was built");
+        assert_eq!(host.generation(), 2, "a new replica was built");
         let world = &host.replica.world;
         assert_eq!((world.winner, world.worms[0].kills, world.worms[1].deaths), (None, 0, 0));
         assert_eq!(world.grid.checksum(), ground().checksum(), "the craters are gone");
@@ -383,7 +397,7 @@ mod tests {
     fn joining_a_room_that_does_not_exist_says_so() {
         relay();
         let mut host = host(); // only here to pump the loop
-        let mut joiner = JoinGame::new("ZZZZ".into(), ground());
+        let mut joiner = JoinGame::new("ZZZZ".into(), ground(), 0);
         run(&mut host, &mut joiner, "the refusal", |_, j| matches!(j.status(), Status::Failed(_)));
         assert_eq!(joiner.status(), Status::Failed("NO ROOM WITH THAT CODE"));
     }
@@ -394,7 +408,7 @@ mod tests {
     fn a_player_plays_in_a_match_the_server_hosts() {
         relay();
         static MAP: OnceLock<Grid> = OnceLock::new();
-        let mut joiner = JoinGame::hosted(MAP.get_or_init(sim::map::build).clone());
+        let mut joiner = JoinGame::hosted(MAP.get_or_init(sim::map::build).clone(), 0, 1, 1);
 
         let deadline = Instant::now() + Duration::from_secs(120);
         while joiner.status() != Status::Playing {

@@ -7,7 +7,7 @@
 
 use crate::input::Input;
 use crate::rng::Rng;
-use crate::weapons::{Kind, Special, WeaponDef, WeaponState, ARSENAL, LAVA, WEAPONS, WHIP};
+use crate::weapons::{Kind, Special, WeaponDef, WeaponState, LAVA, WEAPONS, WHIP};
 use crate::world::{body_axis, body_fits, Action, Event, World, Zone, ZoneKind, DT, WORM_HEIGHT, WORM_RADIUS};
 use glam::{Quat, Vec3};
 use sdf::{Op, Shape};
@@ -1005,7 +1005,10 @@ impl World {
         worm.hp = MAX_HP;
         worm.alive = true;
         worm.invuln = SPAWN_INVULN;
-        worm.weapons = ARSENAL.iter().map(|&id| WeaponState::full(id)).collect();
+        // The same weapons the worm picked, with full magazines again.
+        for gun in &mut worm.weapons {
+            *gun = WeaponState::full(gun.id);
+        }
         self.events.push(Event::Respawned { worm: i as u8 });
     }
 
@@ -2022,6 +2025,39 @@ mod tests {
         let back = &w.worms[1];
         assert!(back.alive && back.hp == MAX_HP && back.invuln > 1.0);
         assert!(w.spawns.iter().any(|s| s.distance(back.pos) < 1.0), "at a spawn point: {:?}", back.pos);
+    }
+
+    #[test]
+    fn a_picked_loadout_replaces_the_arsenal_and_survives_a_respawn() {
+        let mut w = duel();
+        let picked = [NOVA, BLASTER, BUILD];
+        w.set_loadout(1, &picked);
+        let ids = |w: &World| w.worms[1].weapons.iter().map(|g| g.id).collect::<Vec<_>>();
+        assert_eq!(ids(&w), picked);
+        assert_eq!(w.worms[1].current, 0, "the first pick is in hand");
+
+        w.worms[1].weapons[0].ammo = 0;
+        w.worms[1].hp = 5.0;
+        shoot(&mut w, BLASTER, LEVEL);
+        run(&mut w, (RESPAWN_TIME / DT) as usize + 40);
+        assert!(w.worms[1].alive, "back from the dead");
+        assert_eq!(ids(&w), picked, "the same weapons");
+        assert_eq!(w.worms[1].weapons[0].ammo, WEAPONS[NOVA as usize].mag, "with full magazines");
+    }
+
+    #[test]
+    fn nothing_happens_while_the_players_are_choosing() {
+        let mut w = duel();
+        w.choosing = true;
+        let before = (w.worms[0].pos, w.worms[1].hp);
+        let events = shoot(&mut w, BLASTER, LEVEL);
+        run(&mut w, 30);
+        assert!(events.is_empty());
+        assert_eq!((w.worms[0].pos, w.worms[1].hp), before, "frozen");
+        assert!(w.tick > 0, "but the clock runs");
+        w.choosing = false;
+        let events = shoot(&mut w, BLASTER, LEVEL);
+        assert!(!events.is_empty(), "play begins when they are done");
     }
 
     #[test]

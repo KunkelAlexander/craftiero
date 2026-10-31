@@ -14,6 +14,7 @@
 // The split from CLAUDE.md: the rules live in `sim`. This file turns keys into
 // `sim::Input`s, steps `sim::World` at a fixed 60 Hz and draws what it holds.
 
+mod armory;
 mod audio;
 mod camera;
 mod effects;
@@ -38,14 +39,17 @@ use effects::Effects;
 use feel::shot_kick;
 use glam::{Vec2, Vec3};
 use hud::Hud;
-use play::{Play, SEED};
+use play::Play;
+
+/// The seed of the headless screenshots: fixed, so a picture can be repeated.
+const SEED: u32 = 1;
 // The map generator lives in `sim` so the dedicated server builds the very same
 // one; the viewer only needs to say `world::build()`.
 use sim::map as world;
 use renderer::{FrameParams, Gpu, Offscreen, Renderer, Sprite};
 use sdf::{Grid, Op, Shape};
 use sim::weapons::{Kind, WHIP};
-use sim::{dig_target, Action, Event, Input, World, ARSENAL, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
+use sim::{dig_target, Action, Event, Input, World, DIG_RADIUS, DT, EYE_HEIGHT, MAX_HP, WEAPONS, WhipStyle};
 use std::collections::HashSet;
 use std::sync::Arc;
 use web_time::Instant;
@@ -79,14 +83,14 @@ Controls
   F1 F2 F3          fixed render resolution 100% / 75% / 50%
   T                 automatic resolution (default): holds ~60 fps by scaling it
   G shadows   H ambient occlusion   O ink outlines   C colour grade   V vsync
-  R reset the world (offline only)
+  R restart the match (for everyone)
   M mute the sound (synthesised: every weapon has its own voice)
 
 Online (see docs/NETWORKING.md)
   --play | --host | --server | --join CODE
                                   skip the menu: play offline, host a room, ask the
                                   server to host one, or join a room
-  --shot out.png --menu title|code|notice   a picture of a menu screen
+  --shot out.png --menu title|setup|armory|code|notice   a picture of a menu screen
   --relay URL                     the relay server (default ws://127.0.0.1:9001/ws,
                                   or what RELAY_URL was at build time)";
 
@@ -115,6 +119,8 @@ struct Config {
     /// `--hurt damage`: wound that worm before the shot, so the blood, the hurt
     /// flash and the health bar can be inspected without a second player.
     hurt: Option<f32>,
+    /// `--map n`: the map a screenshot is of (an index into `sim::map::MAPS`).
+    map: u8,
     /// `--flash 0..1`: fill the screenshot with an impact flash, for looking at
     /// the post effect without having to catch it in play.
     flash: Option<f32>,
@@ -137,7 +143,7 @@ struct Config {
     outlines: bool,
     /// `--play`, `--host` or `--join CODE`: skip the menu.
     start: Option<menu::Action>,
-    /// `--menu title|code|notice`: draw that menu screen into a screenshot, to
+    /// `--menu title|setup|armory|code|notice`: draw that menu screen into a screenshot, to
     /// look at the layout without clicking through to it.
     menu: Option<String>,
 }
@@ -159,6 +165,7 @@ fn parse_args() -> Config {
         weapon: None,
         won: false,
         hurt: None,
+        map: 0,
         flash: None,
         boom: None,
         grade: true,
@@ -218,15 +225,16 @@ fn parse_args() -> Config {
             "--no-grade" => c.grade = false,
             "--no-brush" => c.brush = false,
             "--no-aim" => c.aim = false,
+            "--map" => c.map = value("--map").parse().expect("--map takes a map number"),
             "--hud" => c.hud = true,
             "--won" => c.won = true,
             "--no-shadows" => c.shadows = false,
             "--no-ao" => c.ao = false,
             "--no-outlines" => c.outlines = false,
             "--menu" => c.menu = Some(value("--menu")),
-            "--play" => c.start = Some(menu::Action::Play),
-            "--host" => c.start = Some(menu::Action::Host),
-            "--server" => c.start = Some(menu::Action::ServerRoom),
+            "--play" => c.start = Some(menu::Action::Play(menu::Setup { players: 4, map: 0 })),
+            "--host" => c.start = Some(menu::Action::Host(menu::Setup { players: 4, map: 0 })),
+            "--server" => c.start = Some(menu::Action::ServerRoom(menu::Setup { players: 4, map: 0 })),
             "--join" => c.start = Some(menu::Action::Join(value("--join").trim().to_uppercase())),
             "--relay" => net::set_relay_url(value("--relay")),
             other => panic!("unknown argument {other}\n{HELP}"),
@@ -239,9 +247,10 @@ fn parse_args() -> Config {
 /// stop the grass competing with the weapons without making the map look dead.
 const WORLD_GRADE: f32 = 0.35;
 
-/// The weapon a number-row key picks: 1 to 9 are the first nine, then 0, `-`,
-/// `=`, `[`, `]` and the backslash.
-fn weapon_key(key: KeyCode) -> Option<u8> {
+/// The slot a number-row key means: 1 to 9 are the first nine, then 0, `-`,
+/// `=`, `[`, `]` and the backslash. (In a match only the first five carry a
+/// weapon; the picker uses all fifteen, one per weapon of the arsenal.)
+fn weapon_key(key: KeyCode) -> Option<usize> {
     Some(match key {
         KeyCode::Digit1 => 0,
         KeyCode::Digit2 => 1,
@@ -453,7 +462,7 @@ fn headless_gpu() -> Gpu {
 /// settled on the ground (and swinging from its rope after `--rope`).
 fn shot_world(cfg: &Config) -> (World, Effects) {
     let spawns: Vec<(f32, f32)> = cfg.worm.iter().map(|w| (w[0], w[1])).collect();
-    let mut world = World::new(world::build(), &spawns, SEED);
+    let mut world = World::new(world::build_map(cfg.map), &spawns, SEED);
     let mut effects = Effects::default();
     if let Some([_, _, yaw]) = cfg.worm {
         let look = Input { yaw: yaw.to_radians(), ..Input::default() };
@@ -639,12 +648,20 @@ fn run_shot(cfg: &Config, path: &str) {
                 }
                 hud.draw_menu(&gpu, &mut encoder, &target.view, cfg.size, &menu);
             }
+            "setup" => {
+                menu.key(menu::Key::Char('h'));
+                hud.draw_menu(&gpu, &mut encoder, &target.view, cfg.size, &menu);
+            }
+            "armory" => {
+                let armory = armory::Armory::new(1);
+                hud.draw_armory(&gpu, &mut encoder, &target.view, cfg.size, &armory);
+            }
             "notice" => {
                 let lines = join::Status::Connecting.lines("K7QP");
                 let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
                 hud.draw_notice(&gpu, &mut encoder, &target.view, cfg.size, &lines);
             }
-            other => panic!("--menu title, code or notice (not {other})"),
+            other => panic!("--menu title, setup, armory, code or notice (not {other})"),
         }
     }
     gpu.queue.submit([encoder.finish()]);
@@ -1027,8 +1044,16 @@ struct Viewer {
     /// start from a copy of it instead of generating it again (a second or
     /// more of work, several in a browser).
     pristine: Grid,
+    /// Which of the maps `pristine` is. Choosing another map builds it (a
+    /// second of work), so the one built last is kept.
+    pristine_map: u8,
     screen: Screen,
     menu: menu::Menu,
+    /// The weapon picker. It keeps the last choice, so a restart offers it again.
+    armory: armory::Armory,
+    /// The replica (`Play::replica_id`) this player has already picked weapons
+    /// for. A new match brings a new replica, and with it the picker again.
+    picked_for: Option<u32>,
     /// Where the mouse is, in window pixels (the menu needs it; play grabs it).
     cursor: (f32, f32),
     /// Which `Replica` the renderer was built for (see `Play::replica_id`).
@@ -1185,7 +1210,7 @@ impl Viewer {
         let audio_started = !cfg!(target_arch = "wasm32");
         let audio = if audio_started { Audio::new() } else { Audio::silent() };
         let pristine = world::build();
-        let mut play = Play::offline(pristine.clone());
+        let mut play = Play::offline(pristine.clone(), 0);
         let me = play.replica().me as usize;
         let world = &mut play.replica_mut().world;
         let surface_size = (surface_cfg.width, surface_cfg.height);
@@ -1213,6 +1238,9 @@ impl Viewer {
             pristine,
             screen: Screen::Menu,
             menu: menu::Menu::default(),
+            armory: armory::Armory::new(play::new_seed()),
+            picked_for: None,
+            pristine_map: 0,
             cursor: (0.0, 0.0),
             seen_replica: 0,
             acc: 0.0,
@@ -1265,7 +1293,7 @@ impl Viewer {
             synced: 0,
         };
         // An explicit `--cam` means "look at this spot": no menu in the way.
-        if let Some(action) = cfg.start.clone().or(fly.then_some(menu::Action::Play)) {
+        if let Some(action) = cfg.start.clone().or(fly.then_some(menu::Action::Play(menu::Setup { players: 4, map: 0 }))) {
             viewer.do_action(action, false);
         }
         viewer
@@ -1282,12 +1310,28 @@ impl Viewer {
     fn do_action(&mut self, action: menu::Action, by_mouse: bool) {
         // While a join is still connecting there is a notice with a button on
         // screen; a grabbed mouse could not press it.
-        let grab = by_mouse && matches!(action, menu::Action::Play | menu::Action::Host);
+        let grab = by_mouse && matches!(action, menu::Action::Play(_) | menu::Action::Host(_));
         match action {
-            menu::Action::Play => {}
-            menu::Action::Host => self.play.open_room(),
-            menu::Action::Join(code) => self.play.join(code, self.pristine.clone()),
-            menu::Action::ServerRoom => self.play.join_hosted(self.pristine.clone()),
+            // The match behind the menu was made for three NPCs: a new one
+            // with the chosen seats replaces it, so the worms are in new places.
+            menu::Action::Play(setup) | menu::Action::Host(setup) => {
+                self.use_map(setup.map);
+                // Offline it is you against NPCs. A room has a seat for every
+                // player: friends take them as they join, and an empty one
+                // stays an NPC (a dummy).
+                let hosting = matches!(action, menu::Action::Host(_));
+                let (humans, npcs) = if hosting { (setup.players, 0) } else { (1, setup.players - 1) };
+                self.play = Play::new(self.pristine.clone(), setup.map, humans as usize, npcs as usize);
+                if hosting {
+                    self.play.open_room();
+                }
+                self.rebind();
+            }
+            menu::Action::Join(code) => self.play.join(code, self.pristine.clone(), self.pristine_map),
+            menu::Action::ServerRoom(setup) => {
+                self.use_map(setup.map);
+                self.play.join_hosted(self.pristine.clone(), setup.map, setup.players, 0)
+            }
         }
         self.screen = Screen::Playing;
         if !self.fly {
@@ -1298,11 +1342,39 @@ impl Viewer {
         }
     }
 
+    /// Make `pristine` map number `map`, building it if it is another one.
+    fn use_map(&mut self, map: u8) {
+        if map != self.pristine_map {
+            self.pristine = world::build_map(map);
+            self.pristine_map = map;
+        }
+    }
+
+    /// Is the weapon picker on screen? Whenever a match has begun with its
+    /// players still choosing and this player has not yet.
+    fn armory_up(&self) -> bool {
+        self.screen == Screen::Playing
+            && !self.fly
+            && self.notice().is_none()
+            && self.play.replica().world.choosing
+            && self.picked_for != Some(self.play.replica_id())
+    }
+
+    /// The picker was finished with GO: tell the host, and hold the first pick.
+    fn pick(&mut self, ids: Vec<u8>, by_mouse: bool) {
+        self.weapon = ids[0];
+        self.play.loadout(ids);
+        self.picked_for = Some(self.play.replica_id());
+        if by_mouse {
+            self.set_grab(true);
+        }
+    }
+
     /// Leave the match (dropping a room or a join closes its connection, which
     /// tells the relay) and show the menu over a fresh offline world.
     fn back_to_menu(&mut self) {
         self.set_grab(false);
-        self.play = Play::offline(self.pristine.clone());
+        self.play = Play::offline(self.pristine.clone(), self.pristine_map);
         self.screen = Screen::Menu;
         self.menu = menu::Menu::default();
         self.rebind();
@@ -1313,6 +1385,8 @@ impl Viewer {
     /// one. The renderer in particular holds a GPU copy of one specific grid.
     fn rebind(&mut self) {
         self.seen_replica = self.play.replica_id();
+        let me = &self.play.replica().world.worms[self.me()];
+        self.weapon = me.weapons[me.current].id;
         self.effects = Effects::default();
         self.audio.stop_all();
         self.feel = CameraFeel::default();
@@ -1374,6 +1448,12 @@ impl Viewer {
     /// menu, a notice or the corner MENU button took it, so the game must not.
     fn ui_press(&mut self, px: (f32, f32), by_mouse: bool) -> bool {
         let (at, width) = self.to_virtual(px);
+        if self.armory_up() {
+            if let Some(ids) = self.armory.press(at, width) {
+                self.pick(ids, by_mouse);
+            }
+            return true;
+        }
         if self.screen == Screen::Menu {
             if let Some(action) = self.menu.press(at, width) {
                 self.do_action(action, by_mouse);
@@ -1391,12 +1471,17 @@ impl Viewer {
             self.back_to_menu();
             return true;
         }
-        // Likewise R, for the button under the result of a finished match.
+        // Likewise R, for the button under the result of a finished match...
         if !by_mouse
             && self.touch.active
             && self.play.replica().world.winner.is_some()
             && menu::rematch_button(width).contains(at)
         {
+            self.play.rematch();
+            return true;
+        }
+        // ...and for a restart in the middle of one.
+        if !by_mouse && self.touch.active && menu::restart_button(width).contains(at) {
             self.play.rematch();
             return true;
         }
@@ -1408,6 +1493,8 @@ impl Viewer {
         let mut keys = Vec::new();
         match code {
             KeyCode::Backspace => keys.push(menu::Key::Backspace),
+            KeyCode::ArrowLeft if !repeat => keys.push(menu::Key::Left),
+            KeyCode::ArrowRight if !repeat => keys.push(menu::Key::Right),
             KeyCode::Enter | KeyCode::NumpadEnter if !repeat => keys.push(menu::Key::Enter),
             KeyCode::Escape if !repeat => {
                 // Esc backs out of the code page; on the title it quits (a
@@ -1438,12 +1525,13 @@ impl Viewer {
         }
     }
 
-    /// The next (`dir` = 1) or previous (-1) weapon in the arsenal: the mouse
+    /// The next (`dir` = 1) or previous (-1) weapon of the five carried: the mouse
     /// wheel and the touch weapon plate.
     fn cycle_weapon(&mut self, dir: i32) {
-        let n = ARSENAL.len() as i32;
-        let at = ARSENAL.iter().position(|&id| id == self.weapon).unwrap_or(0) as i32;
-        self.weapon = ARSENAL[(at + dir).rem_euclid(n) as usize];
+        let carried: Vec<u8> = self.play.replica().world.worms[self.me()].weapons.iter().map(|w| w.id).collect();
+        let n = carried.len() as i32;
+        let at = carried.iter().position(|&id| id == self.weapon).unwrap_or(0) as i32;
+        self.weapon = carried[(at + dir).rem_euclid(n) as usize];
     }
 
     /// One finger event from the touch screen (see `touch.rs`).
@@ -1451,8 +1539,8 @@ impl Viewer {
         if phase == touch::Phase::Down && self.ui_press(pos, false) {
             return;
         }
-        // Menu and notice screens only care about the tap itself.
-        if self.screen == Screen::Menu || self.notice().is_some() {
+        // Menu, notice and picker screens only care about the tap itself.
+        if self.screen == Screen::Menu || self.notice().is_some() || self.armory_up() {
             return;
         }
         let first = !self.touch.active;
@@ -1600,6 +1688,32 @@ impl Viewer {
     }
 
     fn key_pressed(&mut self, key: KeyCode) {
+        // The picker has the number row, Enter, R and Backspace while it is up
+        // (Esc still leaves the match, below).
+        if self.armory_up() {
+            match key {
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    if let Some(ids) = self.armory.go() {
+                        self.pick(ids, true);
+                    }
+                    return;
+                }
+                KeyCode::KeyR => {
+                    self.armory.randomize();
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.armory.clear();
+                    return;
+                }
+                other => {
+                    if let Some(n) = weapon_key(other) {
+                        self.armory.toggle_key(n);
+                        return;
+                    }
+                }
+            }
+        }
         self.cheat = cheat_progress(self.cheat, key);
         if self.cheat == KONAMI.len() {
             self.cheat = 0;
@@ -1648,22 +1762,16 @@ impl Viewer {
                     self.feel.snap(target);
                 }
             }
-            KeyCode::KeyR => {
-                if self.play.replica().world.winner.is_some() {
-                    // The match is over: ask for another with the same people
-                    // (the host starts it, and every replica is rebuilt).
-                    self.play.rematch();
-                } else if !self.play.is_joined() && self.play.room().is_none() {
-                    // A new world, but not under other people's feet.
-                    self.play = Play::offline(self.pristine.clone());
-                    self.rebind();
-                }
-            }
-            // The number row picks the weapon with that id; `-` and `=` are the
-            // last two.
+            // Anyone can restart the match for everyone, finished or not: the
+            // request goes to the host, which starts it at new places with the
+            // same people, and every replica is rebuilt.
+            KeyCode::KeyR => self.play.rematch(),
+            // The number row picks the weapon in that slot of the loadout.
             other => {
-                if let Some(id) = weapon_key(other) {
-                    self.weapon = id;
+                if let Some(slot) = weapon_key(other) {
+                    if let Some(gun) = self.play.replica().world.worms[self.me()].weapons.get(slot) {
+                        self.weapon = gun.id;
+                    }
                 }
             }
         }
@@ -1720,9 +1828,10 @@ impl Viewer {
         // skipped in fly mode, and a flash must never get stuck on screen.
         self.feel.tick(dt);
         // The menu is a picture of the arena, not a game: nobody steers a worm.
-        let mut input = if self.screen == Screen::Menu { Input::default() } else { self.worm_input() };
+        let mut input =
+            if self.screen == Screen::Menu || self.armory_up() { Input::default() } else { self.worm_input() };
         // A notice (or the host leaving) can appear while the mouse is held.
-        if self.grabbed && self.notice().is_some() {
+        if self.grabbed && (self.notice().is_some() || self.armory_up()) {
             self.set_grab(false);
         }
         let t = Instant::now();
@@ -2109,6 +2218,8 @@ impl Viewer {
         } else if let Some(lines) = self.notice() {
             let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
             self.hud.draw_notice(&self.gpu, &mut encoder, &view, screen, &lines);
+        } else if self.armory_up() {
+            self.hud.draw_armory(&self.gpu, &mut encoder, &view, screen, &self.armory);
         } else if !self.fly {
             // The free camera is a debug view, not a worm's: no worm HUD there.
             let touch = self.touch.active.then_some(&self.touch);

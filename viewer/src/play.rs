@@ -19,10 +19,14 @@ use sim::Input;
 use crate::join::JoinGame;
 use crate::local::LocalGame;
 use crate::share::Share;
-use crate::world;
 
-/// The seed of the sim's random numbers (weapon spread, bomblets).
-pub const SEED: u32 = 1;
+/// The seed of the sim's random numbers (weapon spread, bomblets) and of the
+/// spawn places: different for every match, so no two start alike. (The
+/// clock is only read here, in the viewer; the sim stays free of it.)
+pub fn new_seed() -> u32 {
+    let since_epoch = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap_or_default();
+    since_epoch.subsec_nanos() ^ since_epoch.as_secs() as u32
+}
 
 pub struct Play {
     local: LocalGame,
@@ -30,29 +34,34 @@ pub struct Play {
 }
 
 impl Play {
-    /// A fresh offline match on `map`, the untouched map.
-    pub fn offline(map: Grid) -> Play {
-        Play { local: LocalGame::new(map, &world::SPAWNS, SEED), joined: None }
+    /// A fresh offline match on `map`, the untouched map number `map_id`: you
+    /// and `npcs` dummies. A match you will open to friends has `humans`
+    /// seats for them.
+    pub fn new(map: Grid, map_id: u8, humans: usize, npcs: usize) -> Play {
+        Play { local: LocalGame::new(map, map_id, humans, npcs, new_seed()), joined: None }
     }
 
-    /// Leave the local match for room `code`. `map` is the untouched map.
-    pub fn join(&mut self, code: String, map: Grid) {
-        self.joined = Some(JoinGame::new(code, map));
+    /// The match behind the menu: you against three dummies, until the player
+    /// picks how many people and NPCs they want.
+    pub fn offline(map: Grid, map_id: u8) -> Play {
+        Play::new(map, map_id, 1, 3)
     }
 
-    /// Leave the local match for a new one the server hosts. `map` is the
-    /// untouched map (the server builds the same one).
-    pub fn join_hosted(&mut self, map: Grid) {
-        self.joined = Some(JoinGame::hosted(map));
+    /// Leave the local match for room `code`. `map` is the untouched map
+    /// number `map_id`; the host's Welcome may name another, which is built then.
+    pub fn join(&mut self, code: String, map: Grid, map_id: u8) {
+        self.joined = Some(JoinGame::new(code, map, map_id));
+    }
+
+    /// Leave the local match for a new one the server hosts, on map number
+    /// `map_id`. `map` is the untouched map (the server builds the same one).
+    pub fn join_hosted(&mut self, map: Grid, map_id: u8, humans: u8, npcs: u8) {
+        self.joined = Some(JoinGame::hosted(map, map_id, humans, npcs));
     }
 
     /// Open a room on the relay for the local match.
     pub fn open_room(&mut self) {
         self.local.open_room();
-    }
-
-    pub fn is_joined(&self) -> bool {
-        self.joined.is_some()
     }
 
     pub fn joined(&self) -> Option<&JoinGame> {
@@ -86,12 +95,20 @@ impl Play {
         self.local.generation() + self.joined.as_ref().map_or(0, JoinGame::generation)
     }
 
-    /// Ask for another match once this one has a winner. Hosting or joined,
-    /// it is the same request, and the host decides.
+    /// Ask for another match, any time. Hosting or joined, it is the same
+    /// request, and the host decides.
     pub fn rematch(&mut self) {
         match &mut self.joined {
             Some(joined) => joined.rematch(),
             None => self.local.rematch(),
+        }
+    }
+
+    /// Tell the host which weapons this player picked for the match.
+    pub fn loadout(&mut self, ids: Vec<u8>) {
+        match &mut self.joined {
+            Some(joined) => joined.loadout(ids),
+            None => self.local.loadout(ids),
         }
     }
 

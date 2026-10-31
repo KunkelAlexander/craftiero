@@ -222,7 +222,7 @@ mod tests {
 
     /// Two seats, like `host::tests`.
     fn host() -> Host {
-        Host::new(ground(), &[(8.0, 16.0), (24.0, 16.0)], 7)
+        Host::with_places(ground(), 2, 0, 7, crate::flat_places)
     }
 
     /// A friend's end of the connection: what `viewer/src/join.rs` does with the
@@ -343,11 +343,7 @@ mod tests {
         let old = a.replica.as_ref().unwrap().world.grid.checksum();
         assert_ne!(old, ground().checksum());
 
-        // A running match ignores the request.
-        to_host(&mut session, &mut host, 2, &ClientMsg::Rematch);
-        assert_eq!(host.match_number(), 0);
-
-        host.world.winner = Some(0);
+        // A friend restarts the match while it is still running.
         to_host(&mut session, &mut host, 2, &ClientMsg::Rematch);
         assert_eq!(host.match_number(), 1);
 
@@ -378,7 +374,6 @@ mod tests {
         for _ in 0..4 {
             tick(&mut host, &mut session, &mut [(1, &mut a)]);
         }
-        host.world.winner = Some(0);
         host.handle(1, ClientMsg::Rematch); // slot 1 is empty: ignored
         host.join(); // the local player takes slot 1
         host.handle(1, ClientMsg::Rematch);

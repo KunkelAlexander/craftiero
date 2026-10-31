@@ -57,6 +57,7 @@ mod tests {
             edits_total: 0,
             score_limit: 15,
             winner: None,
+            choosing: false,
         }
     }
 

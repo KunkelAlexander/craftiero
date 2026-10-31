@@ -46,11 +46,86 @@ pub const HEAVY: u8 = 14;
 /// burns whatever it touches, and freezes to rock a few seconds later.
 pub const LAVA: u8 = 15;
 
-/// Every weapon a player carries, in slot order. (The 2D game let you pick five
-/// of them on a loadout screen; that comes back with the menus, M6.)
+/// Every weapon there is to pick from. A player carries `LOADOUT_SIZE` of them
+/// (see below); `World::new` still hands out all of them, which is what the
+/// sim's own tests and the screenshot tool want.
 pub const ARSENAL: [u8; 15] = [
     BLASTER, ROCKET, RAILGUN, BOUNCER, BOMB, CLUSTER, SWARM, TELEPORT, NOVA, BUILD, TRACTOR, WHIP, MOON, HEAVY, LAVA,
 ];
+
+/// What a weapon is for. A loadout may hold at most `MAX_PER_CLASS` of each, so
+/// five picks always mix at least three of the four: nobody can carry only guns,
+/// or the strongest weapon of every kind.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Class {
+    Guns,
+    Explosives,
+    Tricks,
+    Tools,
+}
+
+impl Class {
+    pub fn name(self) -> &'static str {
+        match self {
+            Class::Guns => "GUNS",
+            Class::Explosives => "EXPLOSIVES",
+            Class::Tricks => "TRICKS",
+            Class::Tools => "TOOLS",
+        }
+    }
+}
+
+pub const CLASSES: [Class; 4] = [Class::Guns, Class::Explosives, Class::Tricks, Class::Tools];
+
+pub fn class_of(id: u8) -> Class {
+    match id {
+        BLASTER | RAILGUN | BOUNCER | WHIP => Class::Guns,
+        ROCKET | BOMB | CLUSTER | SWARM | NOVA => Class::Explosives,
+        TELEPORT | MOON | HEAVY | LAVA => Class::Tricks,
+        _ => Class::Tools, // BUILD, TRACTOR
+    }
+}
+
+/// How many weapons a player carries into a match, and how many of one class.
+pub const LOADOUT_SIZE: usize = 5;
+pub const MAX_PER_CLASS: usize = 2;
+
+/// What the picker starts with, and what a player who never picks (or an NPC)
+/// carries.
+pub const DEFAULT_LOADOUT: [u8; LOADOUT_SIZE] = [BLASTER, ROCKET, RAILGUN, BOMB, BUILD];
+
+/// May `id` join the weapons already `picked`? It must be a real pick (in the
+/// arsenal), not there yet, with room left, and its class must have room. One
+/// rule for the picker, RANDOM and the host's check of what a client sends.
+pub fn can_add(picked: &[u8], id: u8) -> bool {
+    ARSENAL.contains(&id)
+        && !picked.contains(&id)
+        && picked.len() < LOADOUT_SIZE
+        && picked.iter().filter(|&&p| class_of(p) == class_of(id)).count() < MAX_PER_CLASS
+}
+
+/// Is `ids` a whole, allowed loadout? It arrives from another player's machine,
+/// so the host never trusts it.
+pub fn valid_loadout(ids: &[u8]) -> bool {
+    ids.len() == LOADOUT_SIZE && ids.iter().enumerate().all(|(i, &id)| can_add(&ids[..i], id))
+}
+
+/// Five random weapons that are a valid loadout: for the player who would
+/// rather not pick (and so not pick "the best"). Shuffles the arsenal, then
+/// takes from the top whatever still fits.
+pub fn random_loadout(rng: &mut crate::rng::Rng) -> Vec<u8> {
+    let mut deck = ARSENAL.to_vec();
+    for i in (1..deck.len()).rev() {
+        deck.swap(i, rng.next_u32() as usize % (i + 1));
+    }
+    let mut picked = Vec::with_capacity(LOADOUT_SIZE);
+    for id in deck {
+        if can_add(&picked, id) {
+            picked.push(id);
+        }
+    }
+    picked
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
@@ -588,3 +663,45 @@ pub static WEAPONS: [WeaponDef; 16] = [
         loft: 0.0,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    #[test]
+    fn a_loadout_is_five_different_weapons_with_room_in_their_class() {
+        assert!(valid_loadout(&DEFAULT_LOADOUT));
+        assert!(!valid_loadout(&[BLASTER, ROCKET]), "too few");
+        assert!(!valid_loadout(&[BLASTER, ROCKET, RAILGUN, BOMB, BUILD, NOVA]), "too many");
+        assert!(!valid_loadout(&[BLASTER, BLASTER, ROCKET, BOMB, BUILD]), "a weapon twice");
+        assert!(!valid_loadout(&[BLASTER, ROCKET, BOMB, BUILD, BOMBLET]), "bomblets are not for picking");
+        assert!(!valid_loadout(&[BLASTER, ROCKET, BOMB, BUILD, 200]), "no such weapon");
+        assert!(!valid_loadout(&[ROCKET, BOMB, CLUSTER, BLASTER, BUILD]), "three explosives");
+    }
+
+    #[test]
+    fn every_pickable_weapon_has_a_class_and_the_classes_have_room_for_five() {
+        for &id in &ARSENAL {
+            assert!(CLASSES.contains(&class_of(id)));
+        }
+        assert!(CLASSES.len() * MAX_PER_CLASS >= LOADOUT_SIZE);
+        // Every class has something in it to pick.
+        for class in CLASSES {
+            assert!(ARSENAL.iter().any(|&id| class_of(id) == class), "{class:?} is empty");
+        }
+    }
+
+    #[test]
+    fn a_random_loadout_is_always_a_valid_one_and_varies() {
+        let mut rng = Rng::new(7);
+        let first = random_loadout(&mut rng);
+        let mut varies = false;
+        for _ in 0..200 {
+            let picked = random_loadout(&mut rng);
+            assert!(valid_loadout(&picked), "{picked:?}");
+            varies |= picked != first;
+        }
+        assert!(varies);
+    }
+}

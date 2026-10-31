@@ -39,7 +39,7 @@ pub const CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// BUMP THIS whenever `ClientMsg`/`HostMsg`/`Snapshot`/`Event`, `sdf::Shape`
 /// or the map generator change. Without it a stale browser tab would decode
 /// the new bytes into nonsense (bincode has no field names) or fail silently.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Client -> relay.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -49,8 +49,10 @@ pub enum ToRelay {
     /// "Run a match for me on the server." The server opens a room, hosts it
     /// itself (see server/src/matches.rs) and puts this connection in it as an
     /// ordinary joiner: it answers `RoomCreated` and then `RoomJoined`. The
-    /// code works for friends exactly as with `CreateRoom`.
-    CreateHostedRoom { version: u16 },
+    /// code works for friends exactly as with `CreateRoom`. `humans` seats are
+    /// for people (each who joins replaces one NPC) and `npcs` worms are
+    /// dummies; the server caps the total. `map` indexes `sim::map::MAPS`.
+    CreateHostedRoom { version: u16, humans: u8, npcs: u8, map: u8 },
     /// "Put me in the room with this code." Refused with
     /// `Reject::VersionMismatch` unless `version` equals the host's.
     JoinRoom { code: String, version: u16 },

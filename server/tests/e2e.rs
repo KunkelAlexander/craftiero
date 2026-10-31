@@ -100,7 +100,7 @@ fn patient_client(port: u16) -> Client {
 }
 
 fn open_hosted_room(ws: &mut Client) -> String {
-    say(ws, ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION });
+    say(ws, ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION, humans: 2, npcs: 2, map: 0 });
     let FromRelay::RoomCreated { code } = hear(ws) else { panic!("no room") };
     assert!(matches!(hear(ws), FromRelay::RoomJoined), "the asker is put in the room");
     code
@@ -147,7 +147,7 @@ fn the_server_refuses_more_matches_than_it_can_carry_and_frees_the_room_when_one
     }
 
     let mut extra = patient_client(port);
-    say(&mut extra, ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION });
+    say(&mut extra, ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION, humans: 2, npcs: 2, map: 0 });
     assert!(matches!(hear(&mut extra), FromRelay::Rejected(Reject::ServerBusy)));
 
     // The only player of one match leaves: the match ends by itself, and soon
@@ -157,7 +157,7 @@ fn the_server_refuses_more_matches_than_it_can_carry_and_frees_the_room_when_one
     drop(players.pop());
     let mut got_room = false;
     for _ in 0..1200 {
-        say(&mut extra, ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION });
+        say(&mut extra, ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION, humans: 2, npcs: 2, map: 0 });
         match hear(&mut extra) {
             FromRelay::RoomCreated { .. } => {
                 got_room = true;

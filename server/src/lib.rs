@@ -69,8 +69,8 @@ async fn connection(socket: WebSocket, rooms: Shared) {
         let Some(msg) = decode_to_relay(&bytes) else { continue };
         // A hosted room needs a task to run the match, which `Rooms` (plain
         // synchronous code) cannot start, so it is answered here.
-        if let ToRelay::CreateHostedRoom { version } = msg {
-            matches::start(&rooms, &mut role, &tx, version);
+        if let ToRelay::CreateHostedRoom { version, humans, npcs, map } = msg {
+            matches::start(&rooms, &mut role, &tx, version, humans, npcs, map);
             continue;
         }
         rooms.lock().unwrap().handle(&mut role, &tx, msg);

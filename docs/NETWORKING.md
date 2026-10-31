@@ -62,7 +62,7 @@ the viewer and the server share it, and it is tested by plain function calls.
 | client → host | `Input` | every sim tick | 34 bytes (measured) |
 | client → host | `Ping` | once a second | tiny |
 | client → host | `Resync` | when the terrain went wrong (see below) | tiny |
-| client → host | `Rematch` | after a match has a winner (see below) | tiny |
+| client → host | `Rematch` | any time, from a seated player (see below) | tiny |
 | host → client | `Welcome` + `Edits` slices | once, when you join (and after a resync or a rematch) | the edit log, in slices of 500 edits (~30 KB each) |
 | host → client | `Snapshot` | 30 per second | ~3.4 KB with 4 worms (measured) |
 | host → client | `Pong`, `Full` | answers | tiny |
@@ -145,11 +145,11 @@ with it). Everyone learns it from `Snapshot::winner` and `Snapshot::score_limit`
 (6 bytes in every snapshot, so a Welcome, which holds a snapshot, carries them to
 a late joiner for free), and the `MatchWon` event makes the fanfare.
 
-A new match is a `Rematch` message. **Any player may send it, but the host only
-obeys once the match is over**, so a client cannot reset a running match. Any
-player, not just the room's owner, because a match the server hosts has no owner.
-`Host` starts the next match (same map, same seats and rules, craters gone, a
-fresh edit log) and bumps `match_number`. Everyone who owns a connection compares
+A new match is a `Rematch` message. **Any seated player may send it, at any time,
+and it restarts the match for everyone** (the host ignores it from an empty seat or
+an NPC). Any player, not just the room's owner, because a match the server hosts
+has no owner. `Host` starts the next match (same map, same seats and rules, craters
+gone, a fresh edit log, and new random spawn places) and bumps `match_number`. Everyone who owns a connection compares
 that number with the last one they saw: `Session::after_tick` sends every friend
 a new Welcome, and `LocalGame` builds the local player a new `Replica`. So a
 rematch the host's own player asked for reaches the friends, and a friend's

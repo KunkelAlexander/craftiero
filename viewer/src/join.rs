@@ -79,12 +79,16 @@ pub struct Joiner {
     /// The room to join; for a server-hosted room, empty until the relay
     /// has made the room and told us its code.
     code: String,
-    /// Ask the server to run a new match instead of joining a friend's.
-    hosted: bool,
+    /// Ask the server to run a new match (with this many human seats and
+    /// NPCs, on this map) instead of joining a friend's.
+    hosted: Option<(u8, u8, u8)>,
     /// The untouched map, cloned into each new `Replica` (the Welcome carries
     /// only the edits on top of it). Built once by the caller: generating it
     /// takes a second or more.
     map: Grid,
+    /// Which of `sim::map::MAPS` `map` is. A Welcome names the host's map; if
+    /// it is another one, the right one is built when it arrives.
+    map_id: u8,
     in_room: bool,
     builder: WelcomeBuilder,
     replica: Option<Replica>,
@@ -99,11 +103,12 @@ pub struct Joiner {
 }
 
 impl Joiner {
-    pub fn new(code: String, map: Grid) -> Joiner {
+    pub fn new(code: String, map: Grid, map_id: u8) -> Joiner {
         Joiner {
             code,
-            hosted: false,
+            hosted: None,
             map,
+            map_id,
             in_room: false,
             builder: WelcomeBuilder::default(),
             replica: None,
@@ -117,14 +122,16 @@ impl Joiner {
 
     /// A join to a match the server will run for us: we ask for a new room
     /// and are put in it like any other player (see server/src/matches.rs).
-    pub fn hosted(map: Grid) -> Joiner {
-        Joiner { hosted: true, ..Joiner::new(String::new(), map) }
+    /// `humans` seats are for people, `npcs` worms are dummies, and the match
+    /// is on map number `map_id` (`map` is that map, built).
+    pub fn hosted(map: Grid, map_id: u8, humans: u8, npcs: u8) -> Joiner {
+        Joiner { hosted: Some((humans, npcs, map_id)), ..Joiner::new(String::new(), map, map_id) }
     }
 
     /// The first thing to say to the relay once connected.
     pub fn knock(&self) -> ToRelay {
-        if self.hosted {
-            ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION }
+        if let Some((humans, npcs, map)) = self.hosted {
+            ToRelay::CreateHostedRoom { version: PROTOCOL_VERSION, humans, npcs, map }
         } else {
             ToRelay::JoinRoom { code: self.code.clone(), version: PROTOCOL_VERSION }
         }
@@ -155,6 +162,12 @@ impl Joiner {
         // resync (or a rematch). It arrives in pieces, collected by the
         // builder.
         if let Some(welcome) = self.builder.push(&msg) {
+            // A friend's room may be on another map than the one we have: build
+            // theirs (about a second; it is only ever done once per change).
+            if welcome.map != self.map_id && (welcome.map as usize) < sim::map::MAPS.len() {
+                self.map = sim::map::build_map(welcome.map);
+                self.map_id = welcome.map;
+            }
             self.replica = Some(Replica::new(welcome, self.map.clone(), INTERP_DELAY));
             self.generation += 1;
             self.resync_asked = false;
@@ -194,10 +207,15 @@ impl Joiner {
         to_host(&ClientMsg::Ping { token: now_ms })
     }
 
-    /// "Play again": the host starts a new match if this one is over, and
-    /// answers with a new Welcome like any other.
+    /// "Start over": the host starts a new match, and answers with a new
+    /// Welcome like any other.
     pub fn rematch(&self) -> ToRelay {
         to_host(&ClientMsg::Rematch)
+    }
+
+    /// "These are my weapons."
+    pub fn loadout(&self, ids: Vec<u8>) -> ToRelay {
+        to_host(&ClientMsg::Loadout(ids))
     }
 
     pub fn replica(&self) -> Option<&Replica> {
@@ -264,13 +282,13 @@ pub struct JoinGame {
 impl JoinGame {
     /// Start connecting to the relay and asking for room `code`. `map` is the
     /// untouched map the host's match started from.
-    pub fn new(code: String, map: Grid) -> JoinGame {
-        JoinGame::with(Joiner::new(code, map))
+    pub fn new(code: String, map: Grid, map_id: u8) -> JoinGame {
+        JoinGame::with(Joiner::new(code, map, map_id))
     }
 
     /// Start connecting and ask the server to host a new match for us.
-    pub fn hosted(map: Grid) -> JoinGame {
-        JoinGame::with(Joiner::hosted(map))
+    pub fn hosted(map: Grid, map_id: u8, humans: u8, npcs: u8) -> JoinGame {
+        JoinGame::with(Joiner::hosted(map, map_id, humans, npcs))
     }
 
     fn with(joiner: Joiner) -> JoinGame {
@@ -324,6 +342,13 @@ impl JoinGame {
         }
     }
 
+    /// Tell the host which weapons we picked.
+    pub fn loadout(&mut self, ids: Vec<u8>) {
+        if self.status() == Status::Playing {
+            self.link.send(&self.joiner.loadout(ids));
+        }
+    }
+
     pub fn replica(&self) -> Option<&Replica> {
         self.joiner.replica()
     }
@@ -371,8 +396,8 @@ mod tests {
 
     impl Match {
         fn new() -> Match {
-            let host = Host::new(ground(), &[(8.0, 16.0), (24.0, 16.0)], 7);
-            Match { host, session: Session::new(), joiner: Joiner::new("ABCD".into(), ground()), now_ms: 1000 }
+            let host = Host::with_places(ground(), 2, 0, 7, host::flat_places);
+            Match { host, session: Session::new(), joiner: Joiner::new("ABCD".into(), ground(), 0), now_ms: 1000 }
         }
 
         /// The relay tells the host a friend joined, and the friend that it is in.
@@ -461,7 +486,7 @@ mod tests {
 
     #[test]
     fn nothing_is_sent_before_the_match_starts() {
-        let mut j = Joiner::new("ABCD".into(), ground());
+        let mut j = Joiner::new("ABCD".into(), ground(), 0);
         assert!(j.tick(Input::default()).is_empty());
     }
 
@@ -472,7 +497,7 @@ mod tests {
             (Reject::RoomFull, "THAT ROOM IS FULL"),
             (Reject::VersionMismatch, "THAT ROOM RUNS ANOTHER VERSION - RELOAD THE GAME"),
         ] {
-            let mut j = Joiner::new("ABCD".into(), ground());
+            let mut j = Joiner::new("ABCD".into(), ground(), 0);
             j.on_relay(FromRelay::Rejected(why), 0);
             assert_eq!(j.status(SocketState::Open), Status::Failed(text));
         }
@@ -528,7 +553,7 @@ mod tests {
 
     #[test]
     fn the_ping_clock_may_wrap_around() {
-        let mut j = Joiner::new("ABCD".into(), ground());
+        let mut j = Joiner::new("ABCD".into(), ground(), 0);
         let token = u32::MAX - 10;
         let pong = encode_host(&HostMsg::Pong { token });
         j.on_relay(FromRelay::Data { from: 0, bytes: pong }, 20);
@@ -591,9 +616,9 @@ mod tests {
 
     #[test]
     fn a_server_hosted_join_asks_for_a_room_and_learns_its_code() {
-        let mut j = Joiner::hosted(ground());
-        let ToRelay::CreateHostedRoom { version } = j.knock() else { panic!("expected a hosted-room request") };
-        assert_eq!(version, PROTOCOL_VERSION);
+        let mut j = Joiner::hosted(ground(), 2, 2, 1);
+        let ToRelay::CreateHostedRoom { version, humans, npcs, map } = j.knock() else { panic!("expected a hosted-room request") };
+        assert_eq!((version, humans, npcs, map), (PROTOCOL_VERSION, 2, 1, 2));
         assert_eq!(j.status(SocketState::Open).lines(j.code())[0], "OPENING A ROOM ON THE SERVER");
 
         j.on_relay(FromRelay::RoomCreated { code: "WXYZ".into() }, 0);
@@ -603,7 +628,7 @@ mod tests {
 
     #[test]
     fn the_knock_names_the_room_and_the_build() {
-        let j = Joiner::new("WXYZ".into(), ground());
+        let j = Joiner::new("WXYZ".into(), ground(), 0);
         let ToRelay::JoinRoom { code, version } = j.knock() else { panic!() };
         assert_eq!((code.as_str(), version), ("WXYZ", PROTOCOL_VERSION));
         // And it is something the relay can decode.

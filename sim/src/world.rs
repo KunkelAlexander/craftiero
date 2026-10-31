@@ -475,6 +475,10 @@ pub struct World {
     pub score_limit: i32,
     /// Who won, once somebody has. From then on `step` only counts ticks.
     pub winner: Option<u8>,
+    /// The match has not begun: the players are still picking weapons, so
+    /// nothing moves, shoots or respawns (like after a win, only the tick
+    /// counts). Whoever hosts the match sets and clears it.
+    pub choosing: bool,
     /// Where worms start, and come back after dying.
     pub spawns: Vec<Vec3>,
     /// Ticks simulated so far. Online, this is the shared clock that snapshots
@@ -488,6 +492,13 @@ pub struct World {
     pub(crate) rng: Rng,
 }
 
+/// Where a worm dropped from `from` (a point in open air; its y is the height
+/// the drop starts at) lands: on the first ground below it.
+fn drop_to_ground(grid: &Grid, from: Vec3) -> Vec3 {
+    let y = grid.raycast(from, -Vec3::Y, from.y).map_or(0.0, |t| from.y - t);
+    Vec3::new(from.x, y + 0.05, from.z)
+}
+
 impl World {
     /// One worm per spawn column `(x, z)`, dropped from the top of the world
     /// onto whatever ground is highest there. (The top must be open air.) The
@@ -496,13 +507,15 @@ impl World {
     /// the same inputs always play out the same way.
     pub fn new(grid: Grid, spawns: &[(f32, f32)], seed: u32) -> World {
         let top = grid.size_metres().y - 0.5;
-        let spawns: Vec<Vec3> = spawns
-            .iter()
-            .map(|&(x, z)| {
-                let y = grid.raycast(Vec3::new(x, top, z), -Vec3::Y, top).map_or(0.0, |t| top - t);
-                Vec3::new(x, y + 0.05, z)
-            })
-            .collect();
+        let from: Vec<Vec3> = spawns.iter().map(|&(x, z)| Vec3::new(x, top, z)).collect();
+        World::from_points(grid, &from, seed)
+    }
+
+    /// `new`, but each worm drops from its own point instead of from the top of
+    /// the world: a map that is rock all the way up (tunnels) starts its worms
+    /// inside, from a point in the open air of a chamber.
+    pub fn from_points(grid: Grid, from: &[Vec3], seed: u32) -> World {
+        let spawns: Vec<Vec3> = from.iter().map(|&p| drop_to_ground(&grid, p)).collect();
         let worms = spawns.iter().map(|&p| Worm::new(p)).collect();
         World {
             grid,
@@ -513,12 +526,29 @@ impl World {
             infinite_ammo: false,
             score_limit: SCORE_LIMIT,
             winner: None,
+            choosing: false,
             spawns,
             tick: 0,
             events: Vec::new(),
             blasts: Vec::new(),
             rng: Rng::new(seed),
         }
+    }
+
+    /// More places to come back at, without more worms: a match of two still
+    /// respawns on one of many spots, not always the same two.
+    pub fn add_respawn_points(&mut self, from: &[Vec3]) {
+        let grid = &self.grid;
+        self.spawns.extend(from.iter().map(|&p| drop_to_ground(grid, p)));
+    }
+
+    /// Give worm `i` the weapons `ids` (in that slot order) with full
+    /// magazines, and take the first one in hand. The ids are the caller's to
+    /// check (`weapons::valid_loadout`).
+    pub fn set_loadout(&mut self, i: usize, ids: &[u8]) {
+        let worm = &mut self.worms[i];
+        worm.weapons = ids.iter().map(|&id| WeaponState::full(id)).collect();
+        worm.current = 0;
     }
 
     /// Edit the terrain from outside the rules (the viewer's fly-mode brush) and
@@ -549,8 +579,8 @@ impl World {
     /// Advance the game by one tick (`DT`). `inputs[i]` drives worm `i`; a
     /// worm without an input stands still.
     pub fn step(&mut self, inputs: &[Input]) {
-        if self.winner.is_some() {
-            // Match over: nothing moves, shoots or respawns. The tick still
+        if self.winner.is_some() || self.choosing {
+            // Match over (or not begun): nothing moves, shoots or respawns. The tick still
             // counts, because snapshots are labelled with it and a replica
             // plays them back by it (a clock that stopped would stall it).
             self.tick += 1;

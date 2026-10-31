@@ -194,6 +194,7 @@ impl Replica {
         self.world.lava = from.lava.clone();
         self.world.score_limit = from.score_limit;
         self.world.winner = from.winner;
+        self.world.choosing = from.choosing;
 
         // Projectiles fly in (nearly) straight lines, so instead of matching
         // them up between two snapshots (they have no id) we just move each one
@@ -267,11 +268,12 @@ mod tests {
             edits_total,
             score_limit: 15,
             winner: None,
+            choosing: false,
         }
     }
 
     fn replica(delay: u32) -> Replica {
-        Replica::new(Welcome { you: 0, edits: Vec::new(), snapshot: snapshot(0, Vec::new()) }, map(), delay)
+        Replica::new(Welcome { you: 0, map: 0, edits: Vec::new(), snapshot: snapshot(0, Vec::new()) }, map(), delay)
     }
 
     fn arrive(r: &mut Replica, tick: u32, events: Vec<Event>) {
@@ -366,7 +368,7 @@ mod tests {
         host_map.apply(shape, op);
         let mut at_join = snapshot(0, Vec::new());
         at_join.edits_total = 1; // the host had made that one edit already
-        let r = Replica::new(Welcome { you: 0, edits: vec![(shape, op)], snapshot: at_join }, map(), 0);
+        let r = Replica::new(Welcome { you: 0, map: 0, edits: vec![(shape, op)], snapshot: at_join }, map(), 0);
         assert_eq!(r.world.grid.checksum(), host_map.checksum());
         assert!(!r.desynced(), "the log in the welcome counts as applied");
     }

@@ -13,10 +13,14 @@
 //
 //   PLAY   HOST   JOIN          offline / open a room / enter a friend's code
 //
+// PLAY, HOST and SERVER ROOM first go to a setup page where the player picks
+// how many humans and NPCs the match has; JOIN goes to the code page.
+//
 // Pattern: Immediate Mode UI, again. There are no widget objects: `buttons`
 // rebuilds the list from the state every time it is asked.
 
 use protocol::relay::{CODE_ALPHABET, CODE_LEN};
+use sim::map::MAX_PLAYERS;
 
 /// Margin from the screen edge, like the HUD's.
 const MARGIN: f32 = 28.0;
@@ -46,6 +50,13 @@ pub enum Press {
     /// Go to the code-entry page.
     OpenCode,
     Letter(char),
+    /// The setup page's steppers.
+    /// Choose the map with this index.
+    Map(u8),
+    PlayersUp,
+    PlayersDown,
+    /// Start the match the setup page describes.
+    Start,
     Delete,
     /// Back to the title page.
     Back,
@@ -61,22 +72,61 @@ pub struct Button {
     pub primary: bool,
 }
 
+/// What the setup page decides: how many players the match has (2 to 4) and
+/// which map it is on. Who plays them is the match's business: offline it is
+/// you and NPCs, in a room every seat is for a friend and one nobody takes
+/// stays an NPC (see `main.rs`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Setup {
+    pub players: u8,
+    /// Index into `sim::map::MAPS`.
+    pub map: u8,
+}
+
+impl Setup {
+    fn more_players(&mut self) {
+        self.players = (self.players + 1).min(MAX_PLAYERS as u8);
+    }
+
+    /// Never fewer than two: one worm alone has nobody to fight.
+    fn fewer_players(&mut self) {
+        self.players = (self.players - 1).max(2);
+    }
+
+    fn map_before(self) -> u8 {
+        (self.map + sim::map::MAPS.len() as u8 - 1) % sim::map::MAPS.len() as u8
+    }
+
+    fn map_after(self) -> u8 {
+        (self.map + 1) % sim::map::MAPS.len() as u8
+    }
+}
+
 /// What the viewer must do after a press.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Action {
-    /// Start an offline match.
-    Play,
+    /// Start an offline match: you and the other players as NPCs.
+    Play(Setup),
     /// Start a match and open a room on the relay for friends.
-    Host,
+    Host(Setup),
     /// Ask the server to run a match (friends join it by code, like any room).
-    ServerRoom,
+    ServerRoom(Setup),
     /// Join this room.
     Join(String),
+}
+
+/// What the setup page is setting up.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mode {
+    Play,
+    Host,
+    ServerRoom,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Page {
     Title,
+    Setup(Mode),
     Code,
 }
 
@@ -88,16 +138,20 @@ pub enum Key {
     Backspace,
     Enter,
     Escape,
+    /// The arrow keys change the map on the setup page.
+    Left,
+    Right,
 }
 
 pub struct Menu {
     page: Page,
     code: String,
+    setup: Setup,
 }
 
 impl Default for Menu {
     fn default() -> Menu {
-        Menu { page: Page::Title, code: String::new() }
+        Menu { page: Page::Title, code: String::new(), setup: Setup { players: 4, map: 0 } }
     }
 }
 
@@ -111,16 +165,27 @@ impl Menu {
         &self.code
     }
 
+    /// What the setup page currently says.
+    pub fn setup(&self) -> Setup {
+        self.setup
+    }
+
     /// Every button of the current page for a screen `width` units wide.
     pub fn buttons(&self, width: f32) -> Vec<Button> {
         match self.page {
             Page::Title => title_buttons(width),
+            Page::Setup(_) => setup_buttons(width, self.setup),
             Page::Code => code_buttons(width, self.code.len() == CODE_LEN),
         }
     }
 
     /// A press (mouse down or finger down) at `at`, in virtual units.
     pub fn press(&mut self, at: (f32, f32), width: f32) -> Option<Action> {
+        if matches!(self.page, Page::Setup(_)) {
+            if let Some(i) = map_cards(width).iter().position(|r| r.contains(at)) {
+                return self.apply(Press::Map(i as u8));
+            }
+        }
         let hit = self.buttons(width).into_iter().find(|b| b.enabled && b.rect.contains(at))?;
         self.apply(hit.press)
     }
@@ -133,6 +198,10 @@ impl Menu {
             (Page::Title, Key::Char('h' | 'H')) => self.apply(Press::Host),
             (Page::Title, Key::Char('s' | 'S')) => self.apply(Press::ServerRoom),
             (Page::Title, Key::Char('j' | 'J')) => self.apply(Press::OpenCode),
+            (Page::Setup(_), Key::Left) => self.apply(Press::Map(self.setup.map_before())),
+            (Page::Setup(_), Key::Right) => self.apply(Press::Map(self.setup.map_after())),
+            (Page::Setup(_), Key::Enter) => self.apply(Press::Start),
+            (Page::Setup(_), Key::Escape) => self.apply(Press::Back),
             (Page::Code, Key::Char(c)) => self.apply(Press::Letter(c.to_ascii_uppercase())),
             (Page::Code, Key::Backspace) => self.apply(Press::Delete),
             (Page::Code, Key::Enter) => self.apply(Press::Submit),
@@ -141,11 +210,40 @@ impl Menu {
         }
     }
 
+    /// Go to the setup page. The map stays what it was: a player who liked the
+    /// Plains does not have to pick them again.
+    fn open_setup(&mut self, mode: Mode) -> Option<Action> {
+        self.page = Page::Setup(mode);
+        self.setup.players = 4;
+        None
+    }
+
+    fn stepper(&mut self, change: fn(&mut Setup)) -> Option<Action> {
+        change(&mut self.setup);
+        None
+    }
+
     fn apply(&mut self, press: Press) -> Option<Action> {
         match press {
-            Press::Play => Some(Action::Play),
-            Press::Host => Some(Action::Host),
-            Press::ServerRoom => Some(Action::ServerRoom),
+            Press::Play => self.open_setup(Mode::Play),
+            Press::Host => self.open_setup(Mode::Host),
+            Press::ServerRoom => self.open_setup(Mode::ServerRoom),
+            Press::Map(i) => {
+                self.setup.map = i;
+                None
+            }
+            Press::PlayersUp => self.stepper(Setup::more_players),
+            Press::PlayersDown => self.stepper(Setup::fewer_players),
+            Press::Start => {
+                let Page::Setup(mode) = self.page else { return None };
+                self.page = Page::Title;
+                let seats = self.setup;
+                Some(match mode {
+                    Mode::Play => Action::Play(seats),
+                    Mode::Host => Action::Host(seats),
+                    Mode::ServerRoom => Action::ServerRoom(seats),
+                })
+            }
             Press::OpenCode => {
                 self.page = Page::Code;
                 self.code.clear();
@@ -208,6 +306,61 @@ fn title_buttons(width: f32) -> Vec<Button> {
         enabled: true,
         primary: false,
     });
+    buttons
+}
+
+/// The one row of the setup page.
+pub const PLAYERS_LABEL: &str = "PLAYERS";
+
+const STEP: f32 = 72.0;
+
+/// The box that shows a row's number.
+pub fn setup_value(width: f32) -> Rect {
+    let w = 110.0;
+    Rect { x: (width - w) / 2.0, y: 330.0, w, h: STEP }
+}
+
+/// Where the label of a row goes (above its stepper).
+pub fn setup_label_y() -> f32 {
+    setup_value(0.0).y - 28.0
+}
+
+/// One card per map, side by side across the top of the setup page.
+pub fn map_cards(width: f32) -> Vec<Rect> {
+    let n = sim::map::MAPS.len() as f32;
+    let w = ((width - 2.0 * MARGIN - (n - 1.0) * GAP) / n).min(210.0);
+    let x0 = (width - (n * w + (n - 1.0) * GAP)) / 2.0;
+    (0..sim::map::MAPS.len()).map(|i| Rect { x: x0 + i as f32 * (w + GAP), y: 84.0, w, h: 150.0 }).collect()
+}
+
+/// The little picture of the map on its card: a square, centred near the top.
+pub fn map_preview(card: Rect) -> Rect {
+    let side = (card.w - 24.0).min(96.0);
+    Rect { x: card.x + (card.w - side) / 2.0, y: card.y + 12.0, w: side, h: side }
+}
+
+fn setup_buttons(width: f32, setup: Setup) -> Vec<Button> {
+    let mut buttons = Vec::new();
+    let value = setup_value(width);
+    for (label, press, enabled, x) in [
+        ("-", Press::PlayersDown, setup.players > 2, value.x - GAP - STEP),
+        ("+", Press::PlayersUp, setup.players < MAX_PLAYERS as u8, value.x + value.w + GAP),
+    ] {
+        buttons.push(Button { rect: Rect { x, y: value.y, w: STEP, h: STEP }, label: label.into(), press, enabled, primary: false });
+    }
+    // BACK and START share the bottom row.
+    let w = ((width - 2.0 * MARGIN - GAP) / 2.0).min(300.0);
+    let x0 = (width - (2.0 * w + GAP)) / 2.0;
+    let y = 720.0 - MARGIN - BUTTON_H - 40.0;
+    for (i, (label, press, primary)) in [("BACK", Press::Back, false), ("START", Press::Start, true)].into_iter().enumerate() {
+        buttons.push(Button {
+            rect: Rect { x: x0 + i as f32 * (w + GAP), y, w, h: BUTTON_H },
+            label: label.into(),
+            press,
+            enabled: true,
+            primary,
+        });
+    }
     buttons
 }
 
@@ -281,6 +434,13 @@ pub fn menu_button(width: f32) -> Rect {
     Rect { x: width - MARGIN - 130.0, y: MARGIN, w: 130.0, h: 44.0 }
 }
 
+/// The small RESTART button under it: any player may start the match over for
+/// everybody (the keyboard has R).
+pub fn restart_button(width: f32) -> Rect {
+    let menu = menu_button(width);
+    Rect { y: menu.y + menu.h + GAP, ..menu }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,11 +468,89 @@ mod tests {
     }
 
     #[test]
-    fn play_and_host_are_actions() {
+    fn play_host_and_server_room_go_through_the_setup_page() {
         let mut menu = Menu::default();
-        assert_eq!(tap(&mut menu, "PLAY"), Some(Action::Play));
-        assert_eq!(tap(&mut menu, "HOST"), Some(Action::Host));
-        assert_eq!(tap(&mut menu, "SERVER ROOM"), Some(Action::ServerRoom));
+        assert_eq!(tap(&mut menu, "PLAY"), None);
+        assert_eq!(menu.page(), Page::Setup(Mode::Play));
+        assert_eq!(tap(&mut menu, "START"), Some(Action::Play(Setup { players: 4, map: 0 })));
+        assert_eq!(menu.page(), Page::Title, "back on the title once the match starts");
+
+        tap(&mut menu, "HOST");
+        assert_eq!(tap(&mut menu, "START"), Some(Action::Host(Setup { players: 4, map: 0 })));
+        tap(&mut menu, "SERVER ROOM");
+        assert_eq!(tap(&mut menu, "START"), Some(Action::ServerRoom(Setup { players: 4, map: 0 })));
+    }
+
+    #[test]
+    fn the_setup_page_has_one_stepper_for_two_to_four_players() {
+        let mut menu = Menu::default();
+        tap(&mut menu, "PLAY");
+        let labels: Vec<String> = menu.buttons(WIDE).into_iter().map(|b| b.label).collect();
+        assert_eq!(labels, ["-", "+", "BACK", "START"]);
+        let press = |menu: &mut Menu, label: &str| {
+            let b = menu.buttons(WIDE).into_iter().find(|b| b.label == label).unwrap();
+            let enabled = b.enabled;
+            menu.press(centre(b.rect), WIDE);
+            enabled
+        };
+        assert!(!press(&mut menu, "+"), "four is the most");
+        assert_eq!(menu.setup().players, 4);
+        for _ in 0..5 {
+            press(&mut menu, "-");
+        }
+        assert_eq!(menu.setup().players, 2, "two is the fewest");
+        assert!(!press(&mut menu, "-"), "and the button says so");
+        press(&mut menu, "+");
+        assert_eq!(menu.key(Key::Enter), Some(Action::Play(Setup { players: 3, map: 0 })));
+    }
+
+    #[test]
+    fn the_setup_page_picks_a_map_by_card_or_arrow_and_remembers_it() {
+        let mut menu = Menu::default();
+        tap(&mut menu, "PLAY");
+        assert_eq!(menu.setup().map, 0);
+        let second = map_cards(WIDE)[1];
+        menu.press(centre(second), WIDE);
+        assert_eq!(menu.setup().map, 1);
+        menu.key(Key::Right);
+        menu.key(Key::Right);
+        assert_eq!(menu.setup().map, 0, "wraps round");
+        menu.key(Key::Left);
+        assert_eq!(menu.setup().map, sim::map::MAPS.len() as u8 - 1);
+        let last = menu.setup().map;
+        assert_eq!(menu.key(Key::Enter), Some(Action::Play(Setup { players: 4, map: last })));
+        tap(&mut menu, "HOST");
+        assert_eq!(menu.setup().map, last, "the next setup starts on the same map");
+        assert_eq!(menu.key(Key::Enter), Some(Action::Host(Setup { players: 4, map: last })));
+    }
+
+    #[test]
+    fn the_map_cards_fit_the_screen_and_clear_the_steppers() {
+        for width in [640.0, 820.0, 1280.0, 1700.0] {
+            let cards = map_cards(width);
+            for (i, c) in cards.iter().enumerate() {
+                assert!(c.x >= 0.0 && c.x + c.w <= width, "card {i} on screen at {width}");
+                let p = map_preview(*c);
+                assert!(p.x >= c.x && p.x + p.w <= c.x + c.w && p.y + p.h <= c.y + c.h, "the picture is inside its card");
+                for d in &cards[i + 1..] {
+                    assert!(c.x + c.w <= d.x, "cards do not overlap");
+                }
+            }
+            let bottom = cards[0].y + cards[0].h;
+            assert!(bottom + 30.0 < setup_label_y(), "the blurb fits between the cards and the first row");
+        }
+    }
+
+    #[test]
+    fn back_and_escape_leave_the_setup_page() {
+        let mut menu = Menu::default();
+        tap(&mut menu, "PLAY");
+        tap(&mut menu, "BACK");
+        assert_eq!(menu.page(), Page::Title);
+        menu.key(Key::Char('h'));
+        assert_eq!(menu.page(), Page::Setup(Mode::Host));
+        assert_eq!(menu.key(Key::Escape), None);
+        assert_eq!(menu.page(), Page::Title);
     }
 
     #[test]
@@ -367,9 +605,12 @@ mod tests {
     #[test]
     fn keyboard_shortcuts_on_the_title() {
         let mut menu = Menu::default();
-        assert_eq!(menu.key(Key::Char('p')), Some(Action::Play));
-        assert_eq!(menu.key(Key::Char('H')), Some(Action::Host));
-        assert_eq!(menu.key(Key::Char('s')), Some(Action::ServerRoom));
+        assert_eq!(menu.key(Key::Char('p')), None);
+        assert_eq!(menu.key(Key::Enter), Some(Action::Play(Setup { players: 4, map: 0 })));
+        menu.key(Key::Char('H'));
+        assert_eq!(menu.key(Key::Enter), Some(Action::Host(Setup { players: 4, map: 0 })));
+        menu.key(Key::Char('s'));
+        assert_eq!(menu.key(Key::Enter), Some(Action::ServerRoom(Setup { players: 4, map: 0 })));
         assert_eq!(menu.key(Key::Char('j')), None);
         assert_eq!(menu.page(), Page::Code);
         for c in "abcd".chars() {
@@ -416,8 +657,14 @@ mod tests {
     #[test]
     fn buttons_fit_on_every_screen_shape_without_overlapping() {
         for width in [640.0, 820.0, 960.0, 1280.0, 1700.0] {
-            for page in [Page::Title, Page::Code] {
-                let menu = Menu { page, code: String::new() };
+            for page in [
+                Page::Title,
+                Page::Code,
+                Page::Setup(Mode::Play),
+                Page::Setup(Mode::Host),
+                Page::Setup(Mode::ServerRoom),
+            ] {
+                let menu = Menu { page, ..Menu::default() };
                 let buttons = menu.buttons(width);
                 for (i, a) in buttons.iter().enumerate() {
                     let r = a.rect;
@@ -435,7 +682,7 @@ mod tests {
     #[test]
     fn the_code_slots_do_not_run_into_the_keypad() {
         let slots_bottom = code_slots(WIDE).iter().map(|r| r.y + r.h).fold(0.0, f32::max);
-        let keys_top = Menu { page: Page::Code, code: String::new() }
+        let keys_top = Menu { page: Page::Code, ..Menu::default() }
             .buttons(WIDE)
             .iter()
             .map(|b| b.rect.y)
@@ -446,6 +693,15 @@ mod tests {
     #[test]
     fn the_corner_button_stays_out_of_the_way_of_the_notice_button() {
         assert!(!menu_button(WIDE).contains(centre(notice_button(WIDE))));
+    }
+
+    #[test]
+    fn the_restart_button_sits_under_the_menu_button_on_screen() {
+        for width in [WIDE, 960.0] {
+            let (menu, restart) = (menu_button(width), restart_button(width));
+            assert!(restart.y >= menu.y + menu.h, "no overlap");
+            assert!(restart.x >= 0.0 && restart.x + restart.w <= width);
+        }
     }
 
     #[test]

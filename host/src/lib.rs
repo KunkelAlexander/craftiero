@@ -33,15 +33,50 @@ pub use throttle::Throttle;
 
 use protocol::{ClientMsg, PlayerId, Snapshot, Welcome};
 use sdf::{Grid, Op, Shape};
-use sim::{Event, Input, World};
+use sim::map::{spawn_points, MAX_PLAYERS};
+use sim::weapons::{valid_loadout, DEFAULT_LOADOUT};
+use sim::{Event, Input, Vec3, World};
+
+/// How long the players may take to pick their weapons before the match begins
+/// without the ones who have not: 45 s of ticks.
+const CHOOSE_TICKS: u32 = 45 * 60;
+
+/// Picks `count` (x, z) columns for worms to start at on map number `map`, from
+/// a seed. The demo maps' is `sim::map::spawn_points`; tests with a small flat
+/// map bring their own.
+pub type Places = fn(map: u8, seed: u32, count: usize) -> Vec<Vec3>;
+
+/// `Places` for a small flat test map: up to eight fixed spots, the same for
+/// every seed. (The demo map's valley does not fit in a test's 32 m of ground.)
+pub fn flat_places(_map: u8, _seed: u32, count: usize) -> Vec<Vec3> {
+    let all = [(8.0, 16.0), (24.0, 16.0), (16.0, 8.0), (16.0, 24.0), (10.0, 10.0), (22.0, 22.0), (10.0, 22.0), (22.0, 10.0)];
+    // They drop from the top of the 16 m high test map.
+    all[..count].iter().map(|&(x, z)| Vec3::new(x, 15.5, z)).collect()
+}
+
+/// A fresh world with `seats` worms at random places, and a few more random
+/// spots to come back at after dying. Everybody carries the default weapons
+/// until they pick others.
+fn new_world(map: &Grid, map_id: u8, seats: usize, seed: u32, places: Places) -> World {
+    // The worms take the first points and the spare ones are only for coming
+    // back, so a two-worm match does not respawn on the same two spots forever.
+    let points = places(map_id, seed, seats + 4);
+    let mut world = World::from_points(map.clone(), &points[..seats], seed);
+    world.add_respawn_points(&points[seats..]);
+    for i in 0..seats {
+        world.set_loadout(i, &DEFAULT_LOADOUT);
+    }
+    world
+}
 
 /// Who drives a worm slot.
 ///
 /// Pattern: State. A slot is either empty or a connected human, and what
 /// `tick` does depends on which, without scattering `if is_human` flags.
 enum Controller {
-    /// Nobody: the worm stands there as a target dummy. (The 2D game put a bot
-    /// here; they come back with M6, and become a second kind of controller.)
+    /// Nobody: the worm stands there as a target dummy. This is an NPC seat, or
+    /// a human seat nobody has taken yet. (The 2D game put a bot here; they
+    /// come back with M6, and become a second kind of controller.)
     Idle,
     /// A connected human: their most recent input.
     Human(Input),
@@ -57,8 +92,23 @@ pub struct Host {
     /// match began. (Digging changes `world.grid`, so it cannot be rebuilt
     /// from that.)
     pristine: Grid,
-    spawns: Vec<(f32, f32)>,
+    /// The first this many seats are for humans; the rest are NPCs for good.
+    /// A human who joins takes the first free human seat, which is "replacing
+    /// an NPC" on screen: until then the seat is a dummy like the NPCs.
+    humans: usize,
+    places: Places,
+    /// Which of `sim::map::MAPS` the match is on, repeated in every Welcome.
+    map: u8,
     seed: u32,
+    /// Does a match start with the players picking their weapons (the world
+    /// frozen until they have)? The real game does; the tests' hosts play at once.
+    choose_first: bool,
+    /// Which humans have picked in this match. Only the first pick counts,
+    /// because picking refills the magazines (a client could otherwise
+    /// "reload" by choosing again).
+    chose: Vec<bool>,
+    /// Ticks left before the match begins without the humans who have not picked.
+    choose_left: u32,
     /// Which match this is: 0, then one more after each rematch. Whoever hands
     /// out Welcomes (the `Session`, the local client) compares it with the
     /// number it last saw, so a rematch asked for by anyone reaches everyone.
@@ -66,20 +116,51 @@ pub struct Host {
 }
 
 impl Host {
-    /// A new match on `map` with a worm for each spawn column, all idle until
-    /// humans join.
-    pub fn new(map: Grid, spawns: &[(f32, f32)], seed: u32) -> Host {
-        let world = World::new(map.clone(), spawns, seed);
-        let controllers = spawns.iter().map(|_| Controller::Idle).collect();
+    /// A new match on `map` with `humans` seats for people (idle until they
+    /// join) and `npcs` more worms nobody drives. The worms start at random
+    /// places picked from `seed`.
+    ///
+    /// `map` is the grid built for map number `map_id` of `sim::map::MAPS`. The
+    /// match starts with everybody choosing weapons: it begins once every
+    /// human has picked (or time is up).
+    pub fn new(map: Grid, map_id: u8, humans: usize, npcs: usize, seed: u32) -> Host {
+        let mut host = Host::on(map, map_id, humans, npcs, seed, spawn_points);
+        host.choose_first = true;
+        host.start_choosing();
+        host
+    }
+
+    /// `new` for a map that is not one of the demo maps (a test's flat ground),
+    /// and with no choosing: the match is on from the first tick.
+    pub fn with_places(map: Grid, humans: usize, npcs: usize, seed: u32, places: Places) -> Host {
+        Host::on(map, 0, humans, npcs, seed, places)
+    }
+
+    fn on(map: Grid, map_id: u8, humans: usize, npcs: usize, seed: u32, places: Places) -> Host {
+        let seats = (humans + npcs).min(MAX_PLAYERS);
+        let humans = humans.min(seats);
+        let world = new_world(&map, map_id, seats, seed, places);
         Host {
             world,
-            controllers,
+            controllers: (0..seats).map(|_| Controller::Idle).collect(),
             edits: Vec::new(),
             pristine: map,
-            spawns: spawns.to_vec(),
+            humans,
+            places,
+            map: map_id,
             seed,
+            choose_first: false,
+            chose: vec![false; seats],
+            choose_left: CHOOSE_TICKS,
             match_number: 0,
         }
+    }
+
+    /// Freeze the world until the humans have picked their weapons.
+    fn start_choosing(&mut self) {
+        self.world.choosing = true;
+        self.chose = vec![false; self.controllers.len()];
+        self.choose_left = CHOOSE_TICKS;
     }
 
     /// The kills that win a match (`SCORE_LIMIT` unless this says otherwise).
@@ -95,19 +176,25 @@ impl Host {
     }
 
     /// Start the next match on the same map with the same people in the same
-    /// seats. Their last inputs are cleared, so a held trigger does not fire
-    /// the moment the new match begins.
+    /// seats, at new random places. Their last inputs are cleared, so a held
+    /// trigger does not fire the moment the new match begins.
     fn rematch(&mut self) {
         self.match_number += 1;
-        let mut world = World::new(
-            self.pristine.clone(),
-            &self.spawns,
+        let mut world = new_world(
+            &self.pristine,
+            self.map,
+            self.controllers.len(),
             self.seed.wrapping_add(self.match_number),
+            self.places,
         );
         // The rules and the cheat belong to the room, not to one match.
         world.score_limit = self.world.score_limit;
         world.infinite_ammo = self.world.infinite_ammo;
         self.world = world;
+        if self.choose_first {
+            // Everyone picks again: that is half of why one restarts.
+            self.start_choosing();
+        }
         self.edits.clear();
         for c in &mut self.controllers {
             if let Controller::Human(input) = c {
@@ -116,11 +203,14 @@ impl Host {
         }
     }
 
-    /// A human arrives: give them the first slot nobody holds.
+    /// A human arrives: give them the first human seat nobody holds.
     /// `None` means the match is full.
     pub fn join(&mut self) -> Option<Welcome> {
-        let slot = self.controllers.iter().position(|c| matches!(c, Controller::Idle))?;
+        let slot = self.controllers[..self.humans].iter().position(|c| matches!(c, Controller::Idle))?;
         self.controllers[slot] = Controller::Human(Input::default());
+        // Whoever sat here before took their weapons with them.
+        self.chose[slot] = false;
+        self.world.set_loadout(slot, &DEFAULT_LOADOUT);
         Some(self.welcome(slot as PlayerId))
     }
 
@@ -137,7 +227,7 @@ impl Host {
     fn welcome(&self, you: PlayerId) -> Welcome {
         // No events: the edit log is already up to date, and replaying
         // explosions from before the newcomer arrived would be wrong.
-        Welcome { you, edits: self.edits.clone(), snapshot: self.snapshot(Vec::new()) }
+        Welcome { you, map: self.map, edits: self.edits.clone(), snapshot: self.snapshot(Vec::new()) }
     }
 
     /// A human goes away: the worm stays as a dummy, so the match carries on.
@@ -162,16 +252,25 @@ impl Host {
                     *latest = input;
                 }
             }
+            // The weapons a human picked. Never trust the client: it must be a
+            // whole, allowed set, and only the first one of a match counts.
+            ClientMsg::Loadout(ids) => {
+                let human = matches!(self.controllers.get(id as usize), Some(Controller::Human(_)));
+                if human && !self.chose[id as usize] && valid_loadout(&ids) {
+                    self.world.set_loadout(id as usize, &ids);
+                    self.chose[id as usize] = true;
+                }
+            }
             // A ping tests the connection, not the game, so whoever owns the
             // connection answers it (the host session), not this struct.
             // A resync is the same kind of thing: the session sends the reply
             // (`rewelcome`) down that client's own connection.
             ClientMsg::Ping { .. } | ClientMsg::Resync => {}
-            // The rematch is the host's to allow: only a finished match can be
-            // restarted, and only by someone who is in it.
+            // Anyone in the match may restart it for everybody, at any time (a
+            // finished match or not). Only seated players, though: the host
+            // still decides who counts as one.
             ClientMsg::Rematch => {
-                let human = matches!(self.controllers.get(id as usize), Some(Controller::Human(_)));
-                if human && self.world.winner.is_some() {
+                if matches!(self.controllers.get(id as usize), Some(Controller::Human(_))) {
                     self.rematch();
                 }
             }
@@ -197,6 +296,9 @@ impl Host {
     /// Advance the match by one tick. Returns the world as it is now, plus the
     /// events of this tick. Sending it (or not) is up to the caller.
     pub fn tick(&mut self) -> Snapshot {
+        if self.world.choosing {
+            self.wait_for_choices();
+        }
         // Pattern: Command. Every controller turns into the same `Input`.
         // A human whose packet is late simply repeats their last input.
         let inputs: Vec<Input> = self
@@ -217,6 +319,21 @@ impl Host {
         self.snapshot(events)
     }
 
+    /// The match begins once every human has picked, or the time is up. The
+    /// clock only runs while somebody is here to pick: a room nobody has
+    /// entered yet waits for its first player.
+    fn wait_for_choices(&mut self) {
+        let humans: Vec<usize> =
+            (0..self.controllers.len()).filter(|&i| matches!(self.controllers[i], Controller::Human(_))).collect();
+        if humans.is_empty() {
+            return;
+        }
+        self.choose_left = self.choose_left.saturating_sub(1);
+        if self.choose_left == 0 || humans.iter().all(|&i| self.chose[i]) {
+            self.world.choosing = false;
+        }
+    }
+
     /// Read-only view of the real world (for tests and debugging).
     pub fn world(&self) -> &World {
         &self.world
@@ -233,6 +350,7 @@ impl Host {
             edits_total: self.edits.len() as u32,
             score_limit: self.world.score_limit,
             winner: self.world.winner,
+            choosing: self.world.choosing,
         }
     }
 }
@@ -253,10 +371,16 @@ mod tests {
         Grid::from_fn(IVec3::new(8, 4, 8), |p| p.y - 4.0)
     }
 
-    /// Two worms on the ground (the spawn drop finds rock at once, so put them
-    /// on the surface by hand, like the sim's own tests do).
+    /// Like `flat_places`, but the row of worms shifts with the seed, so a new
+    /// match starts somewhere else.
+    fn shifting_spots(_map: u8, seed: u32, count: usize) -> Vec<Vec3> {
+        (0..count).map(|i| Vec3::new(3.0 + i as f32 * 3.0 + (seed % 7) as f32, 15.5, 16.0)).collect()
+    }
+
+    /// Two human seats on the ground (the spawn drop finds rock at once, so put
+    /// the worms on the surface by hand, like the sim's own tests do).
     fn host() -> Host {
-        let mut host = Host::new(ground(), &[(8.0, 16.0), (24.0, 16.0)], 7);
+        let mut host = Host::with_places(ground(), 2, 0, 7, flat_places);
         for w in &mut host.world.worms {
             w.pos.y = 4.05;
         }
@@ -384,13 +508,142 @@ mod tests {
     }
 
     #[test]
-    fn a_running_match_cannot_be_restarted() {
+    fn any_player_can_restart_a_running_match_for_everyone() {
         let mut host = host();
         host.join();
+        host.join();
         host.tick();
+        host.handle(1, ClientMsg::Rematch);
+        assert_eq!(host.match_number(), 1);
+        assert_eq!(host.world().tick, 0, "the match began again");
+        assert!(host.rewelcome(0).is_some() && host.rewelcome(1).is_some(), "both are still seated");
+    }
+
+    #[test]
+    fn a_rematch_starts_at_new_random_places() {
+        let mut host = Host::with_places(ground(), 1, 1, 3, shifting_spots);
+        host.join();
+        let before: Vec<_> = host.world().worms.iter().map(|w| (w.pos.x, w.pos.z)).collect();
         host.handle(0, ClientMsg::Rematch);
-        assert_eq!(host.match_number(), 0);
-        assert_eq!(host.world().tick, 1, "the match went on");
+        let after: Vec<_> = host.world().worms.iter().map(|w| (w.pos.x, w.pos.z)).collect();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn humans_take_the_seats_set_aside_for_them_and_npcs_stay_dummies() {
+        let mut host = Host::with_places(ground(), 2, 2, 7, flat_places);
+        assert_eq!(host.world().worms.len(), 4);
+        assert_eq!(host.join().unwrap().you, 0);
+        assert_eq!(host.join().unwrap().you, 1);
+        assert!(host.join().is_none(), "seats 2 and 3 are NPCs");
+        assert!(host.rewelcome(2).is_none());
+        host.handle(2, ClientMsg::Rematch);
+        assert_eq!(host.match_number(), 0, "an NPC cannot ask for a rematch");
+    }
+
+    /// A host that does what the real one does at the start of a match: the
+    /// world waits for the humans to pick their weapons.
+    fn choosing_host() -> Host {
+        let mut host = host();
+        host.choose_first = true;
+        host.start_choosing();
+        host
+    }
+
+    fn carried(host: &Host, slot: usize) -> Vec<u8> {
+        host.world().worms[slot].weapons.iter().map(|g| g.id).collect()
+    }
+
+    #[test]
+    fn a_human_may_pick_once_and_only_a_valid_set() {
+        use sim::weapons::{BLASTER, BOMB, BUILD, CLUSTER, NOVA, RAILGUN, ROCKET, TELEPORT};
+        let mut host = host();
+        host.join();
+        let mine = vec![NOVA, BOMB, TELEPORT, BLASTER, BUILD];
+        host.handle(0, ClientMsg::Loadout(vec![ROCKET; 5]));
+        host.handle(0, ClientMsg::Loadout(vec![BLASTER, ROCKET]));
+        host.handle(0, ClientMsg::Loadout(vec![ROCKET, BOMB, CLUSTER, BLASTER, BUILD]));
+        assert_eq!(carried(&host, 0), DEFAULT_LOADOUT, "invalid choices change nothing");
+        host.handle(0, ClientMsg::Loadout(mine.clone()));
+        assert_eq!(carried(&host, 0), mine);
+        host.handle(0, ClientMsg::Loadout(DEFAULT_LOADOUT.to_vec()));
+        assert_eq!(carried(&host, 0), mine, "a second pick would be a free reload");
+        // Nobody sits in seat 1, so a forged pick for it does nothing.
+        host.handle(1, ClientMsg::Loadout(vec![NOVA, BOMB, TELEPORT, BLASTER, RAILGUN]));
+        assert_eq!(carried(&host, 1), DEFAULT_LOADOUT);
+    }
+
+    #[test]
+    fn the_match_waits_for_every_human_to_pick() {
+        let mut host = choosing_host();
+        assert!(host.tick().choosing, "nobody is here yet: it waits for the first player");
+        host.join();
+        host.join();
+        let start = host.world().worms[0].pos;
+        for _ in 0..30 {
+            host.tick();
+        }
+        assert_eq!(host.world().worms[0].pos, start, "frozen while they choose");
+        assert!(host.world().tick > 30, "but the clock runs");
+
+        host.handle(0, ClientMsg::Loadout(DEFAULT_LOADOUT.to_vec()));
+        assert!(host.tick().choosing, "one of two is not enough");
+        host.handle(1, ClientMsg::Loadout(DEFAULT_LOADOUT.to_vec()));
+        assert!(!host.tick().choosing, "everyone is ready");
+    }
+
+    #[test]
+    fn the_match_begins_when_time_runs_out_even_if_somebody_has_not_picked() {
+        let mut host = choosing_host();
+        host.join();
+        for _ in 0..CHOOSE_TICKS - 1 {
+            assert!(host.tick().choosing);
+        }
+        assert!(!host.tick().choosing);
+    }
+
+    #[test]
+    fn a_restart_makes_everybody_pick_again() {
+        use sim::weapons::{BLASTER, BOMB, BUILD, NOVA, TELEPORT};
+        let mut host = choosing_host();
+        host.join();
+        host.handle(0, ClientMsg::Loadout(vec![NOVA, BOMB, TELEPORT, BLASTER, BUILD]));
+        host.tick();
+        assert!(!host.world().choosing);
+
+        host.handle(0, ClientMsg::Rematch);
+        assert!(host.world().choosing, "choosing again");
+        assert_eq!(carried(&host, 0), DEFAULT_LOADOUT, "the old pick is gone");
+        let welcome = host.rewelcome(0).unwrap();
+        assert!(welcome.snapshot.choosing, "the Welcome tells the client to show the picker");
+        host.handle(0, ClientMsg::Loadout(vec![BLASTER, BOMB, TELEPORT, NOVA, BUILD]));
+        assert_eq!(carried(&host, 0), [BLASTER, BOMB, TELEPORT, NOVA, BUILD], "and they may pick again");
+    }
+
+    #[test]
+    fn a_player_who_joins_takes_the_default_weapons_not_the_last_ones() {
+        use sim::weapons::{BLASTER, BOMB, BUILD, NOVA, TELEPORT};
+        let mut host = host();
+        host.join();
+        host.handle(0, ClientMsg::Loadout(vec![NOVA, BOMB, TELEPORT, BLASTER, BUILD]));
+        host.leave(0);
+        host.join();
+        assert_eq!(carried(&host, 0), DEFAULT_LOADOUT);
+        host.handle(0, ClientMsg::Loadout(vec![NOVA, BOMB, TELEPORT, BLASTER, BUILD]));
+        assert_eq!(carried(&host, 0)[0], NOVA, "and the new player may pick");
+    }
+
+    #[test]
+    fn the_welcome_names_the_map() {
+        let mut host = host();
+        host.map = 2;
+        assert_eq!(host.join().unwrap().map, 2);
+    }
+
+    #[test]
+    fn a_match_never_holds_more_than_the_most_players() {
+        let host = Host::with_places(ground(), 4, 4, 7, flat_places);
+        assert_eq!(host.world().worms.len(), MAX_PLAYERS);
     }
 
     #[test]

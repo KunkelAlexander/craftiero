@@ -42,6 +42,11 @@ pub enum ClientMsg {
     /// "Are you there? How long does a round trip take?" The token is echoed
     /// back unchanged in `HostMsg::Pong`.
     Ping { token: u32 },
+    /// The weapons this player picked for the match (ids into `WEAPONS`).
+    /// Sent once after each Welcome that says the players are still choosing.
+    /// The host checks it and takes only the first one of a match: a second
+    /// would be a free refill of every magazine.
+    Loadout(Vec<u8>),
     /// "I think my terrain is wrong, start me over." Sent when the replica
     /// notices it missed an edit (`Replica::desynced`). The host answers with
     /// a fresh Welcome, exactly as for a rematch.
@@ -76,6 +81,9 @@ pub enum HostMsg {
 pub struct Welcome {
     /// The slot this client controls.
     pub you: PlayerId,
+    /// Which map the match is on (an index into `sim::map::MAPS`). Like the
+    /// edits, only the number travels: the client builds the map itself.
+    pub map: u8,
     /// Every terrain edit since the match began. The map itself is not sent:
     /// the generator is in both programs, so a client builds the untouched map
     /// and replays these on top. Snapshots only carry *new* edits
@@ -95,6 +103,7 @@ pub struct Welcome {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WelcomeHead {
     pub you: PlayerId,
+    pub map: u8,
     /// How many edits follow in `HostMsg::Edits` messages.
     pub edit_count: u32,
     pub snapshot: Snapshot,
@@ -109,7 +118,7 @@ pub const EDITS_PER_MESSAGE: usize = 500;
 /// sends them back to back, so (the connection being ordered) no snapshot can
 /// arrive between them.
 pub fn welcome_messages(welcome: Welcome) -> Vec<HostMsg> {
-    let head = WelcomeHead { you: welcome.you, edit_count: welcome.edits.len() as u32, snapshot: welcome.snapshot };
+    let head = WelcomeHead { you: welcome.you, map: welcome.map, edit_count: welcome.edits.len() as u32, snapshot: welcome.snapshot };
     let mut msgs = vec![HostMsg::Welcome(head)];
     msgs.extend(welcome.edits.chunks(EDITS_PER_MESSAGE).map(|slice| HostMsg::Edits(slice.to_vec())));
     msgs
@@ -146,7 +155,7 @@ impl WelcomeBuilder {
         let (head, mut edits) = self.pending.take()?;
         // A host that sends more than it announced is broken; keep the promise.
         edits.truncate(head.edit_count as usize);
-        Some(Welcome { you: head.you, edits, snapshot: head.snapshot })
+        Some(Welcome { you: head.you, map: head.map, edits, snapshot: head.snapshot })
     }
 }
 
@@ -177,6 +186,10 @@ pub struct Snapshot {
     /// snapshot, carries them to a late joiner with no extra code.
     pub score_limit: i32,
     pub winner: Option<u8>,
+    /// The match has not begun: the players are picking their weapons and the
+    /// world stands still until they have (or the time is up). Like `winner`
+    /// it rides in every snapshot, so a late joiner learns it from the Welcome.
+    pub choosing: bool,
 }
 
 // ---- bytes ---------------------------------------------------------------
@@ -250,6 +263,7 @@ mod tests {
             edits_total,
             score_limit: 15,
             winner: None,
+            choosing: false,
         }
     }
 
@@ -270,7 +284,7 @@ mod tests {
     #[test]
     fn a_long_edit_log_arrives_in_order_as_several_messages() {
         let log = edits(EDITS_PER_MESSAGE * 2 + 17);
-        let msgs = welcome_messages(Welcome { you: 2, edits: log.clone(), snapshot: snapshot(log.len() as u32) });
+        let msgs = welcome_messages(Welcome { you: 2, map: 0, edits: log.clone(), snapshot: snapshot(log.len() as u32) });
         assert_eq!(msgs.len(), 1 + 3, "a head and three slices");
 
         let mut builder = WelcomeBuilder::default();
@@ -287,7 +301,7 @@ mod tests {
 
     #[test]
     fn a_welcome_without_edits_is_complete_with_its_head() {
-        let msgs = welcome_messages(Welcome { you: 0, edits: Vec::new(), snapshot: snapshot(0) });
+        let msgs = welcome_messages(Welcome { you: 0, map: 0, edits: Vec::new(), snapshot: snapshot(0) });
         assert_eq!(msgs.len(), 1);
         assert!(WelcomeBuilder::default().push(&msgs[0]).is_some());
     }
@@ -295,8 +309,8 @@ mod tests {
     #[test]
     fn a_new_head_restarts_a_half_received_welcome() {
         let log = edits(EDITS_PER_MESSAGE + 1);
-        let first = welcome_messages(Welcome { you: 0, edits: log.clone(), snapshot: snapshot(0) });
-        let second = welcome_messages(Welcome { you: 1, edits: log.clone(), snapshot: snapshot(0) });
+        let first = welcome_messages(Welcome { you: 0, map: 0, edits: log.clone(), snapshot: snapshot(0) });
+        let second = welcome_messages(Welcome { you: 1, map: 0, edits: log.clone(), snapshot: snapshot(0) });
 
         let mut builder = WelcomeBuilder::default();
         builder.push(&first[0]);
@@ -312,7 +326,7 @@ mod tests {
 
     #[test]
     fn other_messages_do_not_disturb_a_welcome_in_progress() {
-        let msgs = welcome_messages(Welcome { you: 0, edits: edits(3), snapshot: snapshot(3) });
+        let msgs = welcome_messages(Welcome { you: 0, map: 0, edits: edits(3), snapshot: snapshot(3) });
         let mut builder = WelcomeBuilder::default();
         assert!(builder.push(&HostMsg::Pong { token: 1 }).is_none());
         assert!(builder.push(&msgs[0]).is_none());

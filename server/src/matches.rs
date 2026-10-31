@@ -38,16 +38,16 @@ pub const MAX_MATCHES: usize = 4;
 
 type Shared = Arc<Mutex<Rooms>>;
 
-/// The untouched map, built once and copied for each match: generating it
-/// takes about a second of CPU.
-fn pristine_map() -> Grid {
-    static MAP: OnceLock<Grid> = OnceLock::new();
-    MAP.get_or_init(map::build).clone()
+/// The untouched map, built once (the first time a match asks for it) and
+/// copied for each match: generating one takes about a second of CPU.
+fn pristine_map(map: u8) -> Grid {
+    static MAPS: [OnceLock<Grid>; map::MAPS.len()] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    MAPS[map as usize].get_or_init(|| map::build_map(map)).clone()
 }
 
 /// A connection asked for a hosted room: open it, start the match and put the
 /// asker in it.
-pub fn start(rooms: &Shared, role: &mut Role, tx: &Tx, version: u16) {
+pub fn start(rooms: &Shared, role: &mut Role, tx: &Tx, version: u16, humans: u8, npcs: u8, map: u8) {
     let mut guard = rooms.lock().unwrap();
     if !matches!(role, Role::Lobby) {
         return reply(tx, FromRelay::Rejected(Reject::AlreadyInRoom));
@@ -70,7 +70,7 @@ pub fn start(rooms: &Shared, role: &mut Role, tx: &Tx, version: u16) {
     reply(tx, FromRelay::RoomCreated { code: code.clone() });
     guard.handle(role, tx, ToRelay::JoinRoom { code, version });
 
-    tokio::spawn(run(rooms.clone(), host_role, host_tx, host_rx));
+    tokio::spawn(run(rooms.clone(), host_role, host_tx, host_rx, humans, npcs, map));
 }
 
 fn reply(tx: &Tx, msg: FromRelay) {
@@ -83,10 +83,16 @@ fn next_message(rx: &mut UnboundedReceiver<Vec<u8>>) -> Option<FromRelay> {
 
 /// The match: one task that owns a `Host` and ticks it 60 times a second until
 /// everybody has left.
-async fn run(rooms: Shared, mut role: Role, tx: Tx, mut inbox: UnboundedReceiver<Vec<u8>>) {
+async fn run(rooms: Shared, mut role: Role, tx: Tx, mut inbox: UnboundedReceiver<Vec<u8>>, humans: u8, npcs: u8, map: u8) {
     // The map is a second of CPU: keep it off the threads that serve sockets.
-    let grid = tokio::task::spawn_blocking(pristine_map).await.expect("map generation panicked");
-    let mut host = Host::new(grid, &map::SPAWNS, rand::random());
+    // The map number comes from a client too: an unknown one is the valley.
+    let map = if (map as usize) < map::MAPS.len() { map } else { 0 };
+    let grid = tokio::task::spawn_blocking(move || pristine_map(map)).await.expect("map generation panicked");
+    // The seat counts come from a client, so they are clamped: at least one
+    // human (the asker), at most `MAX_PLAYERS` worms in all (`Host::new` caps
+    // the total itself).
+    let humans = (humans as usize).max(1);
+    let mut host = Host::new(grid, map, humans, npcs as usize, rand::random());
     let mut session = Session::new();
 
     let mut clock = tokio::time::interval(Duration::from_secs_f32(DT));

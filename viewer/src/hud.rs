@@ -16,6 +16,7 @@
 //! wide as the window needs. `scale` turns them into real pixels, so the HUD is
 //! the same size relative to the window at any resolution.
 
+use crate::armory::{self, Armory};
 use crate::menu::{self, Menu, Page, Rect};
 use crate::renderer::Gpu;
 use crate::touch::{self, Button, TouchControls};
@@ -32,12 +33,15 @@ fn rgb(hex: u32) -> Colour {
 }
 
 pub const MARGIN: f32 = 28.0;
-const SLOT_KEYS: &str = "1234567890-=[]\\";
+/// The keys of the number row, in the order they pick weapons.
+pub const SLOT_KEYS: &str = "1234567890-=[]\\";
 
 // Cel shading, like the world: every shape is one flat colour with a single
 // hard shadow band along its bottom (`shade`) and a soft dark-brown ink line,
 // in an earthy palette that sits next to the terrain instead of shouting over it.
 const INK: u32 = 0x1e1a14;
+/// Half the width of the minimap's box on the screen, in virtual units.
+const MINIMAP_R: f32 = 64.0;
 const TEXT: u32 = 0xf4ecd8;
 const TRACK: u32 = 0x4a3f33;
 const GOLD: u32 = 0xe6c75a;
@@ -49,7 +53,9 @@ const PANEL_ORANGE: u32 = 0xc58a3e;
 const READY: u32 = 0xdcecc0;
 const RELOAD: u32 = 0xd2e2ee;
 
-const MAX_VERTS: usize = 3 * 10_000;
+/// The armory screen alone is fifteen cards with names (every lit pixel of the
+/// font is two triangles), more than the match HUD ever draws.
+const MAX_VERTS: usize = 3 * 40_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -201,17 +207,24 @@ impl Hud {
         self.vitals(worm);
         self.weapon(worm, width, if touch.is_some() { touch::WEAPON_PLATE_Y } else { 720.0 - MARGIN - 142.0 });
         self.reticle(width / 2.0);
+        // Under the touch MENU and RESTART buttons, which own the corner there.
+        let corner_y = if touch.is_some() { menu::restart_button(width).y + 44.0 + MINIMAP_R } else { MARGIN + MINIMAP_R };
+        self.minimap(worm, (width - MARGIN - MINIMAP_R, corner_y));
         if let Some(note) = self.note.take() {
             self.plate_text(&note, width, MARGIN);
             self.note = Some(note);
         }
         if let Some(winner) = world.winner {
             self.match_over(world, me, winner as usize, width, touch.is_some());
+        } else if world.choosing {
+            // This player has picked; the world waits for the others (or the clock).
+            self.plate_text("WAITING FOR THE OTHER PLAYERS TO PICK THEIR WEAPONS", width, 110.0);
         }
         if let Some(touch) = touch {
             self.touch_controls(touch);
             // A screen with no Esc key needs its own way out of the match.
             self.draw_button(menu::menu_button(width), "MENU", false, true, 3.0);
+            self.draw_button(menu::restart_button(width), "RESTART", false, true, 3.0);
         }
         self.submit(gpu, encoder, target);
     }
@@ -226,6 +239,38 @@ impl Hud {
                 self.fat(title, x, menu::TITLE_Y, 10.0, GOLD);
                 let sub = "PLAY OFFLINE OR ONLINE WITH FRIENDS";
                 self.label(sub, (width - text_width(sub, 2.0)) / 2.0, menu::TITLE_Y + 100.0, TEXT);
+            }
+            Page::Setup(mode) => {
+                let head = match mode {
+                    menu::Mode::Play => "PLAY OFFLINE",
+                    menu::Mode::Host => "HOST A ROOM",
+                    menu::Mode::ServerRoom => "SERVER ROOM",
+                };
+                self.fat(head, (width - text_width(head, 5.0)) / 2.0, 40.0, 5.0, TEXT);
+                let setup = menu.setup();
+                for (i, card) in menu::map_cards(width).into_iter().enumerate() {
+                    let def = &sim::map::MAPS[i];
+                    let chosen = i == setup.map as usize;
+                    self.plate(card.x, card.y, card.w, card.h, if chosen { PANEL_ORANGE } else { PANEL_GREY });
+                    self.map_picture(i as u8, menu::map_preview(card));
+                    let name = def.name.to_uppercase();
+                    let y = card.y + card.h - 30.0;
+                    self.label(&name, card.x + (card.w - text_width(&name, 2.0)) / 2.0, y, TEXT);
+                }
+                let blurb = sim::map::MAPS[setup.map as usize].blurb.to_uppercase();
+                let y = menu::map_cards(width)[0].y + 150.0 + 14.0;
+                self.label(&blurb, (width - text_width(&blurb, 2.0)) / 2.0, y, TEXT);
+                let name = menu::PLAYERS_LABEL;
+                self.label(name, (width - text_width(name, 2.0)) / 2.0, menu::setup_label_y(), TEXT);
+                let value = menu::setup_value(width);
+                self.plate(value.x, value.y, value.w, value.h, PANEL_ORANGE);
+                let n = setup.players.to_string();
+                self.fat(&n, value.x + (value.w - text_width(&n, 6.0)) / 2.0, value.y + (value.h - 42.0) / 2.0, 6.0, TEXT);
+                let hint = match mode {
+                    menu::Mode::Play => "YOU AGAINST NPCS",
+                    _ => "FRIENDS TAKE THE SEATS - THE REST ARE NPCS",
+                };
+                self.label(hint, (width - text_width(hint, 2.0)) / 2.0, value.y + value.h + 24.0, TEXT);
             }
             Page::Code => {
                 let head = "ENTER THE ROOM CODE";
@@ -246,6 +291,72 @@ impl Hud {
             self.draw_button(b.rect, &b.label, b.primary, b.enabled, pixel);
         }
         self.submit(gpu, encoder, target);
+    }
+
+    /// The weapon picker over the frozen world: five weapons out of fifteen, in
+    /// a column per kind.
+    pub fn draw_armory(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, screen: (u32, u32), armory: &Armory) {
+        let width = self.begin(screen);
+        let picked = armory.picked();
+        let head = format!("CHOOSE YOUR {} WEAPONS", sim::weapons::LOADOUT_SIZE);
+        let pixel = if text_width(&head, 4.0) <= width - 2.0 * MARGIN { 4.0 } else { 3.0 };
+        self.fat(&head, (width - text_width(&head, pixel)) / 2.0, 34.0, pixel, TEXT);
+        let help = "CLICK A WEAPON OR PRESS ITS KEY - TWO OF EACH KIND AT MOST";
+        if text_width(help, 2.0) <= width - 2.0 * MARGIN {
+            self.label(help, (width - text_width(help, 2.0)) / 2.0, 100.0, TEXT);
+        }
+        for (col, (class, taken)) in armory::columns(picked).into_iter().enumerate() {
+            let x = armory::column_x(width, col);
+            let full = taken == sim::weapons::MAX_PER_CLASS;
+            self.label(&format!("{} {}/{}", class.name(), taken, sim::weapons::MAX_PER_CLASS), x, armory::CARDS_Y - 24.0, if full { GOLD } else { TEXT });
+        }
+        for card in armory::cards(width) {
+            let r = card.rect;
+            let slot = picked.iter().position(|&p| p == card.id);
+            // A kind that already has its two cannot take another: look it.
+            let closed = slot.is_none() && picked.len() < sim::weapons::LOADOUT_SIZE && !sim::weapons::can_add(picked, card.id);
+            let fill = match (slot, closed) {
+                (Some(_), _) => PANEL_ORANGE,
+                (None, true) => TRACK,
+                (None, false) => PANEL_GREY,
+            };
+            self.plate(r.x, r.y, r.w, r.h, fill);
+            let colour = if closed { PANEL_GREY } else { TEXT };
+            self.label(armory::key_label(card.key), r.x + 14.0, r.y + 25.0, colour);
+            let name = WEAPONS[card.id as usize].name.to_uppercase();
+            let pixel = if text_width(&name, 2.0) <= r.w - 100.0 { 2.0 } else { 1.0 };
+            if pixel > 1.0 {
+                self.label(&name, r.x + 44.0, r.y + 25.0, colour);
+            } else {
+                self.text(&name, r.x + 44.0, r.y + 28.0, 1.0, colour);
+            }
+            if let Some(n) = slot {
+                // The slot it will have in the match.
+                let s = (n + 1).to_string();
+                self.fat(&s, r.x + r.w - 14.0 - text_width(&s, 4.0), r.y + (r.h - 28.0) / 2.0, 4.0, TEXT);
+            }
+        }
+        let [clear, random, go] = armory::footer(width);
+        self.draw_button(clear, "CLEAR", false, !picked.is_empty(), 4.0);
+        self.draw_button(random, "RANDOM", false, true, 4.0);
+        let label = armory::go_label(picked);
+        self.draw_button(go, &label, true, armory.ready(), 4.0);
+        self.submit(gpu, encoder, target);
+    }
+
+    /// A map seen from above in `r`: a grid of coloured squares by height.
+    fn map_picture(&mut self, map: u8, r: Rect) {
+        const N: usize = 10;
+        let heights = sim::map::preview(map, N);
+        let cell = r.w / N as f32;
+        for (i, h) in heights.into_iter().enumerate() {
+            let colour = match h {
+                h if h < 0.45 => 0x7a9a55,
+                h if h < 0.75 => 0xa89865,
+                _ => 0xa4a198,
+            };
+            self.rect(r.x + (i % N) as f32 * cell, r.y + (i / N) as f32 * cell, cell + 0.5, cell + 0.5, colour);
+        }
     }
 
     /// A message in the middle of the screen with a way back: connecting,
@@ -303,6 +414,47 @@ impl Hud {
     // --- panels ---------------------------------------------------------
 
     /// Top left: `KILLS 4 | DEATHS 2`, and under it what it takes to win.
+    /// A little 3D box of the whole map with your own dot in it, turned with
+    /// your view so "up the screen" is the way you face. The box is empty on
+    /// purpose: it shows where *you* are in the world, nothing about the
+    /// terrain (a live picture of it would give away who is digging where) and
+    /// nothing about the other players.
+    fn minimap(&mut self, worm: &Worm, centre: (f32, f32)) {
+        if !worm.alive {
+            return;
+        }
+        let size = sim::map::WORLD_METRES;
+        let (sy, cy) = worm.yaw.sin_cos();
+        // Looking down at the box from a fixed angle: 35 degrees above the floor.
+        let (tilt_s, tilt_c) = (0.77_f32, 0.64_f32);
+        self.rect(centre.0 - MINIMAP_R - 6.0, centre.1 - MINIMAP_R - 6.0, 2.0 * MINIMAP_R + 12.0, 2.0 * MINIMAP_R + 12.0, 0x2b2620);
+        let scale = MINIMAP_R / (0.5 * (size.x * size.x + size.z * size.z).sqrt());
+        // A point of the world on the screen. `right` and `forward` are the
+        // worm's own axes on the floor (the same ones the sim moves it by).
+        let project = |x: f32, y: f32, z: f32| {
+            let (dx, dz) = (x - size.x / 2.0, z - size.z / 2.0);
+            let right = -cy * dx + sy * dz;
+            let forward = sy * dx + cy * dz;
+            let up = y - size.y / 2.0;
+            (centre.0 + right * scale, centre.1 - (forward * tilt_s + up * tilt_c) * scale)
+        };
+        let corner = |i: usize, y: f32| project(if i & 1 == 1 { size.x } else { 0.0 }, y, if i & 2 == 2 { size.z } else { 0.0 });
+        // Round the square: 0, 1, 3, 2.
+        let ring = [0, 1, 3, 2];
+        for k in 0..4 {
+            let (a, b) = (ring[k], ring[(k + 1) % 4]);
+            self.line(corner(a, 0.0), corner(b, 0.0), 2.0, rgb(0xd8cfb8));
+            self.line(corner(a, size.y), corner(b, size.y), 1.5, rgb(0xb0a68e));
+            self.line(corner(a, 0.0), corner(a, size.y), 1.5, rgb(0xb0a68e));
+        }
+        // The drop line to the floor is what makes the height readable.
+        let p = worm.pos;
+        let (dot, foot) = (project(p.x, p.y, p.z), project(p.x, 0.0, p.z));
+        self.line(foot, dot, 1.5, rgb(GOLD));
+        self.rect(foot.0 - 2.0, foot.1 - 1.0, 4.0, 2.0, GOLD);
+        self.rect(dot.0 - 3.5, dot.1 - 3.5, 7.0, 7.0, GOLD);
+    }
+
     fn kills_and_deaths(&mut self, worm: &Worm, score_limit: i32) {
         let (x, y) = (MARGIN, MARGIN);
         self.plate(x, y, 270.0, 44.0, PANEL_ORANGE);
@@ -833,12 +985,18 @@ mod tests {
     // A letter missing from the font draws as a blank gap: easy to miss by eye.
     #[test]
     fn the_font_has_every_character_the_hud_can_say() {
-        let fixed = "KILLS DEATHS HP LOW HEALTH RESPAWN READY RELOADING CHARGING MELEE 0123456789 /%.-= FIRST TO YOU WIN WINS PLAYER PRESS R FOR A NEW MATCH";
+        let fixed = "KILLS DEATHS HP LOW HEALTH RESPAWN READY RELOADING CHARGING MELEE 0123456789 /%.-+= FIRST TO YOU WIN WINS PLAYER PRESS R FOR A NEW MATCH";
         // The menu and the online notices: every string the viewer can show
         // here must be in the font (see `notice_for` and `room_note` in main.rs).
-        let menu = "CRAFTIERO PLAY HOST JOIN BACK DEL MENU ENTER THE ROOM CODE OFFLINE OR ONLINE WITH FRIENDS ROOM PING MS FRIENDS OPENING A CONNECTING TO RELAY KNOCKING WAITING FOR LOST PLAYING THE SERVER IS BUSY TRY AGAIN IN MINUTE NO THAT FULL RUNS ANOTHER VERSION RELOAD GAME LEFT MATCH OVER ALREADY REFUSED CONNECTION";
+        let menu = "CRAFTIERO PLAY HOST JOIN BACK DEL MENU RESTART START HUMANS NPCS CHOOSE YOUR WEAPONS CLICK A WEAPON OR PRESS ITS KEY - TWO OF EACH KIND AT MOST GUNS EXPLOSIVES TRICKS TOOLS CLEAR RANDOM GO PICK MORE PLAYERS YOU AGAINST NPCS FRIENDS TAKE THE SEATS - THE REST ARE WAITING FOR THE OTHER PLAYERS TO THEIR WEAPONS OFFLINE A ROOM SERVER EACH HUMAN THAT JOINS TAKES THE PLACE OF AN NPC ENTER THE ROOM CODE OFFLINE OR ONLINE WITH FRIENDS ROOM PING MS FRIENDS OPENING A CONNECTING TO RELAY KNOCKING WAITING FOR LOST PLAYING THE SERVER IS BUSY TRY AGAIN IN MINUTE NO THAT FULL RUNS ANOTHER VERSION RELOAD GAME LEFT MATCH OVER ALREADY REFUSED CONNECTION";
         let keys = protocol::relay::CODE_ALPHABET;
-        let names = WEAPONS.iter().map(|w| w.name.to_uppercase()).collect::<Vec<_>>().join(" ");
+        let names = WEAPONS
+            .iter()
+            .map(|w| w.name)
+            .chain(sim::map::MAPS.iter().flat_map(|m| [m.name, m.blurb]))
+            .map(str::to_uppercase)
+            .collect::<Vec<_>>()
+            .join(" ");
         for ch in fixed.chars().chain(names.chars()).chain(menu.chars()).chain(keys.chars()) {
             assert!(FONT.iter().any(|(c, _)| *c == ch), "no glyph for {ch:?}");
         }
